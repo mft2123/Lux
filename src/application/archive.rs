@@ -217,18 +217,30 @@ pub(crate) struct TmdbMatch {
     pub(crate) title: String,
     pub(crate) year: Option<i64>,
     pub(crate) origin_countries: Vec<String>,
+    /// Country of the earliest dated release (movies); `None` when TMDB has no
+    /// release-date data, in which case the origin country is the fallback.
+    pub(crate) release_country: Option<String>,
     pub(crate) original_language: Option<String>,
     pub(crate) genres: Vec<String>,
 }
 
 impl TmdbMatch {
-    /// Domestic boards are CN/HK/TW/MO productions and Chinese-language works.
+    /// Domestic means "first released in China": the earliest dated release of
+    /// a movie decides, and TV keeps its origin country because TMDB has no
+    /// per-country release dates for series. Origin country / language only
+    /// remain as a fallback when no release data exists.
     pub(crate) fn is_domestic(&self) -> bool {
         const DOMESTIC_COUNTRIES: &[&str] = &["CN", "HK", "TW", "MO"];
+        let domestic_country = |country: &str| {
+            DOMESTIC_COUNTRIES.contains(&country.to_ascii_uppercase().as_str())
+        };
+        if let Some(country) = self.release_country.as_deref() {
+            return domestic_country(country);
+        }
         if self
             .origin_countries
             .iter()
-            .any(|country| DOMESTIC_COUNTRIES.contains(&country.to_ascii_uppercase().as_str()))
+            .any(|country| domestic_country(country))
         {
             return true;
         }
@@ -666,7 +678,9 @@ impl ArchiveService {
                 [(MediaKind::Movie, "movie"), (MediaKind::Series, "tv")]
             };
             for (_kind, segment) in attempts {
-                if let Ok(details) = self.tmdb_details(api_key, segment, tmdb_id).await {
+                if let Ok(mut details) = self.tmdb_details(api_key, segment, tmdb_id).await {
+                    self.attach_release_country(api_key, segment, tmdb_id, &mut details)
+                        .await;
                     return Ok(Some(tmdb_match_from(segment, tmdb_id, &details, &details)?));
                 }
             }
@@ -687,7 +701,9 @@ impl ArchiveService {
                 .get("id")
                 .and_then(|value| value.as_i64())
                 .ok_or_else(|| "TMDB 返回缺少 id".to_owned())?;
-            let details = self.tmdb_details(api_key, segment, id).await?;
+            let mut details = self.tmdb_details(api_key, segment, id).await?;
+            self.attach_release_country(api_key, segment, id, &mut details)
+                .await;
             return Ok(Some(tmdb_match_from(segment, id, &best, &details)?));
         }
         Ok(None)
@@ -740,6 +756,34 @@ impl ArchiveService {
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Attach the earliest-release country to a movie's details so the board
+    /// decision uses `release_dates` instead of production metadata. Series
+    /// keep origin_country (TMDB has no per-country TV release dates).
+    async fn attach_release_country(
+        &self,
+        api_key: &str,
+        segment: &str,
+        id: i64,
+        details: &mut serde_json::Value,
+    ) {
+        if segment != "movie" {
+            return;
+        }
+        let url = format!("https://api.themoviedb.org/3/movie/{id}/release_dates?api_key={api_key}");
+        let Ok(response) = self.http.get(&url).send().await else {
+            return;
+        };
+        if !response.status().is_success() {
+            return;
+        }
+        let Ok(body) = response.json::<serde_json::Value>().await else {
+            return;
+        };
+        if let Some((_, country)) = earliest_release(&body) {
+            details["_release_country"] = serde_json::Value::String(country);
+        }
     }
 
     async fn tmdb_details(
@@ -900,15 +944,81 @@ fn tmdb_match_from(
                 .collect()
         })
         .unwrap_or_default();
+    let release_country = if kind == MediaKind::Movie {
+        details
+            .get("_release_country")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    } else {
+        // Series have no per-country release dates in TMDB; origin_country is
+        // the country of first airing.
+        details
+            .get("origin_country")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
     Ok(TmdbMatch {
         kind,
         tmdb_id: id,
         title,
         year,
         origin_countries,
+        release_country,
         original_language,
         genres,
     })
+}
+
+/// Earliest dated release (premiere / theatrical) across all countries:
+/// returns `(normalized_date, country)`.
+fn earliest_release(details: &serde_json::Value) -> Option<(String, String)> {
+    let results = details.get("results")?.as_array()?;
+    let mut best: Option<(String, String)> = None;
+    for country_entry in results {
+        let Some(country) = country_entry.get("iso_3166_1").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(release_dates) = country_entry.get("release_dates").and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for release in release_dates {
+            // 1 premiere, 2 theatrical (limited), 3 theatrical, 4 digital, 5 physical
+            let release_type = release.get("type").and_then(|value| value.as_i64()).unwrap_or(3);
+            if !matches!(release_type, 1..=3) {
+                continue;
+            }
+            let Some(date) = release.get("release_date").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let normalized = normalize_release_date(date);
+            let candidate = (normalized.clone(), country.to_owned());
+            if best.as_ref().is_none_or(|(current, _)| normalized < *current) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn normalize_release_date(date: &str) -> String {
+    // TMDB returns `YYYY-MM-DDTHH:MM:SS.mmmZ`; keep the date part only, then pad
+    // partial dates (YYYY / YYYY-MM) so string ordering is a date order.
+    let date = date
+        .split(['T', ' '])
+        .next()
+        .unwrap_or(date);
+    let parts = date.split('-').collect::<Vec<_>>();
+    let mut normalized = String::new();
+    for index in 0..3 {
+        if index > 0 {
+            normalized.push('-');
+        }
+        normalized.push_str(parts.get(index).copied().unwrap_or("01"));
+    }
+    normalized
 }
 
 fn pick_best_result<'a>(
@@ -1494,6 +1604,7 @@ mod tests {
             title: "流浪地球".to_owned(),
             year: Some(2019),
             origin_countries: vec!["CN".to_owned()],
+            release_country: None,
             original_language: Some("zh".to_owned()),
             genres: vec!["科幻".to_owned()],
         };
@@ -1506,6 +1617,7 @@ mod tests {
             title: "The Bear".to_owned(),
             year: Some(2022),
             origin_countries: vec!["US".to_owned()],
+            release_country: None,
             original_language: Some("en".to_owned()),
             genres: vec!["剧情".to_owned()],
         };
@@ -1518,10 +1630,78 @@ mod tests {
             title: "奔跑吧".to_owned(),
             year: Some(2014),
             origin_countries: vec!["CN".to_owned()],
+            release_country: None,
             original_language: Some("zh".to_owned()),
             genres: vec!["综艺".to_owned()],
         };
         assert_eq!(variety.category_label(), "综艺");
+    }
+
+    #[test]
+    fn earliest_release_decides_the_board() {
+        let details = serde_json::json!({
+            "results": [
+                { "iso_3166_1": "US", "release_dates": [
+                    { "type": 3, "release_date": "2006-12-09T00:00:00.000Z" }
+                ]},
+                { "iso_3166_1": "CN", "release_dates": [
+                    { "type": 3, "release_date": "2019-02-05T00:00:00.000Z" }
+                ]}
+            ]
+        });
+        let (date, country) = earliest_release(&details).expect("release");
+        assert_eq!(date, "2006-12-09");
+        assert_eq!(country, "US");
+
+        // A Chinese-first release lands on the domestic board.
+        let details = serde_json::json!({
+            "results": [
+                { "iso_3166_1": "US", "release_dates": [
+                    { "type": 3, "release_date": "2020-01-10T00:00:00.000Z" }
+                ]},
+                { "iso_3166_1": "CN", "release_dates": [
+                    { "type": 2, "release_date": "2019-12-01T00:00:00.000Z" }
+                ]}
+            ]
+        });
+        let (_, country) = earliest_release(&details).expect("release");
+        assert_eq!(country, "CN");
+
+        // Digital/physical-only entries do not count as the release origin.
+        let details = serde_json::json!({
+            "results": [
+                { "iso_3166_1": "CN", "release_dates": [
+                    { "type": 5, "release_date": "2024-01-01T00:00:00.000Z" }
+                ]},
+                { "iso_3166_1": "US", "release_dates": [
+                    { "type": 3, "release_date": "2023-06-01T00:00:00.000Z" }
+                ]}
+            ]
+        });
+        let (_, country) = earliest_release(&details).expect("release");
+        assert_eq!(country, "US");
+    }
+
+    #[test]
+    fn release_country_overrides_origin_for_the_board() {
+        let movie = TmdbMatch {
+            kind: MediaKind::Movie,
+            tmdb_id: 9,
+            title: "Some Film".to_owned(),
+            year: Some(2024),
+            origin_countries: vec!["US".to_owned()],
+            release_country: Some("CN".to_owned()),
+            original_language: Some("en".to_owned()),
+            genres: vec![],
+        };
+        // Released first in China -> domestic board even though it is a US film.
+        assert!(movie.is_domestic());
+
+        let movie = TmdbMatch {
+            release_country: Some("US".to_owned()),
+            ..movie
+        };
+        assert!(!movie.is_domestic());
     }
 
     #[test]
