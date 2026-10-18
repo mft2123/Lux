@@ -433,6 +433,9 @@ impl ArchiveService {
             } else if video_extension(entry).is_none() {
                 continue;
             }
+            if special_category(&name).is_some() {
+                continue;
+            }
             let raw_name = if is_dir {
                 name.clone()
             } else {
@@ -498,6 +501,11 @@ impl ArchiveService {
                     continue;
                 }
             };
+            if let Some(category) = special_category(&name) {
+                self.organize_special(report, &entry, &parsed, category, is_dir, &mut planned_targets)
+                    .await?;
+                continue;
+            }
             let series_hint = is_dir && dir_signals_series(&entry, &parsed);
             let lookup = match tmdb_results.remove(&entry) {
                 Some(result) => result,
@@ -1060,6 +1068,116 @@ impl ArchiveService {
         Ok(report)
     }
 
+    /// Organize a 晚会/演唱会 entry without TMDB data: the release name gives
+    /// the title and year, and a CJK title puts a concert on the domestic
+    /// board. These events rarely exist in TMDB, so no metadata lookup is
+    /// attempted and a minimal NFO is written.
+    async fn organize_special(
+        &self,
+        report: &mut ArchiveReport,
+        entry: &Path,
+        parsed: &ParsedName,
+        category: &str,
+        is_dir: bool,
+        planned: &mut HashMap<PathBuf, u64>,
+    ) -> Result<(), String> {
+        let name = entry
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| entry.display().to_string());
+        let year = parsed.year.filter(|year| (1888..=2100).contains(year));
+        let safe_title = sanitize_component(&parsed.title);
+        let title_dir = match year {
+            Some(year) => format!("{safe_title} ({year})"),
+            None => safe_title.clone(),
+        };
+        let year_segment = year
+            .map(|year| year.to_string())
+            .unwrap_or_else(|| "未知年份".to_owned());
+        let mut target_dir = self.config.media_dir().join(category);
+        let region = if category == "演唱会" {
+            let region = if contains_cjk(&parsed.title) {
+                "国内"
+            } else {
+                "国外"
+            };
+            target_dir = target_dir.join(region);
+            region
+        } else {
+            ""
+        };
+        let target_dir = target_dir.join(&year_segment);
+        let target = if is_dir {
+            target_dir.join(&title_dir)
+        } else {
+            target_dir.join(&title_dir).join(&name)
+        };
+        let existing_size = if target.exists() {
+            Some(path_size(&target))
+        } else {
+            planned.get(&target).copied()
+        };
+        if let Some(existing_size) = existing_size {
+            let incoming_size = path_size(entry);
+            let decision = decide_existing(
+                incoming_size,
+                existing_size,
+                self.config.wash_enabled,
+                self.config.wash_tolerance_ratio,
+            );
+            if decision == ExistingDecision::Wash {
+                self.wash_entry(report, entry, &target, incoming_size, existing_size)?;
+                return Ok(());
+            }
+            self.duplicate_entry(report, entry, &target)?;
+            return Ok(());
+        }
+        if report.dry_run {
+            report.organized.push(OrganizedItem {
+                source: name.clone(),
+                tmdb_id: 0,
+                target: target.display().to_string(),
+                kind: category.to_owned(),
+                region: region.to_owned(),
+                year,
+                title: parsed.title.clone(),
+            });
+            planned.insert(target, path_size(entry));
+            return Ok(());
+        }
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|error| format!("创建目标目录失败: {error}"))?;
+        match move_entry(entry, &target) {
+            Ok(()) => {
+                report.organized.push(OrganizedItem {
+                    source: name.clone(),
+                    tmdb_id: 0,
+                    target: target.display().to_string(),
+                    kind: category.to_owned(),
+                    region: region.to_owned(),
+                    year,
+                    title: parsed.title.clone(),
+                });
+                if let Some(mirror) = self.mirror_dir_for(&target) {
+                    let mut metadata_report = nfo::MetadataReport::default();
+                    let writer = nfo::MetadataWriter::new(self, false);
+                    writer
+                        .write_special(&target, &mirror, &parsed.title, year, &mut metadata_report)
+                        .await;
+                    if !metadata_report.failed.is_empty() {
+                        tracing::warn!(
+                            target = %target.display(),
+                            failed = ?metadata_report.failed,
+                            "special entry sidecar generation had failures"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => self.fail_entry(report, entry, &format!("移动失败: {error}")),
+        }
+    }
+
     pub(crate) fn status(&self) -> ArchiveStatus {
         ArchiveStatus {
             root: self.config.root.display().to_string(),
@@ -1440,6 +1558,43 @@ fn dir_signals_series(directory: &Path, parsed: &ParsedName) -> bool {
     false
 }
 
+/// 晚会/演唱会 are not TMDB categories: they are detected from the entry
+/// name (an explicit `{晚会}` / `{演唱会}` marker wins over keywords, and a
+/// `{tmdb-ID}` hint is handled before this check by the caller).
+pub(crate) fn special_category(name: &str) -> Option<&'static str> {
+    if name.contains("{晚会}") || name.contains("【晚会】") {
+        return Some("晚会");
+    }
+    if name.contains("{演唱会}") || name.contains("【演唱会】") {
+        return Some("演唱会");
+    }
+    // Olympic/parade/season galas and other one-off events.
+    const GALA: &[&str] = &[
+        "开幕式", "闭幕式", "阅兵", "晚会", "春晚", "中秋", "元宵", "跨年", "国庆", "联欢",
+        "颁奖典礼", "庆典",
+    ];
+    if GALA.iter().any(|keyword| name.contains(keyword)) {
+        return Some("晚会");
+    }
+    const CONCERT: &[&str] = &["演唱会", "音乐会", "巡演", "concert", "live"];
+    let lowered = name.to_lowercase();
+    if CONCERT.iter().any(|keyword| lowered.contains(keyword)) {
+        return Some("演唱会");
+    }
+    None
+}
+
+/// Whether a title contains CJK characters (used as the fallback region for
+/// concerts, which TMDB does not describe).
+pub(crate) fn contains_cjk(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(character,
+            '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}')
+    })
+}
+
 fn dir_has_nfo(directory: &Path) -> bool {
     let Ok(reader) = std::fs::read_dir(directory) else {
         return false;
@@ -1591,6 +1746,11 @@ pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
     // reliable than title matching, and the token must not leak into the title.
     let tmdb_id = extract_tmdb_id(&text);
     text = strip_tmdb_tokens(&text);
+    text = text
+        .replace("{晚会}", " ")
+        .replace("【晚会】", " ")
+        .replace("{演唱会}", " ")
+        .replace("【演唱会】", " ");
     // Drop leading bracketed groups like [Group] or 【字幕组】.
     while let Some(rest) = strip_leading_group(&text) {
         text = rest;

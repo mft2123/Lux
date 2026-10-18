@@ -239,6 +239,49 @@ impl<'a> MetadataWriter<'a> {
         }
     }
 
+    /// 晚会/演唱会 have no TMDB entry: mirror the media files with strm and a
+    /// minimal NFO (title + year) so the media server still lists them.
+    pub(crate) async fn write_special(
+        &self,
+        pack: &Path,
+        mirror: &Path,
+        title: &str,
+        year: Option<i64>,
+        report: &mut MetadataReport,
+    ) {
+        if let Err(error) = std::fs::create_dir_all(mirror) {
+            report
+                .failed
+                .push(format!("{}: 创建镜像目录失败: {error}", mirror.display()));
+            return;
+        }
+        relax_permissions(mirror, true);
+        let videos = video_files(pack);
+        if videos.is_empty() {
+            self.write_file(&mirror.join("movie.nfo"), &minimal_nfo(title, year), report);
+            return;
+        }
+        for video in &videos {
+            let relative = video.strip_prefix(pack).unwrap_or(video);
+            let mirror_file = mirror.join(relative);
+            if let Some(parent) = mirror_file.parent() {
+                if let Err(error) = std::fs::create_dir_all(parent) {
+                    report.failed.push(format!("{}: {error}", parent.display()));
+                    continue;
+                }
+                relax_permissions(parent, true);
+            }
+            if let Some(url) = self.service.media_url(video) {
+                self.write_file(&mirror_file.with_extension("strm"), &url, report);
+            }
+            self.write_file(
+                &mirror_file.with_extension("nfo"),
+                &minimal_nfo(title, year),
+                report,
+            );
+        }
+    }
+
     fn write_file(&self, path: &Path, content: &str, report: &mut MetadataReport) -> bool {
         if path.exists() && !self.overwrite {
             report.skipped.push(path.display().to_string());
@@ -330,6 +373,16 @@ fn collect_video_files(directory: &Path, depth: usize, files: &mut Vec<PathBuf>)
             files.push(path);
         }
     }
+}
+
+pub(crate) fn minimal_nfo(title: &str, year: Option<i64>) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<movie>\n");
+    push_field(&mut xml, "title", title);
+    if let Some(year) = year {
+        push_field(&mut xml, "year", &year.to_string());
+    }
+    xml.push_str("</movie>\n");
+    xml
 }
 
 pub(crate) fn movie_nfo(details: &NfoDetails) -> String {
@@ -828,6 +881,27 @@ mod tests {
         assert!(episode.contains("<episode>7</episode>"));
         assert!(episode.contains("<showtitle>大唐迷雾</showtitle>"));
         assert!(episode.contains("<uniqueid type=\"tmdb\" default=\"true\">123</uniqueid>"));
+    }
+
+    #[test]
+    fn special_categories_are_detected_from_names() {
+        assert_eq!(super::super::special_category("2008年北京奥运会开幕式"), Some("晚会"));
+        assert_eq!(super::super::special_category("国庆70周年阅兵"), Some("晚会"));
+        assert_eq!(super::super::special_category("2024中秋晚会"), Some("晚会"));
+        assert_eq!(super::super::special_category("周杰伦演唱会 2024"), Some("演唱会"));
+        assert_eq!(super::super::special_category("Taylor Swift Concert"), Some("演唱会"));
+        assert_eq!(super::super::special_category("{演唱会}某场演出"), Some("演唱会"));
+        assert_eq!(super::super::special_category("{晚会}某场演出"), Some("晚会"));
+        assert_eq!(super::super::special_category("Inception.2010.1080p"), None);
+        assert!(super::super::contains_cjk("周杰伦"));
+        assert!(!super::super::contains_cjk("Taylor Swift"));
+    }
+
+    #[test]
+    fn minimal_nfo_for_special_entries() {
+        let nfo = minimal_nfo("2008年北京奥运会开幕式", Some(2008));
+        assert!(nfo.contains("<title>2008年北京奥运会开幕式</title>"));
+        assert!(nfo.contains("<year>2008</year>"));
     }
 
     #[test]
