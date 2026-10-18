@@ -473,7 +473,7 @@ impl ArchiveService {
                 .join(&board)
                 .join(&year_segment)
                 .join(&title_dir);
-            if matched.kind == MediaKind::Series {
+            if matched.kind == MediaKind::Series && !is_dir {
                 let season = parsed.season.unwrap_or(1);
                 target_dir = target_dir.join(format!("Season {season:02}"));
             }
