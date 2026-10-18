@@ -182,7 +182,7 @@
 `scripts/actor-credits-audit.py` 用来检查「关系快照说已同步、但 `person_credits` 是空的」这种历史残留：
 
 - 只读模式列出 `MISSING_CREDITS` / `COUNT_MISMATCH` / `UNREADABLE`，以及没有关系快照的孤儿 credit；
-  ���问题退出码 1，干净退出 0，方便接监控。
+  有问题退出码 1，干净退出 0，方便接监控。
 - `--fix` 只删掉问题条目的 `people.json`（关系快照是缓存，不碰媒体与数据库行）。
 - **注意**：当前构建下普通 scan / reconcile **不会**重新富化未变化的条目——实测 touch 或修改 NFO 后重扫都无济于事；
   要让 `--fix` 生效必须触发一次完整重富化（实测：删库重建同一个根，5 个条目 92 条 credit 全部恢复）。
