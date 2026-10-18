@@ -11,12 +11,18 @@
 //! The matching rules are frozen in `docs/archive-pipeline.md`; change that
 //! document first and then the code, never the other way around.
 
+// TODO(I16): the archive admin endpoints parse `dry_run` / `overwrite` as
+// `bool` only, so `?dry_run=1` answers 400 even though the old docs promised
+// `1|0`. `docs/archive-pipeline.md` §9 now documents `true|false`; accepting
+// `1|0` needs the query parser in `src/api/admin/admin_jobs.rs` (owned by the
+// settings change), not this module.
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -305,7 +311,10 @@ impl LinkJob {
     fn cleaned(mut self) -> Result<Self, String> {
         self.url = validate_link_url(&self.url)?;
         self.title = clean_optional_text(self.title, LINK_JOB_MAX_TITLE_CHARS);
-        self.mode = clean_optional_text(self.mode, 32);
+        self.mode = match clean_optional_text(self.mode, 32) {
+            Some(mode) => Some(validate_link_mode(&mode)?),
+            None => None,
+        };
         self.source = clean_optional_text(self.source, 32);
         self.kind = clean_optional_text(self.kind, 32);
         self.channel = clean_optional_text(self.channel, 128);
@@ -488,6 +497,11 @@ impl TmdbMatch {
 /// serializes them so one never moves an entry the other is already moving.
 static ARCHIVE_RUN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the ingest check-then-write. Two sidecar requests for the same
+/// URL must not both decide "not queued yet" and write a job each: the check
+/// (`find_existing_link_job`) and the write are one critical section.
+static LINK_INGEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) struct ArchiveService {
     config: Arc<ArchiveConfig>,
     http: reqwest::Client,
@@ -545,13 +559,30 @@ impl ArchiveService {
             ..ArchiveReport::default()
         };
 
-        let link_queue = self.ingest_link_queue(dry_run)?;
+        // The link queue is one stage, not the pipeline. A queue / state file
+        // that cannot be read skips that stage for this round (WARN) and lets
+        // watch dirs, transfer and pending still run; otherwise one broken
+        // file would freeze the whole archive for every poll.
+        let link_queue = match self.ingest_link_queue(dry_run) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "link queue round skipped; continuing with the rest of the pipeline"
+                );
+                LinkQueueReport {
+                    dry_run,
+                    ..LinkQueueReport::default()
+                }
+            }
+        };
         if link_queue.examined > 0 {
             tracing::info!(
                 dry_run = link_queue.dry_run,
                 examined = link_queue.examined,
                 accepted = link_queue.accepted.len(),
                 invalid = link_queue.invalid.len(),
+                failed = link_queue.failed.len(),
                 incomplete = link_queue.skipped_incomplete.len(),
                 "link queue consumed; accepted links wait for the 115 transfer client"
             );
@@ -1690,12 +1721,30 @@ impl ArchiveService {
     /// `状态.jsonl`), is not queued twice — the existing job is returned with
     /// `duplicate: true`.
     pub(crate) fn enqueue_link_job(&self, job: LinkJob) -> Result<QueuedLinkJob, LinkIngestError> {
-        let job = job.normalized().map_err(LinkIngestError::Invalid)?;
+        let mut job = job.normalized().map_err(LinkIngestError::Invalid)?;
         let queue = self.config.link_queue_dir();
         std::fs::create_dir_all(&queue).map_err(|error| {
             LinkIngestError::Storage(format!("无法创建链接队列 {}: {error}", queue.display()))
         })?;
-        if let Some(existing) = self.find_existing_link_job(&job.url) {
+        // The duplicate check and the write are one step, otherwise two
+        // concurrent requests for the same URL both see "not queued" and both
+        // write a job file. The guard is process-wide because ingest and the
+        // poller live in the same service.
+        let _ingest_guard = LINK_INGEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A broken queue / state file means "cannot tell whether this is a
+        // duplicate": answer 500 and queue nothing, instead of writing a
+        // possible second job for one link.
+        let existing = self.find_existing_link_job(&job.url).map_err(|error| {
+            tracing::warn!(
+                url = %mask_link_for_log(&job.url),
+                %error,
+                "could not check for an existing link job; refusing to queue a possible duplicate"
+            );
+            LinkIngestError::Storage(error)
+        })?;
+        if let Some(existing) = existing {
             tracing::info!(
                 url = %mask_link_for_log(&job.url),
                 job_id = %existing.job_id,
@@ -1709,12 +1758,15 @@ impl ArchiveService {
                 duplicate: true,
             });
         }
-        let name = format!("{}.json", job.job_id);
-        let target = unique_target(&queue, &name);
+        // `job_id` is the file name (docs §2.1). A same-millisecond job that
+        // already took the name gets a suffix, and the job adopts it, so the
+        // returned id, the file name and the state record never disagree.
+        let (target, job_id) = link_job_target(&queue, &job.job_id);
+        job.job_id = job_id.clone();
         let body = serde_json::to_string_pretty(&job).map_err(|error| {
             LinkIngestError::Storage(format!("序列化链接任务失败: {error}"))
         })?;
-        let temp = queue.join(format!(".{}.tmp", job.job_id));
+        let temp = queue.join(format!(".{job_id}.tmp"));
         // `0600` from the first byte: a share link may carry `?password=`, and
         // the job file must be as private as the state file (`rename` keeps the
         // mode, so 已处理/ stays 0600 as well).
@@ -1725,7 +1777,7 @@ impl ArchiveService {
             LinkIngestError::Storage(format!("提交 {} 失败: {error}", target.display()))
         })?;
         tracing::info!(
-            job_id = %job.job_id,
+            job_id = %job_id,
             url = %mask_link_for_log(&job.url),
             title = job.title.as_deref().unwrap_or(""),
             mode = job.mode.as_deref().unwrap_or(""),
@@ -1733,7 +1785,7 @@ impl ArchiveService {
             "link job queued"
         );
         Ok(QueuedLinkJob {
-            job_id: job.job_id,
+            job_id,
             file: target.display().to_string(),
             status: LINK_JOB_STATUS_NEEDS_115,
             duplicate: false,
@@ -1742,36 +1794,45 @@ impl ArchiveService {
 
     /// Find a job for `url` that is either still waiting in the queue or
     /// already recorded in the state file. Used to make ingest idempotent.
-    fn find_existing_link_job(&self, url: &str) -> Option<QueuedLinkJob> {
-        for entry in read_dir_entries(&self.config.link_queue_dir()).ok()? {
-            if entry.extension().is_none_or(|extension| !extension.eq_ignore_ascii_case("json")) {
+    ///
+    /// An unreadable queue directory or state file is an **error**, never "no
+    /// duplicate" (review I12): guessing wrong queues the same link twice and
+    /// hands it to the transfer client twice.
+    fn find_existing_link_job(&self, url: &str) -> Result<Option<QueuedLinkJob>, String> {
+        for entry in read_dir_entries(&self.config.link_queue_dir())? {
+            if !is_link_job_file(&entry) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&entry) else {
-                continue;
+            let text = match std::fs::read_to_string(&entry) {
+                Ok(text) => text,
+                Err(error) => {
+                    // One unreadable job file must not make every ingest fail,
+                    // but it may be hiding this URL: say so in the log.
+                    tracing::warn!(
+                        file = %entry.display(),
+                        %error,
+                        "could not read a queued link job while checking for duplicates; it may hide this URL"
+                    );
+                    continue;
+                }
             };
             let Ok(job) = serde_json::from_str::<LinkJob>(&text) else {
                 continue;
             };
             if job.url == url {
-                return Some(QueuedLinkJob {
+                return Ok(Some(QueuedLinkJob {
                     job_id: job.job_id,
                     file: entry.display().to_string(),
                     status: LINK_JOB_STATUS_NEEDS_115,
                     duplicate: true,
-                });
+                }));
             }
         }
-        let Ok(text) = std::fs::read_to_string(self.config.link_state_file()) else {
-            return None;
-        };
-        // Newest record last: walk backwards so the most recent match wins.
-        for line in text.lines().rev() {
-            let Ok(record) = serde_json::from_str::<LinkStateLine>(line) else {
-                continue;
-            };
+        // Newest record last: walk backwards so the most recent match wins. A
+        // missing state file is "nothing consumed yet"; any other error is real.
+        for record in read_link_state(&self.config.link_state_file())?.into_iter().rev() {
             if record.url == url && record.status != LINK_JOB_STATUS_INVALID {
-                return Some(QueuedLinkJob {
+                return Ok(Some(QueuedLinkJob {
                     job_id: record.job_id,
                     file: self
                         .config
@@ -1781,10 +1842,10 @@ impl ArchiveService {
                         .to_string(),
                     status: LINK_JOB_STATUS_NEEDS_115,
                     duplicate: true,
-                });
+                }));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Consume the JSON job files in `链接队列/`.
@@ -1824,15 +1885,10 @@ impl ArchiveService {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // `状态.jsonl` shares the directory but is not a job file; the
-            // `已处理/` and `无效/` sub-directories are skipped below.
-            if name.starts_with('.') || !name.ends_with(".json") {
-                continue;
-            }
-            let Ok(metadata) = std::fs::symlink_metadata(&entry) else {
-                continue;
-            };
-            if !metadata.file_type().is_file() {
+            // The consumer, the duplicate check and the status counter all use
+            // `is_link_job_file`, so they can never disagree about what a job
+            // is: `状态.jsonl`, `已处理/`, `无效/`, `X.TMP` and symlinks are not.
+            if !is_link_job_file(&entry) {
                 continue;
             }
             report.examined += 1;
@@ -2062,6 +2118,37 @@ impl ArchiveService {
     /// `媒体目录/` whose name matches the requested title wins.
     pub(crate) fn lookup_library_size(&self, title: &str) -> LibraryLookup {
         lookup_library_size_in(&self.config.media_dir(), title)
+    }
+
+    /// Blocking-pool variant of [`Self::lookup_library_size`] for async callers.
+    ///
+    /// The scan walks the media tree, so it must not run on a tokio worker: on
+    /// a library of 180k entries that would park one worker per concurrent
+    /// lookup.
+    ///
+    /// TODO(I6): `src/api/admin/admin_jobs.rs` (owned by the settings change)
+    /// still calls the synchronous variant; switching
+    /// `Json(service.lookup_library_size(title))` to
+    /// `Json(service.lookup_library_size_isolated(title).await)` completes the
+    /// isolation. The tree walk itself is already bounded (title layer only,
+    /// depth cap, `symlink_metadata`) and cached, so the synchronous path stays
+    /// cheap until then.
+    #[allow(dead_code)] // wired by the admin_jobs.rs change that owns that file
+    pub(crate) async fn lookup_library_size_isolated(&self, title: &str) -> LibraryLookup {
+        let media_dir = self.config.media_dir();
+        let requested = title.trim().to_owned();
+        let uncached = requested.clone();
+        match tokio::task::spawn_blocking(move || lookup_library_size_in(&media_dir, &requested)).await
+        {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                tracing::warn!(%error, title = %uncached, "library lookup task failed");
+                LibraryLookup {
+                    title: uncached,
+                    ..LibraryLookup::default()
+                }
+            }
+        }
     }
 
     pub(crate) fn status(&self) -> ArchiveStatus {
@@ -2528,12 +2615,32 @@ fn organized_item(
     }
 }
 
+/// Deepest level the wash-size sum follows. A library title is at most
+/// `<board>/<region>/<year>/<title>/Season NN/`, so twelve levels are generous;
+/// the cap only exists so a pathological tree cannot stall a run.
+const PATH_SIZE_MAX_DEPTH: usize = 12;
+
 /// Total size of a file or directory tree (metadata only, no data read).
+///
+/// Symlinks are never followed (`symlink_metadata`): a link pointing back into
+/// the tree would otherwise make the walk unbounded, and a link must not
+/// contribute a size the archive does not own.
 fn path_size(path: &Path) -> u64 {
-    let Ok(metadata) = std::fs::metadata(path) else {
+    path_size_at(path, 0)
+}
+
+fn path_size_at(path: &Path, depth: usize) -> u64 {
+    if depth > PATH_SIZE_MAX_DEPTH {
+        return 0;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return 0;
     };
-    if !metadata.is_dir() {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return 0;
+    }
+    if !file_type.is_dir() {
         return metadata.len();
     }
     let Ok(reader) = std::fs::read_dir(path) else {
@@ -2541,7 +2648,7 @@ fn path_size(path: &Path) -> u64 {
     };
     reader
         .flatten()
-        .map(|entry| path_size(&entry.path()))
+        .map(|entry| path_size_at(&entry.path(), depth + 1))
         .sum()
 }
 
@@ -2664,6 +2771,22 @@ fn unique_target(directory: &Path, name: &str) -> PathBuf {
         }
     }
     directory.join(format!("{stem} ({})", unix_now()))
+}
+
+/// Final job file path for `job_id` in `queue`, plus the id the chosen file
+/// name encodes.
+///
+/// `job_id` is the file name (docs §2.1), so a collision — two links captured in
+/// the same millisecond with the same title slug — renames the *job*, never just
+/// the file: the 202 response, the file name and the state record stay equal.
+fn link_job_target(queue: &Path, job_id: &str) -> (PathBuf, String) {
+    let target = unique_target(queue, &format!("{job_id}.json"));
+    let final_id = target
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| job_id.to_owned());
+    (target, final_id)
 }
 
 fn dir_has_nfo(directory: &Path) -> bool {
@@ -3080,6 +3203,10 @@ pub(crate) struct ArchiveStatus {
 
 /// Only real share links may enter the queue: a `file://` URL (or a crafted
 /// `javascript:` one) must never reach a future transfer client.
+///
+/// The scheme alone is not enough: the part after it must name a reachable
+/// target (`https://` or `magnet:?` with nothing behind it is rejected), because
+/// such a link can never be transferred and would just sit in the queue.
 pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
     let url = raw.trim();
     if url.is_empty() {
@@ -3094,9 +3221,72 @@ pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
         return Err("url 不能含空白或控制字符".to_owned());
     }
     let lowered = url.to_ascii_lowercase();
-    const ALLOWED: &[&str] = &["https://", "http://", "magnet:", "ed2k://"];
-    if !ALLOWED.iter().any(|prefix| lowered.starts_with(prefix)) {
-        return Err("不支持的链接协议（只接受 http(s) / magnet / ed2k）".to_owned());
+    if lowered.starts_with("https://") || lowered.starts_with("http://") {
+        return validate_http_link(url);
+    }
+    if lowered.starts_with("magnet:") {
+        return validate_magnet_link(url);
+    }
+    if lowered.starts_with("ed2k://") {
+        return validate_ed2k_link(url);
+    }
+    Err("不支持的链接协议（只接受 http(s) / magnet / ed2k）".to_owned())
+}
+
+/// `http(s)://<host>[/…]`: the authority must contain a real host name. An empty
+/// authority (`https://`, `https:///s/x`), a port without host or credentials
+/// without host are all rejected.
+fn validate_http_link(url: &str) -> Result<String, String> {
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return Err("链接缺少 host（例如 https://115.com/s/xxxx）".to_owned());
+    }
+    // Drop `user:password@`: the host is what remains.
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host_port.split(':').next().unwrap_or_default();
+    let valid = !host.is_empty()
+        && host
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'));
+    if !valid {
+        return Err(format!("链接缺少有效的 host: {host:?}"));
+    }
+    Ok(url.to_owned())
+}
+
+/// `magnet:?xt=urn:btih:<infohash>`: a magnet without an infohash cannot be
+/// fetched, so it is rejected instead of queued forever.
+fn validate_magnet_link(url: &str) -> Result<String, String> {
+    let rest = &url["magnet:".len()..];
+    let lowered = rest.to_ascii_lowercase();
+    let Some(index) = lowered.find("urn:btih:") else {
+        return Err("magnet 链接缺少 xt=urn:btih:<infohash>".to_owned());
+    };
+    let hash = &rest[index + "urn:btih:".len()..];
+    let hash_end = hash.find('&').unwrap_or(hash.len());
+    if hash[..hash_end].is_empty() {
+        return Err("magnet 链接的 infohash 为空".to_owned());
+    }
+    Ok(url.to_owned())
+}
+
+/// `ed2k://|file|<name>|<size>|<hash>|/`: the file target must carry a name and
+/// a hash.
+fn validate_ed2k_link(url: &str) -> Result<String, String> {
+    let rest = &url["ed2k://".len()..];
+    let Some(fields) = rest.strip_prefix("|file|") else {
+        return Err("ed2k 链接缺少 |file| 目标".to_owned());
+    };
+    let fields = fields.split('|').collect::<Vec<_>>();
+    if fields.first().is_none_or(|name| name.is_empty()) {
+        return Err("ed2k 链接缺少文件名".to_owned());
+    }
+    if fields.get(2).is_none_or(|hash| hash.is_empty()) {
+        return Err("ed2k 链接缺少 hash".to_owned());
     }
     Ok(url.to_owned())
 }
@@ -3141,6 +3331,21 @@ pub(crate) fn mask_link_for_log(raw: &str) -> String {
         return format!("{scheme}://…");
     }
     format!("{scheme}://{host}")
+}
+
+/// The five listening modes of the sidecar (`settings::LISTEN_MODES`). The
+/// queue is an operator-facing record, so `mode` is an enum, not a free-form
+/// tag: anything else is a 400 on ingest and an `invalid` job file in the
+/// queue.
+fn validate_link_mode(mode: &str) -> Result<String, String> {
+    let mode = mode.trim();
+    if settings::LISTEN_MODES.contains(&mode) {
+        return Ok(mode.to_owned());
+    }
+    Err(format!(
+        "mode 只能是 {}（收到 {mode:?}）",
+        settings::LISTEN_MODES.join(" / ")
+    ))
 }
 
 /// Human-readable, file-name-safe job slug: alphanumerics and CJK kept,
@@ -3193,18 +3398,52 @@ fn unix_millis() -> u128 {
         .unwrap_or_default()
 }
 
+/// What counts as a link job file. Shared by the consumer, the duplicate check
+/// and the status counter so the three can never disagree:
+///
+/// - a regular file directly in the queue directory (`已处理/` and `无效/` are
+///   directories, so they never qualify);
+/// - name does not start with `.` (temp files);
+/// - extension is `.json`, case-insensitively (`X.JSON` is a job);
+/// - a symlink is **not** a job: `symlink_metadata` never follows it, so the
+///   consumer and `count_link_jobs` see the same set.
+fn is_link_job_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.starts_with('.') {
+        return false;
+    }
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return false;
+    }
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 fn count_link_jobs(directory: &Path) -> usize {
-    let Ok(reader) = std::fs::read_dir(directory) else {
-        return 0;
+    let reader = match std::fs::read_dir(directory) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            // The status endpoint keeps answering, but the operator must see
+            // that the number is unknown rather than "0 waiting".
+            tracing::warn!(
+                path = %directory.display(),
+                %error,
+                "could not count the pending link jobs"
+            );
+            return 0;
+        }
     };
     reader
         .flatten()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        })
+        .filter(|entry| is_link_job_file(&entry.path()))
         .count()
 }
 
@@ -3287,14 +3526,29 @@ fn job_file_job_id(path: &Path) -> Option<String> {
     (!job.job_id.trim().is_empty()).then_some(job.job_id)
 }
 
-/// Comparison key for library titles: lowercase alphanumerics only, so
-/// `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
+/// Comparison key for library titles: full-width characters folded to ASCII
+/// first (so `流浪地球２` equals `流浪地球2`), then lowercase alphanumerics
+/// only, so `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
 fn normalize_title_key(value: &str) -> String {
     value
         .chars()
+        .map(fold_full_width)
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
         .collect()
+}
+
+/// Simplified NFKC: the full-width ASCII block `！`–`～` (`Ａ`–`Ｚ`, `０`–`９`,
+/// `．`, …) and the ideographic space fold to their ASCII forms. The project has
+/// no ICU dependency and a title only needs these two ranges.
+fn fold_full_width(character: char) -> char {
+    match character {
+        '\u{3000}' => ' ',
+        '\u{FF01}'..='\u{FF5E}' => {
+            char::from_u32(character as u32 - 0xFEE0).unwrap_or(character)
+        }
+        _ => character,
+    }
 }
 
 /// Deepest level walked by the library lookup. A title is a child of a year
@@ -3375,6 +3629,49 @@ fn library_title_matches(query: &LibraryQuery, entry_name: &str) -> bool {
         .all(|character| character.is_ascii_digit())
 }
 
+/// How long one lookup answer is reused. The sidecar asks once per link and the
+/// tree only changes when an archive run finishes, so a minute is cheap and
+/// safe; the lookup stays correct, just a minute stale at worst.
+const LIBRARY_LOOKUP_CACHE_SECONDS: u64 = 60;
+/// A hand-edited library plus scripts can ask for many titles; cap the cache so
+/// it cannot grow forever.
+const LIBRARY_LOOKUP_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Cached answers keyed by `<media dir>\0<title key>\0<year>`. The cached value
+/// is only the match and the size: `LibraryLookup` also carries the caller's
+/// title, which differs between equivalent queries.
+static LIBRARY_LOOKUP_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<String>, Option<u64>)>>> =
+    OnceLock::new();
+
+type LibraryLookupCache = Mutex<HashMap<String, (Instant, Option<String>, Option<u64>)>>;
+
+fn library_lookup_cache() -> &'static LibraryLookupCache {
+    LIBRARY_LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_library_lookup(key: &str) -> Option<(Option<String>, Option<u64>)> {
+    let cache = library_lookup_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .get(key)
+        .filter(|(stored, _, _)| stored.elapsed() < Duration::from_secs(LIBRARY_LOOKUP_CACHE_SECONDS))
+        .map(|(_, matched, size)| (matched.clone(), *size))
+}
+
+fn store_library_lookup(key: String, lookup: &LibraryLookup) {
+    let mut cache = library_lookup_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= LIBRARY_LOOKUP_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        (Instant::now(), lookup.matched.clone(), lookup.size_bytes),
+    );
+}
+
 /// One library lookup against `media_dir` (see `ArchiveService::lookup_library_size`).
 fn lookup_library_size_in(media_dir: &Path, title: &str) -> LibraryLookup {
     let mut lookup = LibraryLookup {
@@ -3384,12 +3681,24 @@ fn lookup_library_size_in(media_dir: &Path, title: &str) -> LibraryLookup {
     let Some(query) = LibraryQuery::new(&lookup.title) else {
         return lookup;
     };
+    let cache_key = format!(
+        "{}\u{0}{}\u{0}{:?}",
+        media_dir.display(),
+        query.key,
+        query.year
+    );
+    if let Some((matched, size)) = cached_library_lookup(&cache_key) {
+        lookup.matched = matched;
+        lookup.size_bytes = size;
+        return lookup;
+    }
     let mut best: Option<(String, u64)> = None;
     collect_library_entries(media_dir, 0, &query, &mut best);
     if let Some((name, size)) = best {
         lookup.matched = Some(name);
         lookup.size_bytes = Some(size);
     }
+    store_library_lookup(cache_key, &lookup);
     lookup
 }
 
@@ -3825,6 +4134,22 @@ mod tests {
         assert!(validate_link_url("https://115.com/s/a b").is_err());
         let long = format!("https://115.com/s/{}", "a".repeat(3000));
         assert!(validate_link_url(&long).is_err());
+
+        // The scheme alone is not a link: the target after it must exist.
+        assert!(validate_link_url("https://").is_err());
+        assert!(validate_link_url("https:///s/abc").is_err());
+        assert!(validate_link_url("https://?password=1").is_err());
+        assert!(validate_link_url("http://:8080/x").is_err());
+        assert!(validate_link_url("magnet:").is_err());
+        assert!(validate_link_url("magnet:?").is_err());
+        assert!(validate_link_url("magnet:?dn=no-hash").is_err());
+        assert!(validate_link_url("magnet:?xt=urn:btih:").is_err());
+        assert!(validate_link_url("ed2k://").is_err());
+        assert!(validate_link_url("ed2k://|file|").is_err());
+        // Credentials are allowed as long as a host follows them.
+        assert!(validate_link_url("https://user:pass@115.com/s/abc").is_ok());
+        assert!(validate_link_url("https://115.com").is_ok());
+        assert!(validate_link_url("magnet:?xt=urn:btih:abcdef0123456789&dn=x").is_ok());
     }
 
     /// Logs must never contain the share link: only scheme + host survives, and
@@ -3856,6 +4181,59 @@ mod tests {
         let masked = mask_link_for_log("https://115.com/s/abc?password=9999");
         assert!(!masked.contains("password"));
         assert!(!masked.contains("115.com/s/abc"));
+    }
+
+    /// `mode` is one of the five listening modes; anything else is rejected on
+    /// ingest and quarantined when a hand-written file carries it.
+    #[test]
+    fn rejects_unknown_link_modes() {
+        let job = LinkJob {
+            url: "https://115.com/s/abc".to_owned(),
+            mode: Some("随便".to_owned()),
+            ..LinkJob::default()
+        };
+        let error = job.normalized().expect_err("unknown mode is rejected");
+        assert!(error.contains("mode 只能是"), "{error}");
+
+        for mode in settings::LISTEN_MODES {
+            let job = LinkJob {
+                url: "https://115.com/s/abc".to_owned(),
+                mode: Some(mode.to_owned()),
+                ..LinkJob::default()
+            };
+            assert!(job.normalized().is_ok(), "{mode} is a valid mode");
+        }
+        // The field stays optional: an old producer that omits it still works.
+        let untagged = LinkJob {
+            url: "https://115.com/s/abc".to_owned(),
+            ..LinkJob::default()
+        };
+        assert_eq!(untagged.cleaned().expect("valid").mode, None);
+        let blank = LinkJob {
+            url: "https://115.com/s/abc".to_owned(),
+            mode: Some("  ".to_owned()),
+            ..LinkJob::default()
+        };
+        assert_eq!(blank.cleaned().expect("valid").mode, None);
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        std::fs::write(
+            queue.join("bad-mode.json"),
+            r#"{"job_id":"1700000000003-bad-mode","url":"https://115.com/s/bad","mode":"乱写"}"#,
+        )
+        .unwrap();
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.invalid.len(), 1);
+        assert!(report.accepted.is_empty());
+        assert_eq!(
+            std::fs::read_dir(service.config.link_invalid_dir())
+                .expect("invalid dir")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3982,6 +4360,57 @@ mod tests {
             .expect("queued");
         assert!(!other.duplicate);
         assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    /// Ten simultaneous posts of one URL leave exactly one job file: the
+    /// duplicate check and the write are one critical section.
+    #[test]
+    fn concurrent_ingest_of_the_same_url_writes_one_job_file() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = std::sync::Arc::new(ArchiveService::new_for_tests(archive_config(tmp.path())));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let service = std::sync::Arc::clone(&service);
+            handles.push(std::thread::spawn(move || {
+                service
+                    .enqueue_link_job(link_job("https://115.com/s/race"))
+                    .expect("queued")
+            }));
+        }
+        let queued = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued.iter().filter(|queued| !queued.duplicate).count(),
+            1,
+            "exactly one caller writes the job"
+        );
+        assert_eq!(queued.iter().filter(|queued| queued.duplicate).count(), 9);
+        let first = &queued[0];
+        assert!(
+            queued.iter().all(|queued| queued.job_id == first.job_id),
+            "every response names the same job"
+        );
+        assert_eq!(count_link_jobs(&service.config.link_queue_dir()), 1);
+        let file = Path::new(&first.file);
+        assert!(file.exists());
+        assert_eq!(
+            file.file_stem().unwrap().to_string_lossy(),
+            first.job_id,
+            "the job id is the file name"
+        );
+    }
+
+    /// A same-name collision renames the job id together with the file, so the
+    /// 202 response and the state record never disagree with the file name.
+    #[test]
+    fn a_colliding_job_file_takes_its_suffixed_name_as_the_job_id() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(tmp.path().join("1700000000000-demo.json"), b"{}").unwrap();
+        let (target, job_id) = link_job_target(tmp.path(), "1700000000000-demo");
+        assert_eq!(job_id, "1700000000000-demo (2)");
+        assert_eq!(target, tmp.path().join("1700000000000-demo (2).json"));
     }
 
     #[test]
@@ -4158,6 +4587,32 @@ mod tests {
         assert_eq!(mode_of(&service.config.link_state_file()), 0o600, "状态.jsonl");
     }
 
+    /// Full-width forms (common in hand-typed and IME titles) fold to ASCII
+    /// before comparison, so the lookup and the wash decision see one title.
+    #[test]
+    fn normalizes_full_width_title_characters() {
+        assert_eq!(normalize_title_key("流浪地球２"), "流浪地球2");
+        assert_eq!(normalize_title_key("ＡＢＣ１２３"), "abc123");
+        assert_eq!(normalize_title_key("某剧　第二季"), "某剧第二季");
+        assert_eq!(normalize_title_key("某剧（２０２４）"), "某剧2024");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电影")
+            .join("国内")
+            .join("2024")
+            .join("某剧２ (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("movie.mkv"), vec![0u8; 300]).unwrap();
+
+        let lookup = service.lookup_library_size("某剧2");
+        assert_eq!(lookup.matched.as_deref(), Some("某剧２ (2024)"));
+        assert_eq!(lookup.size_bytes, Some(300));
+    }
+
     /// The part number belongs to the title: asking for part two must not return
     /// the size of part one.
     #[test]
@@ -4265,6 +4720,199 @@ mod tests {
         assert_eq!(service.lookup_library_size("2024").size_bytes, None);
         assert_eq!(service.lookup_library_size("国内").size_bytes, None);
         assert_eq!(service.lookup_library_size("电视剧").size_bytes, None);
+    }
+
+    /// One job predicate: the status counter and the consumer agree on
+    /// `X.JSON` vs dotfiles vs `状态.jsonl` vs symlinks.
+    /// A read failure is not "no duplicate": ingest refuses instead of writing a
+    /// second job, and the consumer skips the round instead of consuming blindly.
+    #[test]
+    fn an_unreadable_state_file_is_not_no_duplicate() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        // A directory where 状态.jsonl should be: reading it fails (EISDIR).
+        std::fs::create_dir_all(service.config.link_state_file()).expect("state dir");
+
+        let error = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect_err("must not queue a possible duplicate");
+        assert!(matches!(error, LinkIngestError::Storage(_)), "{error}");
+        assert_eq!(count_link_jobs(&queue), 0, "nothing was written");
+
+        // The consumer cannot read the state either: that round fails and the
+        // job file stays where it is for the next round.
+        std::fs::write(
+            queue.join("job.json"),
+            serde_json::to_vec(&link_job("https://115.com/s/def")).unwrap(),
+        )
+        .unwrap();
+        assert!(service.ingest_link_queue(false).is_err());
+        assert_eq!(count_link_jobs(&queue), 1);
+    }
+
+    /// One unreadable queue / state file skips only the link stage of a run; the
+    /// rest of the pipeline still executes.
+    #[tokio::test]
+    async fn a_broken_link_queue_does_not_stop_the_run() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        std::fs::create_dir_all(service.config.link_state_file()).expect("state dir");
+
+        let report = service
+            .run_once(false)
+            .await
+            .expect("the rest of the pipeline still runs");
+        assert!(!report.dry_run);
+        assert!(report.organized.is_empty());
+    }
+
+    #[test]
+    fn count_and_consume_agree_on_what_a_job_is() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        let job = |id: &str| LinkJob {
+            job_id: id.to_owned(),
+            url: format!("https://115.com/s/{id}"),
+            ..LinkJob::default()
+        };
+        std::fs::write(
+            queue.join("UPPER.JSON"),
+            serde_json::to_vec(&job("upper")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            queue.join(".hidden.json"),
+            serde_json::to_vec(&job("hidden")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(queue.join(LINK_QUEUE_STATE_FILE), b"{}\n").unwrap();
+        std::fs::write(queue.join("notes.txt"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(queue.join("UPPER.JSON"), queue.join("link.json"))
+            .expect("symlink");
+
+        assert_eq!(count_link_jobs(&queue), 1, "only UPPER.JSON is a job");
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].job_id, "upper");
+        assert_eq!(
+            count_link_jobs(&queue),
+            0,
+            "the symlink and the dotfile are not jobs"
+        );
+        assert!(queue.join(".hidden.json").exists());
+        assert!(queue.join("notes.txt").exists());
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(queue.join("link.json")).is_ok(),
+            "the symlink is left alone"
+        );
+    }
+
+    /// The walk is cached for `LIBRARY_LOOKUP_CACHE_SECONDS`: a second ask for
+    /// the same title inside the TTL does not rescan the tree.
+    #[test]
+    fn lookup_results_are_cached_briefly() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("缓存测试剧 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 700]).unwrap();
+
+        assert_eq!(service.lookup_library_size("缓存测试剧").size_bytes, Some(700));
+        // The library grows after the first answer; the cached one is reused.
+        std::fs::write(title_dir.join("S01E02.mkv"), vec![0u8; 700]).unwrap();
+        assert_eq!(
+            service.lookup_library_size("缓存测试剧").size_bytes,
+            Some(700),
+            "the second answer comes from the cache"
+        );
+        // A query with another key is not answered from that entry.
+        assert_eq!(service.lookup_library_size("另一个剧").size_bytes, None);
+    }
+
+    /// Symlinks are never followed: not for matching a title and not for the
+    /// size walk (a self-referential link used to recurse forever).
+    #[cfg(unix)]
+    #[test]
+    fn lookup_ignores_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let media = tmp.path().join(MEDIA_DIR);
+        let real = media
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("真实剧 (2024)");
+        std::fs::create_dir_all(&real).expect("title dir");
+        std::fs::write(real.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+        // A link inside the title points back at the title itself.
+        symlink(&real, real.join("loop")).expect("self link");
+
+        assert_eq!(
+            service.lookup_library_size("真实剧").size_bytes,
+            Some(1024),
+            "the self link is skipped, not followed"
+        );
+
+        // A symlinked title is not a library entry, even with a perfect name.
+        let linked = media.join("电视剧").join("国内").join("2025");
+        std::fs::create_dir_all(&linked).expect("year dir");
+        symlink(&real, linked.join("链接剧 (2025)")).expect("title link");
+        assert_eq!(service.lookup_library_size("链接剧").size_bytes, None);
+    }
+
+    /// Manual scale check:
+    /// `cargo test --locked --lib archive lookup_stays_fast -- --ignored --nocapture`.
+    /// A lookup only descends to the title layer, and the second answer is
+    /// served from the cache.
+    #[test]
+    #[ignore = "manual benchmark: run with --ignored --nocapture"]
+    fn lookup_stays_fast_on_a_large_library() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let media = tmp.path().join(MEDIA_DIR);
+        let mut entry_count = 0usize;
+        for board in ["电影", "电视剧", "动画", "综艺"] {
+            for region in ["国内", "国外"] {
+                for year in 2000..2025 {
+                    let year_dir = media.join(board).join(region).join(year.to_string());
+                    for index in 0..180 {
+                        let dir = year_dir.join(format!("剧{index:03} ({year})"));
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("S01E01.mkv"), vec![0u8; 8]).unwrap();
+                        entry_count += 2;
+                    }
+                }
+            }
+        }
+
+        let started = Instant::now();
+        let lookup = service.lookup_library_size("剧042 4K");
+        let uncached = started.elapsed();
+        let started = Instant::now();
+        let cached = service.lookup_library_size("剧042 4K");
+        let cached_time = started.elapsed();
+        eprintln!(
+            "library lookup over {entry_count} entries: first {uncached:?}, cached {cached_time:?}"
+        );
+        assert_eq!(lookup.matched, cached.matched);
+        assert!(lookup.size_bytes.is_some());
     }
 
     #[test]
