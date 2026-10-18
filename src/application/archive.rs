@@ -28,12 +28,12 @@ pub(crate) const ARCHIVE_WASH_TOLERANCE_ENV: &str = "LUX_ARCHIVE_WASH_TOLERANCE"
 /// for the next run.
 const SETTLE_SECONDS: u64 = 60;
 
-const TRANSFER_DIR: &str = "转存";
+const TRANSFER_DIR: &str = "转存目录";
 const PENDING_DIR: &str = "待整理";
-const MEDIA_DIR: &str = "媒体";
-const FAILED_DIR: &str = "失败";
-const DUPLICATE_DIR: &str = "重复";
-const WASH_DIR: &str = "洗版";
+const MEDIA_DIR: &str = "媒体目录";
+const FAILED_DIR: &str = "失败目录";
+const DUPLICATE_DIR: &str = "重复目录";
+const WASH_DIR: &str = "洗版目录";
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "ts", "m2ts", "webm", "rmvb", "rm", "mpg", "mpeg",
