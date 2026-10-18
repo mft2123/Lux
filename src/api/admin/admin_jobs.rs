@@ -1,5 +1,10 @@
 use super::*;
 
+/// Settings writes are read-modify-write: two admins saving at the same time
+/// would otherwise lose one update, and the in-place bind-mount fallback could
+/// truncate the file under the other writer.
+static ARCHIVE_SETTINGS_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn scan_worker_services(
     state: &AppState,
 ) -> crate::application::admin_scan_jobs::ScanWorkerServices {
@@ -1304,13 +1309,24 @@ pub(crate) async fn admin_archive_settings(
         return response;
     }
     let settings = crate::application::archive::ArchiveSettings::load();
-    Json(settings.masked()).into_response()
+    let mut body = serde_json::to_value(settings.masked()).unwrap_or_else(|_| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        // The settings page renders the category list from this, so adding a
+        // category in the notify module does not need a frontend change.
+        object.insert(
+            "known_categories".to_owned(),
+            crate::application::notify::known_categories(),
+        );
+    }
+    Json(body).into_response()
 }
 
 /// Overwrite the editable settings file. The body is the settings document
 /// itself: keys it leaves out keep their effective value and a blank secret
 /// keeps the stored one, so the page can send back a masked secret untouched.
-/// Values that would break the pipeline are rejected instead of clamped.
+/// Values that would break the pipeline are rejected instead of clamped, and
+/// only keys the update actually changes (or the file already holds) are
+/// persisted, so environment values are never frozen into the file.
 pub(crate) async fn admin_update_archive_settings(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1319,17 +1335,9 @@ pub(crate) async fn admin_update_archive_settings(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
+    let _guard = ARCHIVE_SETTINGS_WRITE_LOCK.lock().await;
     let mut settings = crate::application::archive::ArchiveSettings::load();
     if let Err(message) = settings.apply_update(&update) {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            &message,
-        )
-        .into_response();
-    }
-    if let Err(message) = settings.validate() {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -1351,7 +1359,14 @@ pub(crate) async fn admin_update_archive_settings(
         path = %crate::application::archive::ArchiveSettings::path().display(),
         "archive settings updated"
     );
-    Json(settings.masked()).into_response()
+    let mut body = serde_json::to_value(settings.masked()).unwrap_or_else(|_| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "known_categories".to_owned(),
+            crate::application::notify::known_categories(),
+        );
+    }
+    Json(body).into_response()
 }
 
 pub(crate) async fn admin_archive_run(
@@ -1421,11 +1436,37 @@ pub(crate) async fn admin_archive_metadata(
 pub(crate) async fn admin_archive_ingest(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(job): Json<crate::application::archive::LinkJob>,
+    request: axum::extract::Request,
 ) -> Response {
+    // Authenticate before touching the body: an unauthenticated caller must not
+    // get a different error shape (or a 422 from the JSON extractor) than a 401.
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
+    let body = match axum::body::to_bytes(request.into_body(), 256 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "请求体过大或读取失败",
+            )
+            .into_response();
+        }
+    };
+    let job: crate::application::archive::LinkJob = match serde_json::from_slice(&body) {
+        Ok(job) => job,
+        Err(error) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                &format!("链接任务不是合法 JSON: {error}"),
+            )
+            .into_response();
+        }
+    };
     let service = crate::application::archive::ArchiveService::new(
         crate::application::archive::ArchiveConfig::from_env(),
     );
