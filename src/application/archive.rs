@@ -22,15 +22,18 @@ pub(crate) const ARCHIVE_TMDB_KEY_ENV: &str = "LUX_TMDB_API_KEY";
 pub(crate) const ARCHIVE_TMDB_LANGUAGE_ENV: &str = "LUX_TMDB_LANGUAGE";
 pub(crate) const DEFAULT_ARCHIVE_ROOT: &str = "/vol5/1000/docker/lux-test";
 pub(crate) const ARCHIVE_POLL_SECONDS_ENV: &str = "LUX_ARCHIVE_POLL_SECONDS";
+pub(crate) const ARCHIVE_WASH_ENABLED_ENV: &str = "LUX_ARCHIVE_WASH_ENABLED";
+pub(crate) const ARCHIVE_WASH_TOLERANCE_ENV: &str = "LUX_ARCHIVE_WASH_TOLERANCE";
 /// Files modified more recently than this are still being written and are left
 /// for the next run.
 const SETTLE_SECONDS: u64 = 60;
 
-const TRANSFER_DIR: &str = "01-转存";
-const PENDING_DIR: &str = "02-待整理";
-const MEDIA_DIR: &str = "03-媒体";
-const FAILED_DIR: &str = "04-失败";
-const DUPLICATE_DIR: &str = "05-重复";
+const TRANSFER_DIR: &str = "转存";
+const PENDING_DIR: &str = "待整理";
+const MEDIA_DIR: &str = "媒体";
+const FAILED_DIR: &str = "失败";
+const DUPLICATE_DIR: &str = "重复";
+const WASH_DIR: &str = "洗版";
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "ts", "m2ts", "webm", "rmvb", "rm", "mpg", "mpeg",
@@ -41,6 +44,11 @@ pub(crate) struct ArchiveConfig {
     pub(crate) root: PathBuf,
     pub(crate) tmdb_api_key: Option<String>,
     pub(crate) tmdb_language: String,
+    /// Replace an existing entry when the incoming pack is larger than it.
+    pub(crate) wash_enabled: bool,
+    /// Relative size difference under which two packs count as the same version
+    /// (chill's `wash_tolerance_ratio`).
+    pub(crate) wash_tolerance_ratio: f64,
 }
 
 impl ArchiveConfig {
@@ -60,10 +68,22 @@ impl ArchiveConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "zh-CN".to_owned());
+        let wash_enabled = std::env::var(ARCHIVE_WASH_ENABLED_ENV)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        let wash_tolerance_ratio = std::env::var(ARCHIVE_WASH_TOLERANCE_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|ratio| (0.0..=1.0).contains(ratio))
+            .unwrap_or(0.02);
         Self {
             root,
             tmdb_api_key,
             tmdb_language,
+            wash_enabled,
+            wash_tolerance_ratio,
         }
     }
 
@@ -87,6 +107,10 @@ impl ArchiveConfig {
         self.root.join(DUPLICATE_DIR)
     }
 
+    pub(crate) fn wash_dir(&self) -> PathBuf {
+        self.root.join(WASH_DIR)
+    }
+
     /// Create every directory role. Idempotent.
     pub(crate) fn ensure_directories(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.transfer_dir())?;
@@ -94,6 +118,7 @@ impl ArchiveConfig {
         std::fs::create_dir_all(self.media_dir())?;
         std::fs::create_dir_all(self.failed_dir())?;
         std::fs::create_dir_all(self.duplicate_dir())?;
+        std::fs::create_dir_all(self.wash_dir())?;
         Ok(())
     }
 }
@@ -104,6 +129,7 @@ pub(crate) struct ArchiveReport {
     pub(crate) archived_to_pending: Vec<String>,
     pub(crate) organized: Vec<OrganizedItem>,
     pub(crate) duplicates: Vec<DuplicateItem>,
+    pub(crate) washed: Vec<WashedItem>,
     pub(crate) failed: Vec<FailedItem>,
     pub(crate) skipped: Vec<String>,
 }
@@ -123,6 +149,14 @@ pub(crate) struct OrganizedItem {
 pub(crate) struct DuplicateItem {
     pub(crate) source: String,
     pub(crate) existing: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct WashedItem {
+    pub(crate) source: String,
+    pub(crate) replaced: String,
+    pub(crate) replaced_size: u64,
+    pub(crate) kept_size: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -366,6 +400,16 @@ impl ArchiveService {
             }
             let target = target_dir.join(&target_name);
             if target.exists() {
+                let incoming_size = path_size(&entry);
+                let existing_size = path_size(&target);
+                if self.config.wash_enabled && incoming_size > 0 && existing_size > 0 {
+                    let delta = (incoming_size as f64 - existing_size as f64).abs();
+                    let tolerance = existing_size as f64 * self.config.wash_tolerance_ratio;
+                    if incoming_size > existing_size && delta > tolerance {
+                        self.wash_entry(report, &entry, &target, incoming_size, existing_size)?;
+                        continue;
+                    }
+                }
                 self.duplicate_entry(report, &entry, &target)?;
                 continue;
             }
@@ -424,6 +468,53 @@ impl ArchiveService {
         report.failed.push(FailedItem {
             source: name,
             reason: reason.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn wash_entry(
+        &self,
+        report: &mut ArchiveReport,
+        entry: &Path,
+        existing: &Path,
+        incoming_size: u64,
+        existing_size: u64,
+    ) -> Result<(), String> {
+        let name = entry
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| entry.display().to_string());
+        let replaced_name = existing
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| existing.display().to_string());
+        if report.dry_run {
+            report.washed.push(WashedItem {
+                source: name,
+                replaced: existing.display().to_string(),
+                replaced_size: existing_size,
+                kept_size: incoming_size,
+            });
+            return Ok(());
+        }
+        // Move the old pack out of the library first (under a timestamped name
+        // so history is never lost), then put the bigger pack in place.
+        let stamp = unix_now();
+        let retired = self
+            .config
+            .wash_dir()
+            .join(format!("{stamp}-{replaced_name}"));
+        move_entry(existing, &retired).map_err(|error| format!("旧版移入洗版目录失败: {error}"))?;
+        if let Err(error) = move_entry(entry, existing) {
+            // Best-effort rollback: put the old pack back where it was.
+            let _ = move_entry(&retired, existing);
+            return Err(format!("新版移入媒体目录失败: {error}"));
+        }
+        report.washed.push(WashedItem {
+            source: name,
+            replaced: retired.display().to_string(),
+            replaced_size: existing_size,
+            kept_size: incoming_size,
         });
         Ok(())
     }
@@ -584,6 +675,9 @@ impl ArchiveService {
             media_dir: self.config.media_dir().display().to_string(),
             failed_dir: self.config.failed_dir().display().to_string(),
             duplicate_dir: self.config.duplicate_dir().display().to_string(),
+            wash_dir: self.config.wash_dir().display().to_string(),
+            wash_enabled: self.config.wash_enabled,
+            wash_tolerance_ratio: self.config.wash_tolerance_ratio,
             tmdb_configured: self.config.tmdb_api_key.is_some(),
         }
     }
@@ -635,6 +729,7 @@ pub fn start_poller() {
                         organized = report.organized.len(),
                         failed = report.failed.len(),
                         duplicates = report.duplicates.len(),
+                        washed = report.washed.len(),
                         "archive pipeline run completed"
                     );
                 }
@@ -751,6 +846,23 @@ fn pick_best_result<'a>(
         .iter()
         .filter(|result| score(result) > 0)
         .max_by_key(|result| score(result))
+}
+
+/// Total size of a file or directory tree (metadata only, no data read).
+fn path_size(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    let Ok(reader) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    reader
+        .flatten()
+        .map(|entry| path_size(&entry.path()))
+        .sum()
 }
 
 /// A release pack counts as media when it holds a video file up to two levels
@@ -1178,6 +1290,9 @@ pub(crate) struct ArchiveStatus {
     pub(crate) media_dir: String,
     pub(crate) failed_dir: String,
     pub(crate) duplicate_dir: String,
+    pub(crate) wash_dir: String,
+    pub(crate) wash_enabled: bool,
+    pub(crate) wash_tolerance_ratio: f64,
     pub(crate) tmdb_configured: bool,
 }
 
