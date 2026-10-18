@@ -1,0 +1,12 @@
+# 构建上下文只留运行必需的三个东西
+tests/
+tools/
+session/
+state/
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+.gitignore
+README.md
+*.tgz

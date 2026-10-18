@@ -1,0 +1,13 @@
+# 登录态与运行数据都不进仓库
+session/*.session
+session/*.session-journal
+session/code.txt
+state/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 测试临时目录
+tests/.work/

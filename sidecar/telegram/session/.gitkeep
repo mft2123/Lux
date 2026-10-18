@@ -1,0 +1,2 @@
+# 这个目录是 telethon session 的卷挂载点（文档要求的 session/）。
+# 实际文件 lux-telegram.session 含登录态，已被 .gitignore 排除，不要提交。
