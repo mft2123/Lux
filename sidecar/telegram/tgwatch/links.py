@@ -18,6 +18,7 @@ offset/length 与 Telegram 一致，单位是 **UTF-16 码元**，不是 Python 
 
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -70,6 +71,9 @@ _URL_RE = re.compile(
 
 # 链接结尾常被正文标点粘住，需要剥掉
 _TRAILING_JUNK = "。，、；：！？）】》」』\"'”’,.;:!?)]}>~*"
+
+# 只认带分号的 HTML 实体（Telegram 把正文里的 & 转义成 &amp;）
+_HTML_ENTITY_RE = re.compile(r"&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,31});")
 
 _SIZE_RE = re.compile(
     # 只认带明确字节含义的单位：4K/8K 是分辨率、8M 多半是码率，不能被当成体积
@@ -139,14 +143,29 @@ def classify(url: str) -> str:
 
 
 def normalize_url(url: str) -> str:
-    """去掉正文标点、包裹符号和尾部的空转义。"""
-    candidate = url.strip().strip("<>《》【】「」\"'")
+    """去掉正文标点、包裹符号和尾部的空转义，并还原被 HTML 转义的链接。
+
+    频道正文里的链接常被转义成 `...?a=1&amp;b=2`，不还原就会把 `&amp;` 原样送进
+    Lux，下载端拿到的 query 是错的（review SC15）。
+    """
+    candidate = _unescape_entities(url or "").strip().strip("<>《》【】「」\"'")
     while candidate and candidate[-1] in _TRAILING_JUNK:
         candidate = candidate[:-1]
     # magnet 里的 dn/tr 参数不要动，只归一化协议前缀大小写
     if candidate.lower().startswith("magnet:"):
         return "magnet:" + candidate[len("magnet:") :]
     return candidate
+
+
+def _unescape_entities(value: str) -> str:
+    """只还原**带分号**的 HTML 实体（`&amp;` / `&#38;`）。
+
+    不带分号的写法（如 query 里的 `&not=2`）是正常参数，html.unescape 会把它当成
+    实体 `&not` 吃掉，所以这里先用正则圈定范围再还原。
+    """
+    if "&" not in value:
+        return value
+    return _HTML_ENTITY_RE.sub(lambda match: html.unescape(match.group(0)), value)
 
 
 def extract_links(text: str | None, entities: list[dict] | None = None) -> list[Link]:
