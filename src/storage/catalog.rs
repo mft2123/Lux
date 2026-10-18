@@ -124,6 +124,10 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
 fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
     // The explicit `item_type <> 'FOLDER'` predicate lets SQLite match the
     // existing partial index; the IN predicate alone is not inferred.
+    let library_placeholders = (0..library_count)
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
     let libraries = (0..library_count)
         .map(|_| {
              "SELECT recent.id, recent.library_id, recent.latest_added_at
@@ -135,17 +139,12 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                             available.latest_added_at
                      FROM (
                          SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title,
-                                CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
-                                    (SELECT MAX(child.added_at)
-                                     FROM media_items child
-                                     WHERE child.item_type = 'EPISODE'
-                                       AND child.removed_at IS NULL
-                                       AND child.has_available_source = 1
-                                       AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                                    mi.added_at
-                                ) ELSE mi.added_at END AS latest_added_at
+                                COALESCE(episode_latest.latest_added_at, mi.added_at) AS latest_added_at
                          FROM media_items mi
                          JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                         LEFT JOIN episode_latest
+                           ON episode_latest.root_id = mi.id
+                          AND episode_latest.library_id = mi.library_id
                          WHERE mi.library_id = ?
                            AND mi.item_type <> 'FOLDER'
                            AND mi.item_type IN ('MOVIE', 'SERIES')
@@ -160,17 +159,12 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                             unavailable_series.latest_added_at
                      FROM (
                          SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title,
-                                COALESCE(
-                                    (SELECT MAX(child.added_at)
-                                     FROM media_items child
-                                     WHERE child.item_type = 'EPISODE'
-                                       AND child.removed_at IS NULL
-                                       AND child.has_available_source = 1
-                                       AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                                    mi.added_at
-                                ) AS latest_added_at
+                                COALESCE(episode_latest.latest_added_at, mi.added_at) AS latest_added_at
                          FROM media_items mi
                          JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                         LEFT JOIN episode_latest
+                           ON episode_latest.root_id = mi.id
+                          AND episode_latest.library_id = mi.library_id
                          WHERE mi.library_id = ?
                            AND mi.item_type = 'SERIES'
                            AND mi.removed_at IS NULL
@@ -207,7 +201,31 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n             UNION ALL\n             ");
-    format!("WITH selected AS (\n             {libraries}\n             )")
+    format!(
+        "WITH episode_latest AS (
+             SELECT library_id, root_id, MAX(added_at) AS latest_added_at
+             FROM (
+                 SELECT library_id, series_id AS root_id, added_at
+                 FROM media_items
+                 WHERE item_type = 'EPISODE'
+                   AND removed_at IS NULL
+                   AND has_available_source = 1
+                   AND series_id IS NOT NULL
+                   AND library_id IN ({library_placeholders})
+                 UNION ALL
+                 SELECT library_id, parent_id AS root_id, added_at
+                 FROM media_items
+                 WHERE item_type = 'EPISODE'
+                   AND removed_at IS NULL
+                   AND has_available_source = 1
+                   AND parent_id IS NOT NULL
+                   AND library_id IN ({library_placeholders})
+             )
+             GROUP BY library_id, root_id
+         ), selected AS (
+             {libraries}
+             )"
+    )
 }
 
 fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> &'static str {
@@ -1260,7 +1278,10 @@ impl Database {
                 )
             } else {
                 let query = sqlite_recent_catalog_rows_by_library_query(library_ids.len());
-                let mut binds = Vec::with_capacity(library_ids.len() * 5);
+                let mut binds = Vec::with_capacity(library_ids.len() * 7);
+                for _ in 0..2 {
+                    binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
+                }
                 for library_id in library_ids {
                     binds.push(CatalogBind::Text(library_id));
                     binds.push(CatalogBind::Integer(limit));
@@ -9023,8 +9044,10 @@ mod tests {
 
         assert!(!query.contains("LATERAL"));
         assert!(!query.contains("ROW_NUMBER()"));
+        assert!(query.contains("episode_latest"));
+        assert!(!query.contains("(SELECT MAX(child.added_at)"));
         assert_eq!(query.matches("LIMIT ?").count(), 6);
-        assert_eq!(query.matches("UNION ALL").count(), 3);
+        assert_eq!(query.matches("UNION ALL").count(), 4);
     }
 
     #[tokio::test]
