@@ -12,7 +12,7 @@
 //! document first and then the code, never the other way around.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -329,6 +329,10 @@ pub(crate) struct LinkQueueReport {
     pub(crate) examined: usize,
     pub(crate) accepted: Vec<AcceptedLinkJob>,
     pub(crate) invalid: Vec<FailedItem>,
+    /// Jobs that could not be finished this round (state write or move failed).
+    /// They stay queued and are retried by the next round; a failure here never
+    /// stops the other jobs or the rest of the pipeline.
+    pub(crate) failed: Vec<FailedItem>,
     pub(crate) skipped_incomplete: Vec<String>,
 }
 
@@ -1693,7 +1697,7 @@ impl ArchiveService {
         })?;
         if let Some(existing) = self.find_existing_link_job(&job.url) {
             tracing::info!(
-                url = %job.url,
+                url = %mask_link_for_log(&job.url),
                 job_id = %existing.job_id,
                 file = %existing.file,
                 "link job already queued or already consumed; not queued again"
@@ -1711,7 +1715,10 @@ impl ArchiveService {
             LinkIngestError::Storage(format!("序列化链接任务失败: {error}"))
         })?;
         let temp = queue.join(format!(".{}.tmp", job.job_id));
-        std::fs::write(&temp, body.as_bytes())
+        // `0600` from the first byte: a share link may carry `?password=`, and
+        // the job file must be as private as the state file (`rename` keeps the
+        // mode, so 已处理/ stays 0600 as well).
+        write_private_file(&temp, body.as_bytes())
             .map_err(|error| LinkIngestError::Storage(format!("写入 {} 失败: {error}", temp.display())))?;
         std::fs::rename(&temp, &target).map_err(|error| {
             let _ = std::fs::remove_file(&temp);
@@ -1719,7 +1726,7 @@ impl ArchiveService {
         })?;
         tracing::info!(
             job_id = %job.job_id,
-            url = %job.url,
+            url = %mask_link_for_log(&job.url),
             title = job.title.as_deref().unwrap_or(""),
             mode = job.mode.as_deref().unwrap_or(""),
             file = %target.display(),
@@ -1787,6 +1794,14 @@ impl ArchiveService {
     /// `链接队列/状态.jsonl` with the `needs_115_client` status, moved into
     /// `链接队列/已处理/` and logged. Junk is quarantined in
     /// `链接队列/无效/`. Nothing outside the archive root is touched.
+    ///
+    /// Every job is handled **best effort**: a state write or a move that fails
+    /// is reported in `failed` and the round continues with the next job. One
+    /// stuck job must never abort `run_once`, otherwise a full disk or a name
+    /// collision would stop the whole archive pipeline for every round. The
+    /// state line is appended before the file is moved, and the job id is
+    /// remembered in `状态.jsonl`, so a job whose move failed is retried
+    /// without being accounted for twice.
     pub(crate) fn ingest_link_queue(&self, dry_run: bool) -> Result<LinkQueueReport, String> {
         let queue = self.config.link_queue_dir();
         let entries = read_dir_entries(&queue)?;
@@ -1794,6 +1809,16 @@ impl ArchiveService {
             dry_run,
             ..LinkQueueReport::default()
         };
+        // What an earlier round already recorded: read once up front instead of
+        // once per job, because the queue can hold thousands of files.
+        let mut accounted: HashSet<String> = HashSet::new();
+        if !dry_run {
+            for record in read_link_state(&self.config.link_state_file())? {
+                if record.status == LINK_JOB_STATUS_NEEDS_115 && !record.job_id.is_empty() {
+                    accounted.insert(record.job_id);
+                }
+            }
+        }
         for entry in entries {
             let name = entry
                 .file_name()
@@ -1849,36 +1874,147 @@ impl ArchiveService {
                 });
                 continue;
             }
-            let record = LinkJobStateRecord {
-                recorded_at_unix: unix_now(),
-                status: LINK_JOB_STATUS_NEEDS_115,
-                job_id: job.job_id.clone(),
-                url: job.url.clone(),
-                title: job.title.clone().unwrap_or_default(),
-                mode: job.mode.clone().unwrap_or_default(),
-                source: job.source.clone().unwrap_or_default(),
-                reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
-                job_file: name.clone(),
+            // Where the job file has to end up. `job_id` is the file name
+            // (docs §2.1), so a directory (or anything that is not a job file)
+            // squatting on that exact name is a real error the operator has to
+            // fix: renaming around it would break the reconciliation contract.
+            // A *different* job with the same name can only come from two links
+            // captured in the same millisecond and gets a suffix.
+            let done_dir = self.config.link_done_dir();
+            let direct = done_dir.join(&name);
+            let target = match std::fs::symlink_metadata(&direct) {
+                Ok(metadata) if metadata.file_type().is_file() => match job_file_job_id(&direct) {
+                    Some(parked) if parked == job.job_id => None,
+                    _ => Some(unique_target(&done_dir, &name)),
+                },
+                Ok(_) => {
+                    let reason = format!("已处理/{name} 已存在且不是作业文件，无法移入已处理");
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        file = %name,
+                        %reason,
+                        "link job could not be archived this round"
+                    );
+                    report.failed.push(FailedItem {
+                        source: name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(direct),
+                Err(error) => {
+                    let reason = format!("检查 已处理/{name} 失败: {error}");
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        file = %name,
+                        %reason,
+                        "link job could not be archived this round"
+                    );
+                    report.failed.push(FailedItem {
+                        source: name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
+            // The state line records the file it will really be parked under.
+            let job_file = match &target {
+                Some(target) => target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| name.clone()),
+                None => name.clone(),
             };
             let state_path = self.config.link_state_file();
-            append_link_state(&state_path, &record).map_err(|error| {
-                format!("写链接状态文件 {} 失败: {error}", state_path.display())
-            })?;
-            let done = unique_target(&self.config.link_done_dir(), &name);
-            move_entry(&entry, &done).map_err(|error| {
-                format!("移动任务文件 {name} 失败: {error}")
-            })?;
+            if !accounted.contains(&job.job_id) {
+                let record = LinkJobStateRecord {
+                    recorded_at_unix: unix_now(),
+                    status: LINK_JOB_STATUS_NEEDS_115,
+                    job_id: job.job_id.clone(),
+                    url: job.url.clone(),
+                    title: job.title.clone().unwrap_or_default(),
+                    mode: job.mode.clone().unwrap_or_default(),
+                    source: job.source.clone().unwrap_or_default(),
+                    reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+                    job_file,
+                };
+                if let Err(error) = append_link_state(&state_path, &record) {
+                    // Leave the file queued and retry next round: a record
+                    // failure is the same class of transient IO as a move
+                    // failure and must not abort the round either.
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        file = %name,
+                        %error,
+                        "failed to record a link job; the file stays queued for the next round"
+                    );
+                    report.failed.push(FailedItem {
+                        source: name.clone(),
+                        reason: format!("写链接状态文件失败: {error}"),
+                    });
+                    continue;
+                }
+                accounted.insert(job.job_id.clone());
+            }
+            let Some(target) = target else {
+                // The file is already in `已处理/`: an earlier round moved it
+                // but failed to record it. The single state line was recovered
+                // above, so drop the queue copy instead of leaving it pending.
+                match std::fs::remove_file(&entry) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            file = %name,
+                            "link job was already in 已处理/; removed the duplicate queue copy"
+                        );
+                        report.accepted.push(AcceptedLinkJob {
+                            job_id: job.job_id,
+                            url: job.url,
+                            file: done_dir.join(&name).display().to_string(),
+                            status: LINK_JOB_STATUS_NEEDS_115,
+                        });
+                    }
+                    Err(error) => {
+                        let reason = format!("删除重复的任务文件 {name} 失败: {error}");
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            file = %name,
+                            %reason,
+                            "link job retry failed"
+                        );
+                        report.failed.push(FailedItem {
+                            source: name.clone(),
+                            reason,
+                        });
+                    }
+                }
+                continue;
+            };
+            if let Err(error) = move_entry(&entry, &target) {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    file = %name,
+                    target = %target.display(),
+                    %error,
+                    "failed to move a link job into 已处理; the next round retries the move without recording it again"
+                );
+                report.failed.push(FailedItem {
+                    source: name.clone(),
+                    reason: format!("移动任务文件失败: {error}"),
+                });
+                continue;
+            }
             tracing::warn!(
-                job_id = %record.job_id,
-                url = %record.url,
-                title = %record.title,
-                mode = %record.mode,
+                job_id = %job.job_id,
+                url = %mask_link_for_log(&job.url),
+                title = job.title.as_deref().unwrap_or(""),
+                mode = job.mode.as_deref().unwrap_or(""),
                 "link job needs the 115 transfer client (not implemented): recorded, nothing downloaded"
             );
             report.accepted.push(AcceptedLinkJob {
-                job_id: record.job_id,
-                url: record.url,
-                file: done.display().to_string(),
+                job_id: job.job_id,
+                url: job.url,
+                file: target.display().to_string(),
                 status: LINK_JOB_STATUS_NEEDS_115,
             });
         }
@@ -1922,24 +2058,10 @@ impl ArchiveService {
     }
 
     /// Wash-mode support: how big is the copy we already have? Name-based and
-    /// metadata-only (no content is read): the biggest directory under
-    /// `媒体目录/` whose name looks like the requested title wins.
+    /// metadata-only (no content is read): the biggest *title* directory under
+    /// `媒体目录/` whose name matches the requested title wins.
     pub(crate) fn lookup_library_size(&self, title: &str) -> LibraryLookup {
-        let mut lookup = LibraryLookup {
-            title: title.trim().to_owned(),
-            ..LibraryLookup::default()
-        };
-        let query = normalize_title_key(&lookup.title);
-        if query.is_empty() {
-            return lookup;
-        }
-        let mut best: Option<(String, u64)> = None;
-        collect_library_entries(&self.config.media_dir(), 0, &query, &mut best);
-        if let Some((name, size)) = best {
-            lookup.matched = Some(name);
-            lookup.size_bytes = Some(size);
-        }
-        lookup
+        lookup_library_size_in(&self.config.media_dir(), title)
     }
 
     pub(crate) fn status(&self) -> ArchiveStatus {
@@ -2979,6 +3101,48 @@ pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
     Ok(url.to_owned())
 }
 
+/// Log-safe rendering of a share link: only `scheme://host`, and for a magnet
+/// only `magnet:?xt=urn:btih:<前8位>…`.
+///
+/// A share link may carry `?password=`, a per-recipient token or the full file
+/// name, so the raw URL must never reach a log line (review D7).
+pub(crate) fn mask_link_for_log(raw: &str) -> String {
+    let url = raw.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("magnet:") {
+        // The infohash identifies the torrent; eight characters are enough to
+        // correlate two log lines and useless to anyone else.
+        let hash = lower
+            .find("urn:btih:")
+            .map(|index| &url[index + "urn:btih:".len()..])
+            .unwrap_or_default();
+        let head: String = hash.chars().take(8).collect();
+        if head.is_empty() {
+            return "magnet:?xt=…".to_owned();
+        }
+        return format!("magnet:?xt=urn:btih:{head}…");
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "…".to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // `ed2k://|file|name|size|hash|/` has no host and the "authority" is the
+    // file name plus the hash: keep the scheme only.
+    if authority.contains('|') {
+        return format!("{scheme}://…");
+    }
+    // Drop `user:password@` if a producer ever sends credentials.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return format!("{scheme}://…");
+    }
+    format!("{scheme}://{host}")
+}
+
 /// Human-readable, file-name-safe job slug: alphanumerics and CJK kept,
 /// everything else collapsed to `-`, capped at 40 characters.
 fn link_slug(title: Option<&str>, url: &str) -> String {
@@ -3061,6 +3225,68 @@ fn append_link_state(path: &Path, record: &LinkJobStateRecord) -> std::io::Resul
     file.sync_all()
 }
 
+/// Write `contents` to `path` with mode `0600` on Unix. The queue holds share
+/// links, so a job file must not be world-readable even for the instant before
+/// it is renamed into place.
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    // A leftover temp file would keep its old mode through `truncate`; remove it
+    // first so the fresh `OpenOptions` mode applies.
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Parse `状态.jsonl` into its records.
+///
+/// A missing file means "nothing was consumed yet". Any other read error is
+/// returned instead of being treated as "no duplicates": silently deciding that
+/// a link is new would queue it a second time and hand the same share link to
+/// the transfer client twice.
+fn read_link_state(path: &Path) -> Result<Vec<LinkStateLine>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "读取链接状态文件 {} 失败: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut records = Vec::new();
+    let mut broken = 0usize;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<LinkStateLine>(line) {
+            Ok(record) => records.push(record),
+            Err(_) => broken += 1,
+        }
+    }
+    if broken > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            broken,
+            "link state file has unparsable lines; they are ignored"
+        );
+    }
+    Ok(records)
+}
+
+/// `job_id` stored inside a job file, if `path` is one.
+fn job_file_job_id(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let job = serde_json::from_str::<LinkJob>(&text).ok()?;
+    (!job.job_id.trim().is_empty()).then_some(job.job_id)
+}
+
 /// Comparison key for library titles: lowercase alphanumerics only, so
 /// `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
 fn normalize_title_key(value: &str) -> String {
@@ -3071,43 +3297,132 @@ fn normalize_title_key(value: &str) -> String {
         .collect()
 }
 
-/// Heuristic title match between a requested title and a library directory
-/// name. Exact containment wins; otherwise a long enough common prefix counts,
-/// because a Telegram title usually carries extra tags (`4K`, `HDR`, …) that
-/// the library directory does not.
-fn library_title_matches(query: &str, entry: &str) -> bool {
-    if query.is_empty() || entry.is_empty() {
-        return false;
-    }
-    if entry.contains(query) || query.contains(entry) {
-        return true;
-    }
-    let common = query
-        .chars()
-        .zip(entry.chars())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let shorter = query.chars().count().min(entry.chars().count());
-    shorter >= 4 && common * 5 >= shorter * 3
+/// Deepest level walked by the library lookup. A title is a child of a year
+/// directory (depth 3 in the normal chain, depth 2 for 晚会), so nothing deeper
+/// than the title directory is ever read.
+const LIBRARY_LOOKUP_MAX_DEPTH: usize = 3;
+
+/// A title query for the library lookup: the parsed title key plus the year the
+/// query carries (when it has one).
+struct LibraryQuery {
+    key: String,
+    year: Option<i64>,
 }
 
-/// Walk `媒体目录/` (four levels: type / region / year / title, and the shorter
-/// 晚会 chain) collecting the biggest directory whose name matches `query`.
+impl LibraryQuery {
+    fn new(title: &str) -> Option<Self> {
+        let (key, year) = title_match_key(title);
+        (!key.is_empty()).then_some(Self { key, year })
+    }
+}
+
+/// Match key of one title: parse the release name, keep the title without the
+/// year / season / episode / quality tags, and keep the year separately.
+fn title_match_key(value: &str) -> (String, Option<i64>) {
+    match parse_media_name(value) {
+        Some(parsed) => (normalize_title_key(&parsed.title), parsed.year),
+        None => (normalize_title_key(value), None),
+    }
+}
+
+/// `2024` / `未知年份` are the year level of the library tree, never a title.
+fn is_library_year_segment(name: &str) -> bool {
+    let name = name.trim();
+    (name.chars().count() == 4 && name.chars().all(|character| character.is_ascii_digit()))
+        || name == "未知年份"
+}
+
+/// Does the library title `entry_name` denote the same work as `query`?
+///
+/// Deliberately conservative, because a wrong size makes the wash mode treat a
+/// real upgrade as a duplicate:
+///
+/// - only the title layer is compared (the caller guarantees it), never the
+///   board / region / year directory names;
+/// - a year on both sides must agree (`某剧 2019` never matches `某剧 (2024)`);
+/// - titles of three characters or less must match exactly (`繁花` is not
+///   `繁花似锦`);
+/// - a longer title may only extend the shorter one with release tags, never
+///   with a sequel number (`流浪地球` is not `流浪地球2`).
+fn library_title_matches(query: &LibraryQuery, entry_name: &str) -> bool {
+    let (entry_key, entry_year) = title_match_key(entry_name);
+    if query.key.is_empty() || entry_key.is_empty() {
+        return false;
+    }
+    if let (Some(query_year), Some(entry_year)) = (query.year, entry_year) {
+        if query_year != entry_year {
+            return false;
+        }
+    }
+    if query.key == entry_key {
+        return true;
+    }
+    let shorter = query.key.chars().count().min(entry_key.chars().count());
+    if shorter <= 3 {
+        return false;
+    }
+    let (longer, short) = if entry_key.chars().count() > query.key.chars().count() {
+        (entry_key.as_str(), query.key.as_str())
+    } else {
+        (query.key.as_str(), entry_key.as_str())
+    };
+    let Some(remainder) = longer.strip_prefix(short) else {
+        return false;
+    };
+    // A bare number after the title is a sequel marker, not a release tag.
+    !remainder
+        .chars()
+        .all(|character| character.is_ascii_digit())
+}
+
+/// One library lookup against `media_dir` (see `ArchiveService::lookup_library_size`).
+fn lookup_library_size_in(media_dir: &Path, title: &str) -> LibraryLookup {
+    let mut lookup = LibraryLookup {
+        title: title.trim().to_owned(),
+        ..LibraryLookup::default()
+    };
+    let Some(query) = LibraryQuery::new(&lookup.title) else {
+        return lookup;
+    };
+    let mut best: Option<(String, u64)> = None;
+    collect_library_entries(media_dir, 0, &query, &mut best);
+    if let Some((name, size)) = best {
+        lookup.matched = Some(name);
+        lookup.size_bytes = Some(size);
+    }
+    lookup
+}
+
+/// Walk `媒体目录/` (type / region / year / title, and the shorter 晚会 chain)
+/// collecting the biggest **title** directory that matches `query`.
+///
+/// A title is only ever a child of a year directory, so the year / region /
+/// board names are never matched: a query like `2024` used to return the whole
+/// year. Symlinks are inspected with `symlink_metadata` and never followed, so
+/// a self-referential link cannot recurse and cannot smuggle in a size.
 fn collect_library_entries(
     directory: &Path,
     depth: usize,
-    query: &str,
+    query: &LibraryQuery,
     best: &mut Option<(String, u64)>,
 ) {
-    if depth > 4 {
+    if depth > LIBRARY_LOOKUP_MAX_DEPTH {
         return;
     }
+    let parent_is_year = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_library_year_segment);
     let Ok(reader) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in reader.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // `is_dir` on the symlink metadata is false for a link itself.
+        if !metadata.file_type().is_dir() {
             continue;
         }
         let Some(name) = path
@@ -3116,7 +3431,7 @@ fn collect_library_entries(
         else {
             continue;
         };
-        if library_title_matches(query, &normalize_title_key(&name)) {
+        if parent_is_year && library_title_matches(query, &name) {
             let size = path_size(&path);
             if best.as_ref().is_none_or(|(_, current)| size > *current) {
                 *best = Some((name.clone(), size));
@@ -3512,6 +3827,37 @@ mod tests {
         assert!(validate_link_url(&long).is_err());
     }
 
+    /// Logs must never contain the share link: only scheme + host survives, and
+    /// a magnet keeps the first eight characters of its infohash.
+    #[test]
+    fn masks_share_links_in_logs() {
+        assert_eq!(
+            mask_link_for_log("https://115.com/s/abc123?password=9999&uid=1"),
+            "https://115.com"
+        );
+        assert_eq!(
+            mask_link_for_log("  HTTP://115.com:8080/x/y  "),
+            "HTTP://115.com:8080"
+        );
+        assert_eq!(
+            mask_link_for_log("https://user:pass@115.com/s/abc?password=1"),
+            "https://115.com"
+        );
+        assert_eq!(
+            mask_link_for_log("magnet:?xt=urn:btih:abcdef0123456789&dn=secret.mkv"),
+            "magnet:?xt=urn:btih:abcdef01…"
+        );
+        assert_eq!(
+            mask_link_for_log("ed2k://|file|private.mkv|1|HASH|/"),
+            "ed2k://…"
+        );
+        assert_eq!(mask_link_for_log("https://"), "https://…");
+        assert_eq!(mask_link_for_log(""), "");
+        let masked = mask_link_for_log("https://115.com/s/abc?password=9999");
+        assert!(!masked.contains("password"));
+        assert!(!masked.contains("115.com/s/abc"));
+    }
+
     #[test]
     fn normalizes_link_job_fields() {
         let job = LinkJob {
@@ -3684,6 +4030,241 @@ mod tests {
         assert_eq!(report.skipped_incomplete.len(), 1);
         assert!(report.invalid.is_empty());
         assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    /// One stuck job must not block the others: the healthy job is archived
+    /// and recorded, the blocked one is counted once and retried next round.
+    #[test]
+    fn an_unmovable_link_job_does_not_stop_the_round() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        let blocked = LinkJob {
+            job_id: "1700000000000-blocked".to_owned(),
+            url: "https://115.com/s/blocked".to_owned(),
+            title: Some("被卡住的剧".to_owned()),
+            ..LinkJob::default()
+        };
+        let healthy = LinkJob {
+            job_id: "1700000000001-ok".to_owned(),
+            url: "https://115.com/s/ok".to_owned(),
+            title: Some("正常的剧".to_owned()),
+            ..LinkJob::default()
+        };
+        std::fs::write(queue.join("blocked.json"), serde_json::to_vec(&blocked).unwrap()).unwrap();
+        std::fs::write(queue.join("ok.json"), serde_json::to_vec(&healthy).unwrap()).unwrap();
+        // A directory squatting on the exact destination name of the blocked
+        // job: it cannot be moved, and nothing may be renamed around it.
+        let blocker = service.config.link_done_dir().join("blocked.json");
+        std::fs::create_dir_all(blocker.join("keep")).expect("blocker dir");
+        std::fs::write(blocker.join("keep").join("note.txt"), b"x").unwrap();
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 2);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].job_id, healthy.job_id);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].source, "blocked.json");
+        assert!(report.invalid.is_empty());
+
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(
+            state.lines().count(),
+            1,
+            "only the healthy job is recorded: {state}"
+        );
+        assert_eq!(service.status().pending_link_jobs, 1);
+        assert!(service.config.link_done_dir().join("ok.json").exists());
+        assert!(blocker.is_dir());
+
+        // The next round retries the blocked job and still accounts it once.
+        let again = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(again.failed.len(), 1);
+        assert!(again.accepted.is_empty());
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(state.lines().count(), 1);
+    }
+
+    /// State write and file move are two steps: a job recorded last round but
+    /// not moved is retried without a second state line.
+    #[test]
+    fn a_recorded_link_job_is_not_accounted_twice() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        let job = LinkJob {
+            job_id: "1700000000002-retry".to_owned(),
+            url: "https://115.com/s/retry".to_owned(),
+            title: Some("重试的剧".to_owned()),
+            ..LinkJob::default()
+        };
+        std::fs::write(queue.join("retry.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+        let record = LinkJobStateRecord {
+            recorded_at_unix: 1_700_000_000,
+            status: LINK_JOB_STATUS_NEEDS_115,
+            job_id: job.job_id.clone(),
+            url: job.url.clone(),
+            title: job.title.clone().unwrap_or_default(),
+            mode: String::new(),
+            source: String::new(),
+            reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+            job_file: "retry.json".to_owned(),
+        };
+        append_link_state(&service.config.link_state_file(), &record).expect("state");
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.accepted.len(), 1);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(service.config.link_done_dir().join("retry.json").exists());
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(
+            state.lines().count(),
+            1,
+            "the retried job is not recorded twice: {state}"
+        );
+    }
+
+    /// Job files carry share links (possibly `?password=`), so they are as
+    /// private as `状态.jsonl` — before and after the move into 已处理/.
+    #[cfg(unix)]
+    #[test]
+    fn link_job_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        }
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queued = service
+            .enqueue_link_job(link_job("https://115.com/s/secret?password=1"))
+            .expect("queued");
+        assert_eq!(mode_of(Path::new(&queued.file)), 0o600, "job file");
+
+        service.ingest_link_queue(false).expect("consumed");
+        let done = service.config.link_done_dir().join(
+            Path::new(&queued.file)
+                .file_name()
+                .expect("job file name"),
+        );
+        assert_eq!(mode_of(&done), 0o600, "已处理/ keeps the mode");
+        assert_eq!(mode_of(&service.config.link_state_file()), 0o600, "状态.jsonl");
+    }
+
+    /// The part number belongs to the title: asking for part two must not return
+    /// the size of part one.
+    #[test]
+    fn lookup_does_not_confuse_a_sequel_with_its_predecessor() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电影")
+            .join("国内")
+            .join("2019")
+            .join("流浪地球 (2019)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("movie.mkv"), vec![0u8; 2048]).unwrap();
+
+        assert_eq!(
+            service.lookup_library_size("流浪地球2 4K").size_bytes,
+            None,
+            "流浪地球2 must not match 流浪地球"
+        );
+        let found = service.lookup_library_size("流浪地球 4K HDR");
+        assert_eq!(found.matched.as_deref(), Some("流浪地球 (2019)"));
+        assert_eq!(found.size_bytes, Some(2048));
+    }
+
+    /// A year in the query must agree with the year in the library name; a
+    /// query without a year still matches (Telegram titles rarely carry one).
+    #[test]
+    fn lookup_requires_the_year_to_agree() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("某剧 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+
+        assert_eq!(
+            service.lookup_library_size("某剧 2019 4K").size_bytes,
+            None,
+            "2019 is not the 2024 copy"
+        );
+        assert_eq!(
+            service
+                .lookup_library_size("某剧 2024 4K")
+                .matched
+                .as_deref(),
+            Some("某剧 (2024)")
+        );
+        assert_eq!(
+            service.lookup_library_size("某剧 4K").matched.as_deref(),
+            Some("某剧 (2024)")
+        );
+    }
+
+    /// A two- or three-character title is too short for a prefix heuristic:
+    /// `繁花` must not match `繁花似锦`.
+    #[test]
+    fn lookup_requires_exact_match_for_short_titles() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2023")
+            .join("繁花似锦 (2023)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 512]).unwrap();
+
+        assert_eq!(
+            service.lookup_library_size("繁花").size_bytes,
+            None,
+            "繁花 is not 繁花似锦"
+        );
+        assert_eq!(
+            service.lookup_library_size("繁花似锦").size_bytes,
+            Some(512)
+        );
+    }
+
+    /// Only the title layer is matched: a year directory can never answer a
+    /// lookup, otherwise a query like `2024` returns a whole year of files.
+    #[test]
+    fn lookup_never_matches_a_year_directory() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let year_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024");
+        let title_dir = year_dir.join("某剧 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+        std::fs::write(year_dir.join("loose.mkv"), vec![0u8; 4096]).unwrap();
+
+        assert_eq!(service.lookup_library_size("2024").size_bytes, None);
+        assert_eq!(service.lookup_library_size("国内").size_bytes, None);
+        assert_eq!(service.lookup_library_size("电视剧").size_bytes, None);
     }
 
     #[test]

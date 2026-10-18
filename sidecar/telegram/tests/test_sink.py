@@ -31,11 +31,35 @@ def sample_item(**overrides):
 
 class PayloadTest(unittest.TestCase):
     def test_http_payload_is_documented_contract(self):
-        # Lux LinkJob：url + title + mode（brief 约定的三个字段）
+        # Lux LinkJob：url + title + mode + 溯源字段（review SC6）
         self.assertEqual(
             sink_mod.payload(sample_item()),
-            {"url": "https://115.com/s/abc", "title": "某剧 S01", "mode": "上新"},
+            {
+                "url": "https://115.com/s/abc",
+                "title": "某剧 S01",
+                "mode": "上新",
+                "source": "telegram",
+                "kind": "115",
+                "channel": "@chan",
+                "message_id": 42,
+                "size_bytes": 1024,
+                "captured_at": "2026-10-18T00:00:00+00:00",
+            },
         )
+
+    def test_traceability_fields_are_all_present(self):
+        body = sink_mod.payload(sample_item())
+        for key in ("source", "kind", "channel", "message_id", "size_bytes", "captured_at"):
+            self.assertIn(key, body)
+            self.assertNotIn(body[key], (None, ""), f"{key} 不能为空")
+
+    def test_unknown_size_is_null_and_message_id_is_int(self):
+        body = sink_mod.payload(sample_item(size_bytes=None, msg_id="77"))
+        self.assertIsNone(body["size_bytes"])
+        self.assertEqual(body["message_id"], 77)
+
+    def test_source_can_be_overridden_by_the_item(self):
+        self.assertEqual(sink_mod.payload(sample_item(source="replay"))["source"], "replay")
 
     def test_title_falls_back_to_anchor(self):
         self.assertEqual(sink_mod.payload(sample_item(title="", anchor="锚文本"))["title"], "锚文本")
@@ -179,10 +203,40 @@ class HttpSinkTest(unittest.TestCase):
             raise urllib.error.URLError("refused")
 
         with patch.object(urllib.request, "urlopen", boom):
-            with self.assertRaises(sink_mod.SinkError):
+            with self.assertRaises(sink_mod.SinkError) as ctx:
                 asyncio.run(sink.send(sample_item()))
+        # 网络错误可重试
+        self.assertFalse(ctx.exception.permanent)
 
-    def test_success_posts_url_title_mode_with_api_key_header(self):
+    def test_400_and_403_are_permanent(self):
+        """review SC4：Lux 的 400/403 重试无意义，必须标成永久失败。"""
+        for code in (400, 403):
+            sink = sink_mod.HttpSink(url="http://lux:8097/ingest", api_key="k")
+
+            def boom(*args, _code=code, **kwargs):
+                raise urllib.error.HTTPError(
+                    "http://lux:8097/ingest", _code, "denied", {}, io.BytesIO(b'{"error":"x"}')
+                )
+
+            with patch.object(urllib.request, "urlopen", boom):
+                with self.assertRaises(sink_mod.SinkError) as ctx:
+                    asyncio.run(sink.send(sample_item()))
+            self.assertTrue(ctx.exception.permanent, f"{code} 应当是永久失败")
+            self.assertIn(str(code), str(ctx.exception))
+            self.assertIn("永久", str(ctx.exception))
+
+    def test_5xx_is_retryable(self):
+        sink = sink_mod.HttpSink(url="http://lux:8097/ingest", api_key="k")
+
+        def boom(*args, **kwargs):
+            raise urllib.error.HTTPError("http://lux:8097/ingest", 503, "down", {}, io.BytesIO(b""))
+
+        with patch.object(urllib.request, "urlopen", boom):
+            with self.assertRaises(sink_mod.SinkError) as ctx:
+                asyncio.run(sink.send(sample_item()))
+        self.assertFalse(ctx.exception.permanent)
+
+    def test_success_posts_full_body_with_api_key_header(self):
         captured = {}
 
         class Response:
@@ -208,9 +262,10 @@ class HttpSinkTest(unittest.TestCase):
             asyncio.run(sink.send(sample_item()))
         self.assertEqual(captured["url"], "http://lux:8097/api/v1/admin/archive/ingest")
         self.assertEqual(captured["api_key"], "test-key")
-        self.assertEqual(
-            captured["body"], {"url": "https://115.com/s/abc", "title": "某剧 S01", "mode": "上新"}
-        )
+        self.assertEqual(captured["body"], sink_mod.payload(sample_item()))
+        # 线上 body 必须带齐溯源字段（review SC6）
+        self.assertEqual(captured["body"]["channel"], "@chan")
+        self.assertEqual(captured["body"]["message_id"], 42)
 
 
 class LookupTest(unittest.TestCase):
@@ -273,6 +328,18 @@ class SecretTest(unittest.TestCase):
         sink = sink_mod.HttpSink(url="http://lux/ingest", api_key="very-secret")
         described = json.dumps(sink.describe())
         self.assertNotIn("very-secret", described)
+
+    def test_describe_masks_ingest_url(self):
+        """review SC8：status 打印的 ingest_url 只留 scheme://host（D7）。"""
+        sink = sink_mod.HttpSink(
+            url="http://lux:8097/api/v1/admin/archive/ingest?token=deadbeef", api_key="k"
+        )
+        described = sink.describe()
+        self.assertEqual(described["url"], "http://lux:8097/…")
+        blob = json.dumps(described)
+        self.assertNotIn("deadbeef", blob)
+        self.assertNotIn("/api/", blob)
+        self.assertTrue(described["authorized"])
 
 
 if __name__ == "__main__":

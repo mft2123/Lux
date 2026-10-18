@@ -84,7 +84,13 @@ def _cmd_status(config: config_mod.SidecarConfig) -> int:
         print(f"⚠️  {warning}")
     store = store_mod.Store(config.state_db)
     try:
-        print("状态库: " + json.dumps(store.stats(), ensure_ascii=False))
+        stats = store.stats()
+        print("状态库: " + json.dumps(stats, ensure_ascii=False))
+        if stats.get("dead"):
+            print(
+                f"死信: {stats['dead']} 条（原因 {json.dumps(stats['dead_reasons'], ensure_ascii=False)}；"
+                "`main.py replay --id <id>` 可人工再试）"
+            )
     finally:
         store.close()
     try:
@@ -132,6 +138,7 @@ async def _cmd_replay(config: config_mod.SidecarConfig, args) -> int:
         store_mod.STATUS_PENDING,
         store_mod.STATUS_SKIPPED,
         store_mod.STATUS_DELIVERED,
+        store_mod.STATUS_DEAD,
     )
     unknown = [status for status in statuses if status not in known]
     if unknown:

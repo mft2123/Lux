@@ -2,8 +2,9 @@
 
 两种实现，`LUX_TG_SINK` 切换：
 
-1. `http`（默认）——POST 到 Lux 的 `POST /api/v1/admin/archive/ingest`，body
-   `{"url", "title", "mode"}`，带 `X-Lux-Api-Key`。Lux 校验后写入
+1. `http`（默认）——POST 到 Lux 的 `POST /api/v1/admin/archive/ingest`，body 见 `payload()`
+   （url/title/mode + 溯源字段 source/kind/channel/message_id/size_bytes/captured_at），
+   带 `X-Lux-Api-Key`。Lux 校验后写入
    `<archive_root>/链接队列/<ts>-<slug>.json`，流水线下一轮 `ingest_link_jobs()`
    把它记进 `状态.jsonl`（当前 115 转存客户端未实现，状态是 `needs_115_client`）。
 2. `inbox`——写入共享目录 `/watch-inbox/<ts>-<slug>.txt`（运维/离线诊断用；
@@ -24,21 +25,45 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .config import mask_url
 from .links import slugify
 
 log = logging.getLogger("tgwatch.sink")
 
+# 投递来源标记：Lux 的 LinkJob.source，用来区分「谁把这个链接送进来的」
+SOURCE_TELEGRAM = "telegram"
+
 
 class SinkError(RuntimeError):
-    """投递失败；runner 会把条目置 failed 并进重试队列。"""
+    """投递失败。
+
+    `permanent=True` 表示重试也不会成功（Lux 400 链接非法 / 403 无权限），
+    runner 直接把它落死信（review SC4）；其余错误进重试队列。
+    """
+
+    def __init__(self, message: str, *, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 def payload(item: dict) -> dict:
-    """Lux `POST /api/v1/admin/archive/ingest` 的 body（brief 约定的三个字段）。"""
+    """Lux `POST /api/v1/admin/archive/ingest` 的 body。
+
+    与 Lux 的 `LinkJob`（`src/application/archive.rs`）逐字段对齐：`url` + `title` + `mode`，
+    再加溯源字段 `source/kind/channel/message_id/size_bytes/captured_at`（review SC6），
+    这样 `链接队列/状态.jsonl` 的每条记录都能回溯到频道与原始消息。
+    """
+    msg_id = item.get("msg_id")
     return {
         "url": item.get("url"),
         "title": item.get("title") or item.get("anchor") or "",
         "mode": item.get("mode"),
+        "source": item.get("source") or SOURCE_TELEGRAM,
+        "kind": item.get("kind") or "",
+        "channel": item.get("channel") or "",
+        "message_id": int(msg_id) if msg_id is not None else None,
+        "size_bytes": item.get("size_bytes"),
+        "captured_at": item.get("msg_date") or "",
     }
 
 
@@ -92,8 +117,11 @@ class HttpSink:
                 error.close()
             if error.code == 401:
                 raise SinkError("Lux 拒绝：X-Lux-Api-Key 无效（检查 telegram.api_key）") from error
-            if error.code == 400:
-                raise SinkError(f"Lux 认为链接不合法（400）：{detail[:200]}") from error
+            if error.code in (400, 403):
+                # 400 链接被判非法、403 管理员接口无权限：重试多少次结果都一样（review SC4）
+                raise SinkError(
+                    f"Lux 永久拒绝（{error.code}，不再重试）：{detail[:200]}", permanent=True
+                ) from error
             raise SinkError(f"HTTP {error.code}: {detail[:200]}") from error
         except urllib.error.URLError as error:
             raise SinkError(f"连接 Lux 失败: {error.reason}") from error
@@ -115,7 +143,9 @@ class HttpSink:
             log.debug("Lux 已入队: job=%s file=%s", outcome.get("jobId"), outcome.get("file"))
 
     def describe(self) -> dict:
-        return {"sink": self.name, "url": self.url, "authorized": bool(self.api_key)}
+        # status 会把它打印出来：URL 只留 scheme://host（D7 / review SC8），
+        # query 里可能是 ingest token，绝不能明文上班。
+        return {"sink": self.name, "url": mask_url(self.url), "authorized": bool(self.api_key)}
 
 
 @dataclass

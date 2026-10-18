@@ -54,6 +54,54 @@ class ExtractTest(unittest.TestCase):
         kept = links.split_kinds(found, links.DEFAULT_ALLOWED_KINDS)
         self.assertEqual([link.kind for link in kept], [links.KIND_115])
 
+    def test_default_kinds_drop_other_and_telegram(self):
+        """review SC5：默认只放行已知网盘/磁力，other 要显式开关。"""
+        self.assertNotIn(links.KIND_OTHER, links.DEFAULT_ALLOWED_KINDS)
+        self.assertNotIn(links.KIND_TELEGRAM, links.DEFAULT_ALLOWED_KINDS)
+        for kind in (links.KIND_115, links.KIND_MAGNET, links.KIND_ED2K,
+                     links.KIND_ALIYUN, links.KIND_QUARK, links.KIND_BAIDU):
+            self.assertIn(kind, links.DEFAULT_ALLOWED_KINDS)
+
+    def test_news_link_is_other_and_dropped_by_default(self):
+        found = links.extract_links("新片资讯 https://example.com/news/2026/10 快看")
+        self.assertEqual([link.kind for link in found], [links.KIND_OTHER])
+        self.assertEqual(links.split_kinds(found, links.DEFAULT_ALLOWED_KINDS), [])
+        kept = links.split_kinds(found, (*links.DEFAULT_ALLOWED_KINDS, links.KIND_OTHER))
+        self.assertEqual([link.kind for link in kept], [links.KIND_OTHER])
+
+
+class HtmlEntityTest(unittest.TestCase):
+    """review SC15：正文里的 `&amp;` 必须还原成 `&`，否则 Lux 拿到的 query 是错的。"""
+
+    def test_amp_in_plain_link_is_unescaped(self):
+        found = links.extract_links("下载 https://115.com/s/abc?p=1&amp;q=2")
+        self.assertEqual([link.url for link in found], ["https://115.com/s/abc?p=1&q=2"])
+
+    def test_amp_in_hidden_link_is_unescaped(self):
+        entities = [
+            {
+                "type": "MessageEntityTextUrl",
+                "offset": 0,
+                "length": 2,
+                "url": "https://115.com/s/abc?a=1&amp;b=2",
+            }
+        ]
+        found = links.extract_links("某剧", entities)
+        self.assertEqual(found[0].url, "https://115.com/s/abc?a=1&b=2")
+
+    def test_numeric_entity_is_unescaped(self):
+        found = links.extract_links("https://pan.quark.cn/s/1?x=1&#38;y=2")
+        self.assertEqual(found[0].url, "https://pan.quark.cn/s/1?x=1&y=2")
+
+    def test_semicolonless_query_is_untouched(self):
+        # `&not=` / `&copy=` 是正常 query 参数，不能被 html.unescape 当成实体吃掉
+        found = links.extract_links("https://115.com/s/abc?not=1&copy=2")
+        self.assertEqual(found[0].url, "https://115.com/s/abc?not=1&copy=2")
+
+    def test_escaped_and_plain_forms_dedupe_to_one_link(self):
+        text = "https://115.com/s/abc?a=1&amp;b=2 和 https://115.com/s/abc?a=1&b=2"
+        self.assertEqual(len(links.extract_links(text)), 1)
+
 
 class ClassifyTest(unittest.TestCase):
     def test_host_boundary(self):

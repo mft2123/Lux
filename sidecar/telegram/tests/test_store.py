@@ -82,6 +82,25 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.store.get_item(held)["status"], store_mod.STATUS_PENDING)
         self.assertEqual(self.store.get_item(delivered)["status"], store_mod.STATUS_DELIVERED)
 
+    def test_promote_can_resurrect_dead_explicitly(self):
+        """死信默认不再自动重试，但 `replay --id` 必须能人工放行（review SC4）。"""
+        dead = self.store.add_item(
+            **item_kwargs(status=store_mod.STATUS_DEAD, reason="Lux 永久拒绝（400，不再重试）")
+        )
+        self.assertEqual(self.store.promote([dead]), 1)
+        self.assertEqual(self.store.get_item(dead)["status"], store_mod.STATUS_PENDING)
+        self.assertEqual(self.store.get_item(dead)["reason"], "released")
+
+    def test_stats_expose_dead_count_and_reasons(self):
+        self.store.add_item(**item_kwargs(status=store_mod.STATUS_DEAD, reason="400 forever"))
+        self.store.add_item(
+            **item_kwargs(url="https://115.com/s/q", status=store_mod.STATUS_DEAD, reason="403 forever")
+        )
+        stats = self.store.stats()
+        self.assertEqual(stats["dead"], 2)
+        self.assertEqual(stats["dead_reasons"], {"400 forever": 1, "403 forever": 1})
+        self.assertEqual(stats["by_status"][store_mod.STATUS_DEAD], 2)
+
     def test_stats(self):
         self.store.add_item(**item_kwargs(status=store_mod.STATUS_HELD))
         self.store.add_item(**item_kwargs(url="https://115.com/s/z", status=store_mod.STATUS_HELD))

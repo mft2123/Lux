@@ -135,6 +135,43 @@ class LoadTest(unittest.TestCase):
             self.load(payload)
         self.assertIn("api_key", str(ctx.exception))
 
+    def test_api_key_prefers_settings_file_over_env(self):
+        """review SC1 / D1：设置文件里的 key 是权威值，env 不能盖掉它。"""
+        cfg = self.load(env={"LUX_TG_API_KEY": "key-from-env"})
+        self.assertEqual(cfg.api_key, FAKE_API_KEY)
+
+    def test_api_key_falls_back_to_env(self):
+        payload = {"telegram": {"api_id": 1, "api_hash": "h", "api_key": ""}}
+        cfg = self.load(payload, env={"LUX_TG_API_KEY": "key-from-env"})
+        self.assertEqual(cfg.api_key, "key-from-env")
+
+    def test_missing_api_key_error_is_actionable(self):
+        payload = {"telegram": {"api_id": 1, "api_hash": "h"}}
+        with self.assertRaises(config_mod.ConfigError) as ctx:
+            self.load(payload)
+        message = str(ctx.exception)
+        self.assertIn("telegram.api_key", message)
+        self.assertIn("LUX_TG_API_KEY", message)
+        self.assertIn("API key", message)
+
+    def test_env_only_startup_works(self):
+        """只给 env 也要能启动（SC1 验收的三种情况之一）。"""
+        payload = {"telegram": {"api_id": 1, "api_hash": "h"}}
+        cfg = self.load(
+            payload,
+            env={
+                "LUX_TG_API_KEY": "key-from-env",
+                "LUX_TG_CHANNELS": "@a",
+            },
+        )
+        self.assertEqual(cfg.api_key, "key-from-env")
+        self.assertNotIn("key-from-env", json.dumps(cfg.masked(), ensure_ascii=False))
+
+    def test_settings_only_startup_works(self):
+        cfg = self.load()  # BASE 里只有文件、没有 LUX_TG_API_KEY
+        self.assertEqual(cfg.api_key, FAKE_API_KEY)
+        self.assertNotIn(FAKE_API_KEY, json.dumps(cfg.masked(), ensure_ascii=False))
+
     def test_inbox_sink_does_not_require_api_key(self):
         payload = {"telegram": {"api_id": 1, "api_hash": "h", "api_key": ""}}
         cfg = self.load(payload, env={"LUX_TG_SINK": "inbox"})
@@ -147,6 +184,32 @@ class LoadTest(unittest.TestCase):
     def test_unknown_kind_raises(self):
         with self.assertRaises(config_mod.ConfigError):
             self.load(env={"LUX_TG_ALLOWED_KINDS": "115,网盘"})
+
+    def test_other_is_not_allowed_by_default(self):
+        """review SC5：默认白名单里没有 other。"""
+        cfg = self.load()
+        self.assertNotIn("other", cfg.allowed_kinds)
+        self.assertIn("115", cfg.allowed_kinds)
+        self.assertIn("magnet", cfg.allowed_kinds)
+
+    def test_allow_other_switch_adds_other(self):
+        cfg = self.load(env={"LUX_TG_ALLOW_OTHER": "1"})
+        self.assertIn("other", cfg.allowed_kinds)
+        # 显式开关只加 other，不影响其余默认项
+        self.assertIn("115", cfg.allowed_kinds)
+        self.assertNotIn("telegram", cfg.allowed_kinds)
+
+    def test_allow_other_off_keeps_other_out(self):
+        cfg = self.load(env={"LUX_TG_ALLOW_OTHER": "0"})
+        self.assertNotIn("other", cfg.allowed_kinds)
+
+    def test_explicit_whitelist_with_other(self):
+        cfg = self.load(env={"LUX_TG_ALLOWED_KINDS": "115,other"})
+        self.assertEqual(cfg.allowed_kinds, ("115", "other"))
+
+    def test_bad_allow_other_value_raises(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load(env={"LUX_TG_ALLOW_OTHER": "maybe"})
 
     def test_bad_bool_raises(self):
         with self.assertRaises(config_mod.ConfigError):
@@ -188,6 +251,58 @@ class LoadTest(unittest.TestCase):
         self.assertEqual(cfg.state_db, self.dir / "st" / "state.db")
         self.assertEqual(cfg.inbox_dir, self.dir / "inbox")
         self.assertEqual(cfg.ingest_url, "http://lux.local/ingest")
+
+
+class SettingsPermissionTest(unittest.TestCase):
+    """review SC2：设置文件读不到时要给可操作的属组/权限提示，不能笼统报 ConfigError。"""
+
+    def setUp(self):
+        self.dir = support.mkdtemp()
+        self.addCleanup(support.cleanup, self.dir)
+
+    def test_permission_error_message_is_actionable(self):
+        path = write_settings(self.dir, BASE)
+        with patch.dict(os.environ, CLEAN_ENV, clear=True), patch.object(
+            Path, "read_text", side_effect=PermissionError(13, "Permission denied")
+        ):
+            with self.assertRaises(config_mod.ConfigError) as ctx:
+                config_mod.load(path)
+        message = str(ctx.exception)
+        self.assertIn("设置文件不可读", message)
+        self.assertIn("部署检查清单", message)
+        self.assertIn("LUX_ARCHIVE_SETTINGS_GROUP", message)
+        self.assertIn(str(path), message)
+        self.assertIn("Permission denied", message)
+
+    @unittest.skipUnless(os.name == "posix", "需要 POSIX 权限位")
+    def test_unreadable_file_on_disk_is_actionable(self):
+        if not support.permissions_enforced(self.dir):
+            self.skipTest("文件系统不校验 chmod（root 或忽略权限位的挂载点）")
+        path = write_settings(self.dir, BASE)
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+        with patch.dict(os.environ, CLEAN_ENV, clear=True):
+            with self.assertRaises(config_mod.ConfigError) as ctx:
+                config_mod.load(path)
+        self.assertIn("设置文件不可读", str(ctx.exception))
+
+    def test_missing_file_still_falls_back_to_env(self):
+        # 文件不存在 ≠ 权限错误：仍然走 env 兜底，不报「不可读」
+        with patch.dict(
+            os.environ,
+            {**CLEAN_ENV, "LUX_TG_API_ID": "7", "LUX_TG_API_HASH": "h", "LUX_TG_API_KEY": "k"},
+            clear=True,
+        ):
+            cfg = config_mod.load(self.dir / "missing.json")
+        self.assertEqual(cfg.api_id, 7)
+
+    def test_broken_json_is_reported_as_json_error(self):
+        path = self.dir / "archive-settings.json"
+        path.write_text("{not json", encoding="utf-8")
+        with patch.dict(os.environ, CLEAN_ENV, clear=True):
+            with self.assertRaises(config_mod.ConfigError) as ctx:
+                config_mod.load(path)
+        self.assertIn("JSON", str(ctx.exception))
 
 
 class MaskTest(unittest.TestCase):

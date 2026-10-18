@@ -7,6 +7,7 @@
     delivered→ 已成功写下游
     held     → 判定需要人工/信息不足（体积未知、库中体积未知）
     failed   → 下游投递失败，等 retry 循环重试
+    dead     → 死信：Lux 永久拒绝（400/403）或重试到上限（review SC4），不再自动重试
     skipped  → 判定不投（记原因，不再处理）
 """
 
@@ -66,6 +67,7 @@ STATUS_PENDING = "pending"
 STATUS_DELIVERED = "delivered"
 STATUS_HELD = "held"
 STATUS_FAILED = "failed"
+STATUS_DEAD = "dead"
 STATUS_SKIPPED = "skipped"
 
 RETRYABLE = (STATUS_PENDING, STATUS_HELD, STATUS_FAILED)
@@ -200,14 +202,18 @@ class Store:
             return [dict(row) for row in rows]
 
     def promote(self, item_ids: list[int], status: str = STATUS_PENDING) -> int:
-        """手动放行：held/pending → pending，让投递循环去推。"""
+        """手动放行：held/pending/failed → pending，让投递循环去推。
+
+        `dead` 也允许被显式放行（`replay --id N`）：死信默认不再自动重试，
+        但运维认清原因后可以手动再试一次。
+        """
         if not item_ids:
             return 0
         placeholders = ",".join("?" for _ in item_ids)
         with self._lock, closing(self._conn.cursor()) as cursor:
             cursor.execute(
                 f"UPDATE items SET status = ?, reason = 'released' WHERE id IN ({placeholders})"
-                f" AND status IN ('held', 'pending', 'failed')",
+                f" AND status IN ('held', 'pending', 'failed', 'dead')",
                 [status, *item_ids],
             )
             changed = cursor.rowcount
@@ -218,8 +224,20 @@ class Store:
         with self._lock, closing(self._conn.cursor()) as cursor:
             messages = cursor.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
             rows = cursor.execute("SELECT status, COUNT(*) AS n FROM items GROUP BY status").fetchall()
+            dead = cursor.execute(
+                "SELECT COALESCE(reason, '') AS reason, COUNT(*) AS n FROM items"
+                " WHERE status = ? GROUP BY reason ORDER BY n DESC, reason ASC LIMIT 5",
+                (STATUS_DEAD,),
+            ).fetchall()
         by_status = {row["status"]: row["n"] for row in rows}
-        return {"messages": messages, "items": sum(by_status.values()), "by_status": by_status}
+        return {
+            "messages": messages,
+            "items": sum(by_status.values()),
+            "by_status": by_status,
+            # 死信要能在 `status` 里看到「多少条 + 为什么」，否则 rollback 时无从下手
+            "dead": by_status.get(STATUS_DEAD, 0),
+            "dead_reasons": {row["reason"] or "unknown": row["n"] for row in dead},
+        }
 
     # ---- 频道游标（宕机期间的消息靠它补拉） ----
 

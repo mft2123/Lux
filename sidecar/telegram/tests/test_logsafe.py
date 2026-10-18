@@ -29,8 +29,12 @@ class RedactorTest(unittest.TestCase):
         self.assertNotIn(TOKEN, self.redactor.redact(f"Authorization: Bearer {TOKEN}"))
 
     def test_unknown_phone_pattern_removed(self):
-        out = self.redactor.redact("另一个号码 +8613900112233 也别露")
-        self.assertNotIn("13900112233", out)
+        # 用 +10000000000 这种明显假号，让全仓 grep 大陆手机号的验收能机械通过（review SC17）；
+        # redactor 故意不注册 PHONE，逼 _PHONE_RE 自己匹配，用例才有意义。
+        redactor = logsafe.SecretRedactor([API_HASH, TOKEN])
+        out = redactor.redact(f"另一个号码 {PHONE} 也别露")
+        self.assertNotIn("10000000000", out)
+        self.assertIn("****", out)
 
     def test_login_code_removed(self):
         out = self.redactor.redact("Please enter the code you received: 54321")

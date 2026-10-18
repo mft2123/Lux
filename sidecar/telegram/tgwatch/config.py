@@ -1,10 +1,11 @@
 """配置加载：读 Lux 的 `archive-settings.json` + 环境变量覆盖。
 
-优先级：环境变量 > 设置文件 > 内置默认值。
+优先级：设置文件 > 环境变量 > 内置默认值。唯一的例外是 `LUX_TG_API_KEY`，
+它只在设置文件 `telegram.api_key` 为空时兜底（D1：文件优先，env 只补缺）。
 
 `telegram` 段由 module-settings 维护，本模块 **只读**。额外读取两个顶层字段：
 - `wash_tolerance_ratio`：洗版容差，与 Lux 归档流水线用同一个值（默认 0.02）
-- `telegram.api_key`：调用 Lux 管理接口的 `X-Lux-Api-Key`
+- `telegram.api_key`：调用 Lux 管理接口的 `X-Lux-Api-Key`（env `LUX_TG_API_KEY` 兜底）
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .filters import MODE_MANUAL, ModeError, normalize_mode
-from .links import ALL_KINDS, DEFAULT_ALLOWED_KINDS
+from .links import ALL_KINDS, DEFAULT_ALLOWED_KINDS, KIND_OTHER
 
 MODULE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -227,14 +228,28 @@ def _as_list(value) -> tuple[str, ...]:
 
 
 def load_settings_file(path: str | Path) -> dict:
-    """读设置文件；文件缺失返回空 dict（此时全靠 env）。"""
+    """读设置文件；文件缺失返回空 dict（此时全靠 env）。
+
+    权限错误单独给可操作提示（review SC2）：容器以 uid 10001 只读挂载设置文件，
+    Lux 保存后写成 0640 + 属组；读不到时多半是属组没对上，不能再笼统报 ConfigError。
+    """
     target = Path(path)
     if not target.exists():
         return {}
     try:
-        raw = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        text = target.read_text(encoding="utf-8")
+    except PermissionError as error:
+        raise ConfigError(
+            f"设置文件不可读：检查属组/权限（见 README 的部署检查清单）：{target}（{error}）。"
+            "文件应为 0640 + 属组 $LUX_ARCHIVE_SETTINGS_GROUP，"
+            "compose 用 group_add 让 uid 10001 加入同一个 gid"
+        ) from error
+    except OSError as error:
         raise ConfigError(f"无法读取设置文件 {target}: {error}") from error
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"设置文件不是合法 JSON（{target}）：{error}") from error
     return raw if isinstance(raw, dict) else {}
 
 
@@ -298,6 +313,10 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
     unknown_kinds = [kind for kind in allowed if kind not in ALL_KINDS]
     if unknown_kinds:
         raise ConfigError(f"未知链接类型 {unknown_kinds}，可用: {list(ALL_KINDS)}")
+    # 默认不放行 other（任意 http 网页）；只有显式开关才收（review SC5）
+    allow_other = _env_bool("LUX_TG_ALLOW_OTHER", False)
+    if allow_other and KIND_OTHER not in allowed:
+        allowed = (*allowed, KIND_OTHER)
 
     sink = _env("LUX_TG_SINK", SINK_HTTP).lower()
     if sink not in SINKS:
@@ -306,10 +325,14 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
     base = (_env("LUX_TG_LUX_BASE") or DEFAULT_LUX_BASE).rstrip("/")
     ingest_url = _env("LUX_TG_INGEST_URL") or f"{base}{DEFAULT_INGEST_PATH}"
     lookup_url = _env("LUX_ARCHIVE_LOOKUP_URL") or f"{base}{DEFAULT_LOOKUP_PATH}"
-    api_key = _env("LUX_TG_API_KEY") or str(section.get("api_key") or "").strip()
+    # D1：文件优先、env 兜底。Lux 保存设置时会把 key 写进 telegram.api_key，
+    # 那才是唯一权威值；LUX_TG_API_KEY 只补「文件里还没填」的窗口期。
+    api_key = str(section.get("api_key") or "").strip() or _env("LUX_TG_API_KEY")
     if sink == SINK_HTTP and not api_key:
         raise ConfigError(
-            "sink=http 需要 Lux 管理 API key：在设置文件 telegram.api_key 里填，或设置 LUX_TG_API_KEY"
+            "缺少 Lux 管理 API key（sink=http 必需）：在设置文件的 telegram.api_key 里填"
+            f"（{path}；管理页「API key」或 POST /api/v1/admin/api-key/rotate 生成），"
+            "或设置环境变量 LUX_TG_API_KEY 兜底"
         )
 
     tolerance_raw = _env("LUX_TG_WASH_TOLERANCE") or settings.get("wash_tolerance_ratio")

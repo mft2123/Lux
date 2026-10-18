@@ -29,6 +29,12 @@ log = logging.getLogger("tgwatch.runner")
 
 DELIVER_CONCURRENCY = 4
 
+# 投递重试（review SC4）：Lux 的 400/403 重试也没用，直接落死信；
+# 其余错误（网络、5xx、磁盘）最多尝试这么多次，第 MAX 次仍失败就落死信。
+MAX_DELIVERY_ATTEMPTS = 20
+# 重试间隔的指数退避上限（秒）
+MAX_BACKOFF_SECONDS = 3600
+
 # 容器里没有 tty 时，验证码文档写进 session/code.txt；最多等 15 分钟
 CODE_WAIT_SECONDS = 900
 CODE_POLL_SECONDS = 2
@@ -37,6 +43,17 @@ CODE_REMIND_SECONDS = 30
 
 class RunnerError(RuntimeError):
     """启动前置条件不满足（未登录、session 损坏、频道解析不到、未装 telethon）。"""
+
+
+def backoff_seconds(base: int, consecutive_failures: int) -> int:
+    """连续失败时的重试间隔：base → 2*base → 4*base… 封顶 MAX_BACKOFF_SECONDS。
+
+    `consecutive_failures=0`（上一轮没有失败）回到 base。
+    """
+    interval = max(1, int(base))
+    if consecutive_failures <= 0:
+        return interval
+    return int(min(MAX_BACKOFF_SECONDS, interval * (2 ** min(consecutive_failures, 10))))
 
 
 def _telethon():
@@ -170,8 +187,18 @@ def code_provider(config: config_mod.SidecarConfig):
 
 
 async def _authorize(client, config: config_mod.SidecarConfig) -> None:
-    """首次运行登录（文档流程）：日志提示 → 人工录入 → session 落盘。"""
-    if not config.session_path.exists():
+    """首次运行登录（文档流程）：日志提示 → 人工录入 → session 落盘。
+
+    首次登录必须有 phone；缺了就在这里抛 `RunnerError`（exit 2 + 一行中文），
+    而不是让 telethon 抛一个带栈的 `ValueError`（review SC16）。
+    """
+    first_run = not config.session_path.exists()
+    if first_run and not config.phone:
+        raise RunnerError(
+            "首次登录缺少 phone：在设置文件的 telegram.phone 里填，或设置 LUX_TG_PHONE"
+            f"（session 已存在时不需要；当前 session 路径 {config.session_path}）"
+        )
+    if first_run:
         log.info("首次运行：%s 不存在，开始登录流程", config.session_path)
     await client.start(
         phone=config.phone or None,
@@ -188,19 +215,69 @@ async def _authorize(client, config: config_mod.SidecarConfig) -> None:
     )
 
 
+# 只有这两类消息才说明 session 文件本身被写坏（review SC3）。
+# sqlite 用 "file is not a database" / "database disk image is malformed" 报损坏。
+_SESSION_CORRUPT_MARKERS = ("not a database", "malformed")
+
+_SESSION_OPS_HINT = (
+    "检查 session 文件的属主/属组与权限（目录 0700、文件 0600，容器内 uid 10001）、"
+    "磁盘空间，以及是否有别的进程占用；修好后重启"
+)
+
+
+def _session_is_corrupt(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _SESSION_CORRUPT_MARKERS)
+
+
+def _sqlite_detail(error: BaseException) -> str:
+    """sqlite 原文 + errno/code：无权限、磁盘满、被锁的文案各不相同，不能被抹平。"""
+    detail = str(error) or error.__class__.__name__
+    extras: list[str] = []
+    errno_value = getattr(error, "errno", None)
+    if errno_value is not None:
+        extras.append(f"errno {errno_value}")
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        extras.append(f"{getattr(error, 'sqlite_errorname', None) or 'sqlite'} {code}")
+    return f"{detail}（{'，'.join(extras)}）" if extras else detail
+
+
 @contextlib.contextmanager
 def session_errors(config: config_mod.SidecarConfig):
-    """把 sqlite 层面的 session 损坏翻译成干净的中文错误（review F6）。
+    """把 sqlite 层面的 session 故障翻译成干净的中文错误（review F6 / SC3）。
 
-    Telethon 的 session 就是 sqlite 文件；被截断/写坏时 `TelegramClient(...)`
-    或 `start()` 会抛 `sqlite3.DatabaseError`，默认会连栈一起打到日志里，
-    再被 `restart: unless-stopped` 反复刷屏。
+    Telethon 的 session 就是 sqlite 文件；出错时默认会连栈打到日志里，再被
+    `restart: unless-stopped` 反复刷屏。分类比「一律说损坏」重要：
+
+    - `DatabaseError` 且消息含 `not a database` / `malformed`：文件真的坏了，
+      删掉重登即可；
+    - `OperationalError`（无权限、磁盘满、被锁）：文件没坏，原样带 errno 报出，
+      让人去修权限/空间，**不能**叫人删 session（删了要重新登录，问题还在）；
+    - 其余 sqlite 错误也只报一次，不猜成损坏。
     """
     try:
         yield
+    except sqlite3.OperationalError as error:
+        raise RunnerError(
+            f"session 无法打开或写入（{config.session_path}）：{_sqlite_detail(error)}；"
+            f"{_SESSION_OPS_HINT}"
+        ) from error
+    except sqlite3.DatabaseError as error:
+        detail = _sqlite_detail(error)
+        if _session_is_corrupt(error):
+            raise RunnerError(
+                f"session 文件损坏（{config.session_path}）：{detail}。"
+                "删掉它后重启，会重新走登录流程"
+            ) from error
+        raise RunnerError(
+            f"session 读取失败（{config.session_path}）：{detail}；"
+            "文件本身没被写坏，按提示检查权限/磁盘后再试"
+        ) from error
     except sqlite3.Error as error:
         raise RunnerError(
-            f"session 文件损坏（{config.session_path}）：删掉它后重启，会重新走登录流程"
+            f"session 访问失败（{config.session_path}）：{type(error).__name__}: "
+            f"{_sqlite_detail(error)}；{_SESSION_OPS_HINT}"
         ) from error
 
 
@@ -245,7 +322,7 @@ class Watcher:
         self.store = store
         self.sink = sink
         self.lookup = lookup or LibraryLookup(config.lookup_url, config.api_key, config.http_timeout)
-        self.counts = {"messages": 0, "delivered": 0, "held": 0, "skipped": 0, "failed": 0}
+        self.counts = {"messages": 0, "delivered": 0, "held": 0, "skipped": 0, "failed": 0, "dead": 0}
         self._semaphore = asyncio.Semaphore(DELIVER_CONCURRENCY)
         self._stop = asyncio.Event()
         # peer_key → ChannelConfig；启动解析频道时填充
@@ -357,7 +434,9 @@ class Watcher:
         )
         await self.deliver(item_ids)
 
-    async def deliver(self, item_ids: list[int]) -> None:
+    async def deliver(self, item_ids: list[int]) -> int:
+        """逐条投递；返回本轮失败（含落死信）的条数。"""
+        failures = 0
         for item_id in item_ids:
             item = self.store.get_item(item_id)
             if not item or item["status"] == store_mod.STATUS_DELIVERED:
@@ -366,38 +445,96 @@ class Watcher:
                 try:
                     await self.sink.send(item)
                 except sink_mod.SinkError as error:
-                    self.counts["failed"] += 1
-                    self.store.set_status(item_id, store_mod.STATUS_FAILED, str(error)[:200], bump_attempts=True)
-                    log.warning("投递失败 item=%s: %s", item_id, error)
+                    failures += 1
+                    self._record_failure(item, error)
+                except Exception as error:  # noqa: BLE001 - 序列化等意外也必须落状态（SC18）
+                    failures += 1
+                    log.exception("投递异常（非 SinkError）item=%s", item_id)
+                    self._record_failure(
+                        item, sink_mod.SinkError(f"未预期异常: {type(error).__name__}: {error}")
+                    )
                 else:
                     self.counts["delivered"] += 1
                     self.store.set_status(item_id, store_mod.STATUS_DELIVERED)
+        return failures
+
+    def _record_failure(self, item: dict, error: sink_mod.SinkError) -> None:
+        """永久失败（400/403）或试满 MAX_DELIVERY_ATTEMPTS → 死信，其余进 failed 重试。"""
+        item_id = int(item["id"])
+        attempts = int(item.get("attempts") or 0) + 1  # 含本次
+        reason = str(error)[:200]
+        if getattr(error, "permanent", False):
+            self.store.set_status(item_id, store_mod.STATUS_DEAD, reason, bump_attempts=True)
+            self.counts["dead"] += 1
+            log.warning(
+                "投递被 Lux 永久拒绝，落死信 item=%s attempts=%s（不再重试）: %s",
+                item_id,
+                attempts,
+                error,
+            )
+            return
+        if attempts >= MAX_DELIVERY_ATTEMPTS:
+            dead_reason = f"max_attempts({attempts}): {reason}"[:200]
+            self.store.set_status(item_id, store_mod.STATUS_DEAD, dead_reason, bump_attempts=True)
+            self.counts["dead"] += 1
+            log.error(
+                "投递失败已达上限 %s 次，落死信 item=%s: %s（`main.py replay --id %s` 可人工再试）",
+                MAX_DELIVERY_ATTEMPTS,
+                item_id,
+                error,
+                item_id,
+            )
+            return
+        self.counts["failed"] += 1
+        self.store.set_status(item_id, store_mod.STATUS_FAILED, reason, bump_attempts=True)
+        log.warning(
+            "投递失败 item=%s attempts=%s/%s: %s",
+            item_id,
+            attempts,
+            MAX_DELIVERY_ATTEMPTS,
+            error,
+        )
 
     # ---- 重试循环（failed + 手动放行后的 pending） ----
 
-    async def retry_once(self, limit: int = 50) -> int:
+    async def retry_once(self, limit: int = 50) -> tuple[int, int]:
+        """推一轮可重试条目；返回 (尝试条数, 失败条数)。"""
         items = self.store.items_by_status((store_mod.STATUS_FAILED, store_mod.STATUS_PENDING), limit=limit)
         if not items:
-            return 0
+            return 0, 0
         if self.config.dry_run:
             log.info("dry-run：跳过 %d 条待投递条目", len(items))
-            return 0
+            return 0, 0
         log.info("重试投递 %d 条", len(items))
-        await self.deliver([int(item["id"]) for item in items])
-        return len(items)
+        failures = await self.deliver([int(item["id"]) for item in items])
+        return len(items), failures
+
+    def retry_interval(self) -> int:
+        return max(10, int(self.config.retry_seconds))
+
+    async def _wait(self, seconds: float) -> bool:
+        """等 `seconds` 秒；期间收到 stop 返回 True。单独抽出来便于测试退避。"""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def retry_loop(self) -> None:
-        interval = max(10, int(self.config.retry_seconds))
+        base = self.retry_interval()
+        failures = 0
+        delay = base
         while not self._stop.is_set():
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            if await self._wait(delay):
                 return
-            except asyncio.TimeoutError:
-                pass
             try:
-                await self.retry_once()
+                _, failed = await self.retry_once()
             except Exception:  # pragma: no cover - 重试循环不能死
                 log.exception("重试循环异常")
+                failed = 1
+            # 一轮里还有失败就指数退避，全部成功则回到基准间隔
+            failures = failures + 1 if failed else 0
+            delay = backoff_seconds(base, failures)
 
     def stop(self) -> None:
         self._stop.set()
@@ -447,6 +584,21 @@ class Watcher:
 
 
 _BACKGROUND: set[asyncio.Task] = set()
+
+
+async def _drain_background(reason: str = "退出") -> None:
+    """取消并等待后台 handler 任务收尾（review SC11）。
+
+    `store.close()` 之后若还有 handler 在写库，会抛 `sqlite3.ProgrammingError`
+    （或静默丢记录）。所以断开连接前先把这些任务 cancel 掉并 gather 完。
+    """
+    tasks = [task for task in list(_BACKGROUND) if not task.done()]
+    if not tasks:
+        return
+    log.info("%s：等待 %d 个后台任务收尾", reason, len(tasks))
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _resolve_channel(client, channel: config_mod.ChannelConfig):
@@ -526,7 +678,9 @@ async def run(config: config_mod.SidecarConfig) -> None:
         except RunnerError:
             raise
         except sqlite3.Error as error:  # pragma: no cover - session_errors 已兜住
-            raise RunnerError(f"session 文件损坏：{error}") from error
+            raise RunnerError(
+                f"session 访问失败（{config.session_path}）：{_sqlite_detail(error)}"
+            ) from error
 
         resolved: list[tuple[config_mod.ChannelConfig, object]] = []
         for channel in config.channels:
@@ -577,6 +731,8 @@ async def run(config: config_mod.SidecarConfig) -> None:
             retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retry_task
+            # 后台 handler 必须先收尾，再让外层 finally 关库（review SC11）
+            await _drain_background("停止监听")
             log.info("统计: %s", watcher.counts)
     finally:
         if client is not None:
