@@ -1193,6 +1193,14 @@ impl ArchiveService {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_else(|| child.display().to_string());
+            // Season directories were already handled (or already failed) by
+            // the plan; do not move them a second time.
+            let is_season = child.is_dir()
+                && season_number_from_dir(&name).is_some()
+                && dir_contains_video(&child);
+            if is_season {
+                continue;
+            }
             let target = title_dir.join(&name);
             if target.exists() {
                 tracing::warn!(
