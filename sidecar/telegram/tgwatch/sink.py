@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .config import mask_url
 from .links import slugify
 
 log = logging.getLogger("tgwatch.sink")
@@ -142,7 +143,9 @@ class HttpSink:
             log.debug("Lux 已入队: job=%s file=%s", outcome.get("jobId"), outcome.get("file"))
 
     def describe(self) -> dict:
-        return {"sink": self.name, "url": self.url, "authorized": bool(self.api_key)}
+        # status 会把它打印出来：URL 只留 scheme://host（D7 / review SC8），
+        # query 里可能是 ingest token，绝不能明文上班。
+        return {"sink": self.name, "url": mask_url(self.url), "authorized": bool(self.api_key)}
 
 
 @dataclass

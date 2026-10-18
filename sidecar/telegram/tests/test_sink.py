@@ -329,6 +329,18 @@ class SecretTest(unittest.TestCase):
         described = json.dumps(sink.describe())
         self.assertNotIn("very-secret", described)
 
+    def test_describe_masks_ingest_url(self):
+        """review SC8：status 打印的 ingest_url 只留 scheme://host（D7）。"""
+        sink = sink_mod.HttpSink(
+            url="http://lux:8097/api/v1/admin/archive/ingest?token=deadbeef", api_key="k"
+        )
+        described = sink.describe()
+        self.assertEqual(described["url"], "http://lux:8097/…")
+        blob = json.dumps(described)
+        self.assertNotIn("deadbeef", blob)
+        self.assertNotIn("/api/", blob)
+        self.assertTrue(described["authorized"])
+
 
 if __name__ == "__main__":
     unittest.main()
