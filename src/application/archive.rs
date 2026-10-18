@@ -3160,6 +3160,10 @@ pub(crate) struct ArchiveStatus {
 
 /// Only real share links may enter the queue: a `file://` URL (or a crafted
 /// `javascript:` one) must never reach a future transfer client.
+///
+/// The scheme alone is not enough: the part after it must name a reachable
+/// target (`https://` or `magnet:?` with nothing behind it is rejected), because
+/// such a link can never be transferred and would just sit in the queue.
 pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
     let url = raw.trim();
     if url.is_empty() {
@@ -3174,9 +3178,72 @@ pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
         return Err("url 不能含空白或控制字符".to_owned());
     }
     let lowered = url.to_ascii_lowercase();
-    const ALLOWED: &[&str] = &["https://", "http://", "magnet:", "ed2k://"];
-    if !ALLOWED.iter().any(|prefix| lowered.starts_with(prefix)) {
-        return Err("不支持的链接协议（只接受 http(s) / magnet / ed2k）".to_owned());
+    if lowered.starts_with("https://") || lowered.starts_with("http://") {
+        return validate_http_link(url);
+    }
+    if lowered.starts_with("magnet:") {
+        return validate_magnet_link(url);
+    }
+    if lowered.starts_with("ed2k://") {
+        return validate_ed2k_link(url);
+    }
+    Err("不支持的链接协议（只接受 http(s) / magnet / ed2k）".to_owned())
+}
+
+/// `http(s)://<host>[/…]`: the authority must contain a real host name. An empty
+/// authority (`https://`, `https:///s/x`), a port without host or credentials
+/// without host are all rejected.
+fn validate_http_link(url: &str) -> Result<String, String> {
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return Err("链接缺少 host（例如 https://115.com/s/xxxx）".to_owned());
+    }
+    // Drop `user:password@`: the host is what remains.
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host_port.split(':').next().unwrap_or_default();
+    let valid = !host.is_empty()
+        && host
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'));
+    if !valid {
+        return Err(format!("链接缺少有效的 host: {host:?}"));
+    }
+    Ok(url.to_owned())
+}
+
+/// `magnet:?xt=urn:btih:<infohash>`: a magnet without an infohash cannot be
+/// fetched, so it is rejected instead of queued forever.
+fn validate_magnet_link(url: &str) -> Result<String, String> {
+    let rest = &url["magnet:".len()..];
+    let lowered = rest.to_ascii_lowercase();
+    let Some(index) = lowered.find("urn:btih:") else {
+        return Err("magnet 链接缺少 xt=urn:btih:<infohash>".to_owned());
+    };
+    let hash = &rest[index + "urn:btih:".len()..];
+    let hash_end = hash.find('&').unwrap_or(hash.len());
+    if hash[..hash_end].is_empty() {
+        return Err("magnet 链接的 infohash 为空".to_owned());
+    }
+    Ok(url.to_owned())
+}
+
+/// `ed2k://|file|<name>|<size>|<hash>|/`: the file target must carry a name and
+/// a hash.
+fn validate_ed2k_link(url: &str) -> Result<String, String> {
+    let rest = &url["ed2k://".len()..];
+    let Some(fields) = rest.strip_prefix("|file|") else {
+        return Err("ed2k 链接缺少 |file| 目标".to_owned());
+    };
+    let fields = fields.split('|').collect::<Vec<_>>();
+    if fields.first().is_none_or(|name| name.is_empty()) {
+        return Err("ed2k 链接缺少文件名".to_owned());
+    }
+    if fields.get(2).is_none_or(|hash| hash.is_empty()) {
+        return Err("ed2k 链接缺少 hash".to_owned());
     }
     Ok(url.to_owned())
 }
@@ -3998,6 +4065,22 @@ mod tests {
         assert!(validate_link_url("https://115.com/s/a b").is_err());
         let long = format!("https://115.com/s/{}", "a".repeat(3000));
         assert!(validate_link_url(&long).is_err());
+
+        // The scheme alone is not a link: the target after it must exist.
+        assert!(validate_link_url("https://").is_err());
+        assert!(validate_link_url("https:///s/abc").is_err());
+        assert!(validate_link_url("https://?password=1").is_err());
+        assert!(validate_link_url("http://:8080/x").is_err());
+        assert!(validate_link_url("magnet:").is_err());
+        assert!(validate_link_url("magnet:?").is_err());
+        assert!(validate_link_url("magnet:?dn=no-hash").is_err());
+        assert!(validate_link_url("magnet:?xt=urn:btih:").is_err());
+        assert!(validate_link_url("ed2k://").is_err());
+        assert!(validate_link_url("ed2k://|file|").is_err());
+        // Credentials are allowed as long as a host follows them.
+        assert!(validate_link_url("https://user:pass@115.com/s/abc").is_ok());
+        assert!(validate_link_url("https://115.com").is_ok());
+        assert!(validate_link_url("magnet:?xt=urn:btih:abcdef0123456789&dn=x").is_ok());
     }
 
     /// Logs must never contain the share link: only scheme + host survives, and
