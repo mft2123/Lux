@@ -267,7 +267,7 @@ def _clean_title(value: str) -> str:
 
 
 def slugify(value: str, fallback: str = "link") -> str:
-    """把标题压成文件名安全的短 slug（spool 文件名、日志用）。"""
+    """把标题压成文件名安全的短 slug（inbox 文件名、日志用）。"""
     normalized = unicodedata.normalize("NFKC", value or "").lower()
     pieces = re.findall(r"[0-9a-z\u4e00-\u9fff]+", normalized)
     slug = "-".join(pieces)[:60].strip("-")

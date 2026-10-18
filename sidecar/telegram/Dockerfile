@@ -1,10 +1,11 @@
 FROM python:3.12-slim
 
+# 注意：不设 ENV UMASK —— 镜像构建参数不会作用到进程 umask，
+# 真正的 umask(0o077) 在 main.py / tgwatch.runner 里设置。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    TZ=Asia/Shanghai \
-    UMASK=077
+    TZ=Asia/Shanghai
 
 WORKDIR /app
 

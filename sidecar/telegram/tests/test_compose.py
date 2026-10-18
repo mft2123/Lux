@@ -9,6 +9,7 @@ from pathlib import Path
 
 MODULE_ROOT = Path(__file__).resolve().parent.parent
 COMPOSE = MODULE_ROOT / "compose.fragment.yml"
+DOCKERFILE = MODULE_ROOT / "Dockerfile"
 
 
 class ComposeFragmentTest(unittest.TestCase):
@@ -27,6 +28,21 @@ class ComposeFragmentTest(unittest.TestCase):
 
     def test_deployment_checklist_is_mentioned(self):
         self.assertIn("部署检查清单", self.text)
+
+
+class DockerfileTest(unittest.TestCase):
+    def setUp(self):
+        self.text = DOCKERFILE.read_text(encoding="utf-8")
+
+    def test_no_pointless_umask_env(self):
+        # review SC14：镜像里的 `ENV UMASK=…` 不会作用到进程 umask，真实设置在各模块的 os.umask()
+        self.assertNotIn("UMASK" + "=077", self.text)
+
+    def test_runs_as_non_root(self):
+        self.assertIn("USER 10001:10001", self.text)
+
+    def test_healthcheck_uses_check_command(self):
+        self.assertIn("main.py check", self.text)
 
 
 if __name__ == "__main__":
