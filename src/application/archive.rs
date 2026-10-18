@@ -26,8 +26,14 @@ pub(crate) const ARCHIVE_POLL_SECONDS_ENV: &str = "LUX_ARCHIVE_POLL_SECONDS";
 pub(crate) const ARCHIVE_WASH_ENABLED_ENV: &str = "LUX_ARCHIVE_WASH_ENABLED";
 pub(crate) const ARCHIVE_WASH_TOLERANCE_ENV: &str = "LUX_ARCHIVE_WASH_TOLERANCE";
 /// Files modified more recently than this are still being written and are left
-/// for the next run.
-const SETTLE_SECONDS: u64 = 60;
+/// for the next run. Kept short: the pack is a copy in progress only during
+/// those seconds, and a slower pipeline loses far more time than a rare
+/// half-written pack gains.
+const DEFAULT_SETTLE_SECONDS: u64 = 5;
+pub(crate) const ARCHIVE_SETTLE_SECONDS_ENV: &str = "LUX_ARCHIVE_SETTLE_SECONDS";
+/// Metadata lookups run concurrently; moves stay sequential so duplicate and
+/// wash decisions see the batch in name order.
+const METADATA_RESOLVE_CONCURRENCY: usize = 8;
 
 const TRANSFER_DIR: &str = "转存目录";
 const PENDING_DIR: &str = "待整理";
@@ -45,6 +51,8 @@ pub(crate) struct ArchiveConfig {
     pub(crate) root: PathBuf,
     pub(crate) tmdb_api_key: Option<String>,
     pub(crate) tmdb_language: String,
+    /// How long a freshly written entry waits before it is claimed.
+    pub(crate) settle_seconds: u64,
     /// Replace an existing entry when the incoming pack is larger than it.
     pub(crate) wash_enabled: bool,
     /// Relative size difference under which two packs count as the same version
@@ -69,6 +77,11 @@ impl ArchiveConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "zh-CN".to_owned());
+        let settle_seconds = std::env::var(ARCHIVE_SETTLE_SECONDS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds <= 3600)
+            .unwrap_or(DEFAULT_SETTLE_SECONDS);
         let wash_enabled = std::env::var(ARCHIVE_WASH_ENABLED_ENV)
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
@@ -83,6 +96,7 @@ impl ArchiveConfig {
             root,
             tmdb_api_key,
             tmdb_language,
+            settle_seconds,
             wash_enabled,
             wash_tolerance_ratio,
         }
@@ -292,7 +306,7 @@ impl ArchiveService {
             if is_ignored_entry(&name) {
                 continue;
             }
-            if !entry_is_settled(&entry) {
+            if !entry_is_settled(&entry, self.config.settle_seconds) {
                 report.skipped.push(format!("{name} (仍在写入)"));
                 continue;
             }
@@ -327,6 +341,59 @@ impl ArchiveService {
             candidates.extend(read_dir_entries(&self.config.transfer_dir())?);
             candidates.sort();
         }
+        // TMDB latency dominates a run and every entry is independent, so the
+        // lookups are resolved up front in bounded concurrent chunks. The
+        // decisions below stay sequential and in name order so a duplicate
+        // pair is always compared deterministically.
+        let mut tmdb_results: HashMap<PathBuf, Result<Option<TmdbMatch>, String>> = HashMap::new();
+        let mut lookup_jobs: Vec<(PathBuf, ParsedName, bool)> = Vec::new();
+        for entry in &candidates {
+            let name = entry
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if is_ignored_entry(&name) || !entry_is_settled(entry, self.config.settle_seconds) {
+                continue;
+            }
+            let is_dir = entry.is_dir();
+            if is_dir {
+                if !dir_contains_video(entry) {
+                    continue;
+                }
+            } else if video_extension(entry).is_none() {
+                continue;
+            }
+            let raw_name = if is_dir {
+                name.clone()
+            } else {
+                stem_of(&name).to_string()
+            };
+            let Some(parsed) = parse_media_name(&raw_name) else {
+                continue;
+            };
+            let series_hint = is_dir && dir_signals_series(entry, &parsed);
+            lookup_jobs.push((entry.clone(), parsed, series_hint));
+        }
+        for chunk in lookup_jobs.chunks(METADATA_RESOLVE_CONCURRENCY) {
+            let mut join_set = tokio::task::JoinSet::new();
+            for (entry, parsed, series_hint) in chunk.iter() {
+                let config = Arc::clone(&self.config);
+                let http = self.http.clone();
+                let entry = entry.clone();
+                let parsed = parsed.clone();
+                let series_hint = *series_hint;
+                join_set.spawn(async move {
+                    let service = ArchiveService { config, http };
+                    let result = service.lookup_tmdb(&parsed, series_hint).await;
+                    (entry, result)
+                });
+            }
+            while let Some(joined) = join_set.join_next().await {
+                if let Ok((entry, result)) = joined {
+                    tmdb_results.insert(entry, result);
+                }
+            }
+        }
         for entry in candidates {
             let name = entry
                 .file_name()
@@ -335,7 +402,7 @@ impl ArchiveService {
             if is_ignored_entry(&name) {
                 continue;
             }
-            if !entry_is_settled(&entry) {
+            if !entry_is_settled(&entry, self.config.settle_seconds) {
                 report.skipped.push(format!("{name} (仍在写入)"));
                 continue;
             }
@@ -366,7 +433,11 @@ impl ArchiveService {
                 }
             };
             let series_hint = is_dir && dir_signals_series(&entry, &parsed);
-            let matched = match self.lookup_tmdb(&parsed, series_hint).await {
+            let lookup = match tmdb_results.remove(&entry) {
+                Some(result) => result,
+                None => self.lookup_tmdb(&parsed, series_hint).await,
+            };
+            let matched = match lookup {
                 Ok(Some(matched)) => matched,
                 Ok(None) => {
                     self.fail_entry(report, &entry, "TMDB 未找到匹配")?;
@@ -702,6 +773,7 @@ impl ArchiveService {
             failed_dir: self.config.failed_dir().display().to_string(),
             duplicate_dir: self.config.duplicate_dir().display().to_string(),
             wash_dir: self.config.wash_dir().display().to_string(),
+            settle_seconds: self.config.settle_seconds,
             wash_enabled: self.config.wash_enabled,
             wash_tolerance_ratio: self.config.wash_tolerance_ratio,
             tmdb_configured: self.config.tmdb_api_key.is_some(),
@@ -992,7 +1064,7 @@ fn is_ignored_entry(name: &str) -> bool {
     name.starts_with('.') || name == "原因.txt" || name.ends_with(".part") || name.ends_with(".tmp")
 }
 
-fn entry_is_settled(path: &Path) -> bool {
+fn entry_is_settled(path: &Path, settle_seconds: u64) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -1001,7 +1073,7 @@ fn entry_is_settled(path: &Path) -> bool {
     };
     SystemTime::now()
         .duration_since(modified)
-        .map(|age| age.as_secs() >= SETTLE_SECONDS)
+        .map(|age| age.as_secs() >= settle_seconds)
         .unwrap_or(true)
 }
 
@@ -1346,6 +1418,7 @@ pub(crate) struct ArchiveStatus {
     pub(crate) failed_dir: String,
     pub(crate) duplicate_dir: String,
     pub(crate) wash_dir: String,
+    pub(crate) settle_seconds: u64,
     pub(crate) wash_enabled: bool,
     pub(crate) wash_tolerance_ratio: f64,
     pub(crate) tmdb_configured: bool,
