@@ -437,6 +437,12 @@ class Watcher:
                 except sink_mod.SinkError as error:
                     failures += 1
                     self._record_failure(item, error)
+                except Exception as error:  # noqa: BLE001 - 序列化等意外也必须落状态（SC18）
+                    failures += 1
+                    log.exception("投递异常（非 SinkError）item=%s", item_id)
+                    self._record_failure(
+                        item, sink_mod.SinkError(f"未预期异常: {type(error).__name__}: {error}")
+                    )
                 else:
                     self.counts["delivered"] += 1
                     self.store.set_status(item_id, store_mod.STATUS_DELIVERED)

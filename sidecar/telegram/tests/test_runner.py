@@ -284,6 +284,24 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(body["captured_at"], "2026-10-18T00:00:00+00:00")
         self.assertIsNone(body["size_bytes"])  # 正文里没写体积
 
+    def test_unexpected_sink_exception_is_recorded(self):
+        """review SC18：SinkError 之外的异常也要落 failed，不能卡在 pending 无限重试。"""
+
+        class ExplodingSink(FakeSink):
+            async def send(self, item):
+                raise ValueError("cannot serialize payload")
+
+        config = make_config(self.tmp)
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        watcher = runner.Watcher(config, store, ExplodingSink(), FakeLookup())
+        asyncio.run(watcher.process(message(entities=HIDDEN), config.channels[0]))
+
+        failed = store.items_by_status((store_mod.STATUS_FAILED,))
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["attempts"], 1)
+        self.assertIn("cannot serialize payload", failed[0]["reason"])
+
     def test_sink_failure_marks_failed_and_retry_succeeds(self):
         config = make_config(self.tmp)
         store = store_mod.Store(config.state_db)
