@@ -494,6 +494,36 @@ fn write_private(path: &Path, contents: &str) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("无法创建设置目录 {}: {error}", parent.display()))?;
     }
+    write_with_fallback(path, contents, atomic_write)
+        .map_err(|error| format!("无法写入设置文件 {}: {error}", path.display()))
+}
+
+/// Atomic writes need a `rename` over the target. When the settings file is a
+/// single-file bind mount, `rename` fails with EBUSY/EXDEV and the only way to
+/// update it is to truncate and rewrite the file in place. The fallback is not
+/// atomic; readers can briefly observe a partial file, but the settings loader
+/// treats an unparsable document as "use the environment", so the window is
+/// bounded and visible in the log.
+fn write_with_fallback(
+    path: &Path,
+    contents: &str,
+    atomic: impl FnOnce(&Path, &str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match atomic(path, contents) {
+        Ok(()) => Ok(()),
+        Err(error) if is_bind_mount_error(&error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "atomic settings write failed; writing the bind-mounted file in place"
+            );
+            write_in_place(path, contents)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -511,11 +541,39 @@ fn write_private(path: &Path, contents: &str) -> Result<(), String> {
         fs::rename(&temp, path)?;
         set_private(path)
     })();
-    if let Err(error) = written {
+    if written.is_err() {
         let _ = fs::remove_file(&temp);
-        return Err(format!("无法写入设置文件 {}: {error}", path.display()));
     }
-    Ok(())
+    written
+}
+
+fn write_in_place(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    set_private(path)
+}
+
+fn is_bind_mount_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::CrossesDevices | std::io::ErrorKind::ResourceBusy
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EBUSY) | Some(libc::EXDEV))
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn create_private(path: &Path) -> std::io::Result<fs::File> {
@@ -875,6 +933,50 @@ mod tests {
             .collect();
         assert_eq!(entries, vec!["archive-settings.json".to_owned()]);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bind_mount_writes_fall_back_to_in_place() {
+        let directory = temporary_directory("bind-mount");
+        let path = directory.join("archive-settings.json");
+        fs::write(&path, "old").expect("seed");
+        let result = write_with_fallback(&path, "{\"new\":true}", |_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+        });
+        assert!(result.is_ok(), "fallback failed: {result:?}");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "{\"new\":true}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn write_failures_other_than_bind_mounts_are_propagated() {
+        let directory = temporary_directory("write-error");
+        let path = directory.join("archive-settings.json");
+        let result = write_with_fallback(&path, "x", |_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn bind_mount_errors_are_recognised() {
+        assert!(is_bind_mount_error(&std::io::Error::from_raw_os_error(
+            libc::EBUSY
+        )));
+        assert!(is_bind_mount_error(&std::io::Error::from_raw_os_error(
+            libc::EXDEV
+        )));
+        assert!(!is_bind_mount_error(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
     }
 
     #[test]
