@@ -47,15 +47,17 @@
 | `<root>/链接队列/已处理/` | 已消费的作业文件（保留原件，便于对账） |
 | `<root>/链接队列/无效/` | 校验失败被隔离的作业文件 |
 
-作业文件字段（未知字段忽略；`jobId` / `receivedAtUnix` 由 Lux 赋值，生产方给的 `jobId` 会被忽略）：
+作业文件字段（`snake_case`；未知字段忽略；`job_id` / `received_at_unix` 由 Lux 赋值，生产方给的 `jobId` 会被忽略）：
 
 ```json
-{"jobId":"1750000000123-某剧-第二季-4k","url":"https://115.com/s/xxx","title":"某剧 第二季 4K",
- "mode":"上新","source":"telegram","kind":"115","channel":"@chan","messageId":42,
- "sizeBytes":25769803776,"capturedAt":"2026-10-18T00:00:00+00:00","receivedAtUnix":1750000000}
+{"job_id":"1750000000123-某剧-第二季-4k","url":"https://115.com/s/xxx","title":"某剧 第二季 4K",
+ "mode":"上新","source":"telegram","kind":"115","channel":"@chan","message_id":42,
+ "size_bytes":25769803776,"captured_at":"2026-10-18T00:00:00+00:00","received_at_unix":1750000000}
 ```
 
-`jobId` 就是文件名（去掉 `.json`）：毫秒时间戳保证按到达顺序排序，标题 slug 让人一眼看出是哪个资源。
+`job_id` 就是文件名（去掉 `.json`）：毫秒时间戳保证按到达顺序排序，标题 slug 让人一眼看出是哪个资源。
+`POST` 的 body 只强制 `url`：`title` / `mode` 建议给，其余字段（`source`、`kind`、`channel`、`message_id`、
+`size_bytes`、`captured_at`）可选，名字用同一套 `snake_case`。
 
 消费规则：
 

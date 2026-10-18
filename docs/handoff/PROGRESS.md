@@ -31,6 +31,11 @@
   - 管理接口：`GET /api/v1/admin/archive/status`、`POST .../archive/run?dry_run=`、`POST .../archive/metadata?dry_run=&overwrite=`
   - 规范文档：`docs/archive-pipeline.md`（改行为先改它）
 - 测试：`cargo test --locked --lib archive` 22 个通过
+- **Telegram 旁挂 · Lux 侧交接**（分支 `feat/telegram-ingest`）：
+  `POST /api/v1/admin/archive/ingest` 把链接写成 `<archive_root>/链接队列/<ts>-<slug>.json`（按 URL 幂等）；
+  流水线每轮消费队列，登记 `<archive_root>/链接队列/状态.jsonl`（`needs_115_client`）并移入 `已处理/`，
+  **不下载、不转存**（115 转存客户端 U11 未实现）；`GET …/archive/lookup?title=` 供洗版查库中体积；
+  `GET …/archive/status` 新增 `link_queue_dir` / `link_state_file` / `pending_link_jobs`
 
 待做（按顺序）：
 
@@ -45,7 +50,7 @@
 | --- | --- | --- | --- |
 | 设置与 UI | module-settings.md | `src/application/archive/settings.rs`、`src/api/admin/admin_jobs.rs`、`web/src/features/settings/…` | 待开工 |
 | 通知 | module-notify.md | `src/application/archive/notify.rs`、admin 路由 | 待开工 |
-| Telethon 旁挂 | module-telethon.md | 新目录 `sidecar/telegram/`（Python） | 待开工 |
+| Telethon 旁挂 | module-telethon.md | Lux 侧 `src/application/archive.rs` + admin 路由；Python 侧车在 `sidecar/telegram/` | Lux 侧交接已交付（`feat/telegram-ingest`）；侧车由用户对话框推进 |
 
 ## 审核规则（总控对话框用）
 
