@@ -1,0 +1,37 @@
+FROM node:22-bookworm-slim AS web-builder
+ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
+WORKDIR /src/web
+COPY web/package.json web/pnpm-lock.yaml ./
+COPY web/pnpm-workspace.yaml ./
+RUN echo "registry=https://registry.npmmirror.com" > .npmrc \
+    && corepack enable \
+    && corepack prepare pnpm@11.9.0 --activate \
+    && pnpm install --frozen-lockfile
+COPY web ./
+RUN pnpm build
+
+FROM rust:1.94-bookworm AS builder
+COPY .cargo-config.toml /usr/local/cargo/config.toml
+WORKDIR /src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
+COPY migrations ./migrations
+COPY migrations-postgres ./migrations-postgres
+RUN mkdir -p src/bin \
+    && printf "pub fn placeholder() {}\n" > src/lib.rs \
+    && printf "fn main() {}\n" > src/main.rs \
+    && cargo build --release --locked --bin luxd
+COPY src ./src
+COPY assets ./assets
+COPY logo.svg ./logo.svg
+COPY web ./web
+COPY --from=web-builder /src/web/dist ./web/dist
+RUN cargo build --release --locked --bin luxd
+
+FROM pdzhou/lux:latest
+ARG LUX_VERSION=0.6.9-custom
+ARG LUX_REVISION=local
+COPY --from=builder /src/target/release/luxd /usr/local/bin/luxd
+COPY --from=web-builder /src/web/dist /usr/local/share/lux/web
