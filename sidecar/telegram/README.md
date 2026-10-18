@@ -235,6 +235,22 @@ docker exec -u 10001 lux-telegram python main.py replay --id 42   # 看清原因
 `LUX_TG_SINK=inbox` 时写 `/watch-inbox/<ts>-<slug>.txt`，首行链接、其余 `#` 注释、`0644`。
 注意：Lux 的 `ingest_watch_dirs` 只接受视频，`.txt` 进去会被判「不是视频文件」，**不要**拿它当正式通道。
 
+## 依赖锁定（SC10）
+
+`requirements.txt` 把直接依赖与关键传递依赖**全部钉死成 `name==version`**：
+
+```
+telethon==1.45.0  pyaes==1.6.1  rsa==4.9.1  pyasn1==0.6.4  python-socks==2.8.2
+```
+
+版本来自 `/vol5/1000/build/tgvenv` 的实际安装结果（`pip freeze`），文件头写明了来源与升级
+方法（改版本 → 干净 venv 重装 → 抄回 `pip freeze` → 跑 `tools/api_smoke.py` 与单测 →
+`docker build` 后用 `check --deep` 验登录态）。`tests/test_requirements.py` 会拒绝任何
+`~=` / 范围 / 未钉版本 / 行尾注释，并检查 telethon、pyaes、rsa、python-socks 四项都在。
+
+`python-socks` 是 telethon 的**可选**代理后端（不传 `proxy=` 就不会 import 它），钉住是为了
+以后真挂代理时版本也不漂。
+
 ## 测试
 
 ```bash
