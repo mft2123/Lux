@@ -96,7 +96,7 @@ class IncomingMessage:
     """一条待判定消息的纯数据视图（测试里直接造这个）。"""
 
     channel: str  # 配置里的频道标识，用于日志与 DB
-    chat_id: int
+    chat_id: int  # 只用于溯源；**不参与去重键**（review SC12）
     msg_id: int
     date: str
     text: str = ""
@@ -104,7 +104,19 @@ class IncomingMessage:
 
     @property
     def key(self) -> str:
-        return f"{self.chat_id}:{self.msg_id}"
+        """去重键：`channel:msg_id`（review SC12）。
+
+        老实现用 `chat_id:msg_id`：handler 路径有 `event.chat_id`（`-100…`），而
+        backfill 路径的消息没有这个属性、退化成 `0:<id>`，同一条消息于是有两个键，
+        可能被投递两次。频道标识（`@name` / `id:-100…`）在两条路径上都拿得到，
+        是唯一稳定的部分。
+
+        升级提示：键语义变了，旧状态库里的旧键不再命中。**最坏情况是重启后把回填
+        窗口里的消息再投递一次**；Lux 侧 ingest 按 URL 幂等（返回 `duplicate`），
+        不会产生第二条转存任务。不做数据迁移——旧键里的 chat_id 当时就没落库，
+        无法可靠还原。
+        """
+        return f"{self.channel}:{self.msg_id}"
 
 
 def entities_to_dicts(message) -> list[dict]:

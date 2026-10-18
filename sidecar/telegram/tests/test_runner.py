@@ -431,6 +431,70 @@ class PerLinkTitleTest(unittest.TestCase):
         self.assertEqual([item["reason"] for item in held], ["title_ambiguous"])
 
 
+class MessageKeyTest(unittest.TestCase):
+    """review SC12：去重键统一成 `channel:msg_id`，backfill 与 handler 必须一致。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def test_backfill_and_handler_produce_the_same_key(self):
+        channel = config_mod.ChannelConfig(channel="@chan")
+        # backfill：`iter_messages` 拿到的消息没有 chat_id 属性 → 老代码造出 0:42
+        backfill_message = FakeMessage(42, "某剧", HIDDEN, chat_id=None)
+        # handler：`event.chat_id` 是 -100… → 老代码造出 -100123:42
+        handler_message = FakeMessage(42, "某剧", HIDDEN, chat_id=-100123)
+
+        backfill = runner.incoming_from_message(backfill_message, channel.key())
+        handler = runner.incoming_from_message(handler_message, channel.key(), -100123)
+
+        # channel.key() 会把 `@` 去掉，所以键是 `chan:42`
+        self.assertEqual(backfill.key, "chan:42")
+        self.assertEqual(backfill.key, f"{channel.key()}:42")
+        self.assertEqual(handler.key, "chan:42")
+        self.assertEqual(backfill.key, handler.key)
+        # 旧格式（chat_id:msg_id、0:msg_id）不再生成
+        self.assertNotEqual(backfill.key, f"{backfill.chat_id}:{backfill.msg_id}")
+        self.assertNotEqual(handler.key, f"{handler.chat_id}:{handler.msg_id}")
+        self.assertFalse(backfill.key.startswith("0:"))
+        self.assertNotIn(str(-100123), handler.key)
+
+    def test_key_uses_the_normalized_channel_label(self):
+        channel = config_mod.ChannelConfig(channel="https://t.me/chan")
+        self.assertEqual(channel.key(), "chan")
+        incoming = runner.IncomingMessage(channel=channel.key(), chat_id=0, msg_id=7, date="")
+        self.assertEqual(incoming.key, "chan:7")
+
+    def test_same_message_from_backfill_then_handler_is_delivered_once(self):
+        config = make_config(self.tmp)
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        sink = FakeSink()
+        watcher = runner.Watcher(config, store, sink, FakeLookup())
+        channel = config.channels[0]
+
+        async def scenario():
+            await watcher.process(
+                runner.incoming_from_message(FakeMessage(42, "某剧", HIDDEN, chat_id=None), channel.key()),
+                channel,
+            )
+            # 同一条消息随后又从 handler 进来（event.chat_id 是 -100…）
+            await watcher.process(
+                runner.incoming_from_message(
+                    FakeMessage(42, "某剧", HIDDEN, chat_id=-100123), channel.key(), -100123
+                ),
+                channel,
+            )
+
+        asyncio.run(scenario())
+        self.assertEqual(len(sink.sent), 1, "同一 channel/msg_id 只能投递一次")
+        stats = store.stats()
+        self.assertEqual(stats["messages"], 1)
+        self.assertEqual(stats["items"], 1)
+
+
 class DeadLetterTest(unittest.TestCase):
     """review SC4：400/403 只尝试一次就落死信；其余错误重试到上限后落死信。"""
 

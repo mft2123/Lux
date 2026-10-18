@@ -268,6 +268,17 @@ SQLite 去重与频道游标、inbox 与 HTTP 契约（完整 payload）、`X-Lu
 死信与重试上限/退避、日志脱敏、登录验证码两条路径与首登 phone 校验、回填取最新 / 按游标补拉、
 session 权限加固、sqlite 错误分类（损坏 vs 权限/磁盘）、关停前收尾后台任务、部署片段静态检查。
 
+## 升级注意：去重键语义（SC12）
+
+消息去重键是 **`channel:msg_id`**（如 `somechannel:4321`，`channel` 取 `channel.key()`
+规范化后的标识，`@` 已被去掉）——频道标识在 handler 与 backfill 两条路径上都拿得到。
+老版本用 `chat_id:msg_id`，而 backfill 拿到的消息没有 `chat_id`，会退化成 `0:4321`，
+同一条消息于是有两个键、可能被投递两次。
+
+**升级到本版后旧键不再命中**：重启时回填窗口内的消息可能被**再投递一次**，最坏情况是
+Lux 侧多一条 `duplicate`（`POST /archive/ingest` 按 URL 幂等，返回 `duplicate:true`），
+不会重复转存。**没有数据迁移脚本**：旧键里的 chat_id 当时就没落库，无法可靠还原。
+
 ## 已知边界
 
 - **不实现 115 转存**：Lux 侧 ingest 只入队并标 `needs_115_client`，真正的转存在 U11。
