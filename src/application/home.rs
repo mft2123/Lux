@@ -224,48 +224,52 @@ impl HomeService {
             library_ids: library_ids.to_vec(),
         };
         let entry = self.entry(key, principal).await;
-        loop {
-            let generation = self.inner.generation.load(Ordering::Acquire);
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        {
+            let cached = entry.value.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
             {
-                let cached = entry.value.lock().await;
-                if let Some(cached) = cached.as_ref()
-                    && cached.generation == generation
-                {
-                    if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
-                        self.schedule_refresh();
-                    }
-                    return Ok(cached.snapshot.clone());
+                if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
+                    self.schedule_refresh();
                 }
+                return Ok(cached.snapshot.clone());
             }
-
-            let _compute_guard = entry.compute_lock.lock().await;
-            let generation = self.inner.generation.load(Ordering::Acquire);
-            let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
-            {
-                let cached = entry.value.lock().await;
-                if let Some(cached) = cached.as_ref()
-                    && cached.generation == generation
-                {
-                    if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
-                        self.schedule_refresh();
-                    }
-                    return Ok(cached.snapshot.clone());
-                }
-            }
-
-            let snapshot = Arc::new(self.build_cached_snapshot(principal, library_ids).await?);
-            if self.inner.generation.load(Ordering::Acquire) != generation
-                || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
-            {
-                continue;
-            }
-            *entry.value.lock().await = Some(CachedSnapshot {
-                generation,
-                refreshed_at: Instant::now(),
-                snapshot: snapshot.clone(),
-            });
-            return Ok(snapshot);
         }
+
+        let _compute_guard = entry.compute_lock.lock().await;
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+        {
+            let cached = entry.value.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+            {
+                if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
+                    self.schedule_refresh();
+                }
+                return Ok(cached.snapshot.clone());
+            }
+        }
+
+        let snapshot = Arc::new(self.build_cached_snapshot(principal, library_ids).await?);
+        // Serve the snapshot that was just built even when an invalidation
+        // landed while it was being built. Metadata backfill emits
+        // invalidations faster than a build completes, so discarding the
+        // result and retrying here starved every home/carousel request under
+        // load; the refresh worker converges the cache to the newest state.
+        let completed_generation = self.inner.generation.load(Ordering::Acquire);
+        if completed_generation != generation
+            || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
+        {
+            self.schedule_refresh();
+        }
+        *entry.value.lock().await = Some(CachedSnapshot {
+            generation: completed_generation,
+            refreshed_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
 
     pub(crate) fn invalidate(&self) {
@@ -487,7 +491,11 @@ impl HomeService {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::atomic::Ordering, time::Duration};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
 
     use super::{HOME_INVALIDATION_DEBOUNCE, HomeService};
     use crate::{
@@ -535,6 +543,44 @@ mod tests {
 
         assert!(std::ptr::eq(first.as_ref(), reused.as_ref()));
         assert!(!std::ptr::eq(first.as_ref(), isolated.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn invalidation_storm_does_not_starve_snapshot_requests() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let principal = AccessPrincipal::new(UserId::new(), false);
+
+        // Simulate metadata backfill: invalidations land faster than a
+        // snapshot build can complete, for as long as the request is pending.
+        let storm_home = home.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let storm_stop = stop.clone();
+        let storm = tokio::spawn(async move {
+            while !storm_stop.load(Ordering::Acquire) {
+                storm_home.invalidate();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let request = home.cached_snapshot(principal, &[]);
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("a snapshot request must not be starved by an invalidation storm")
+            .expect("snapshot request should succeed");
+        stop.store(true, Ordering::Release);
+        storm.await.expect("storm task should finish");
+
+        assert!(snapshot.recommended.len() <= 7);
     }
 
     #[tokio::test]
