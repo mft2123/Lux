@@ -1715,7 +1715,10 @@ impl ArchiveService {
             LinkIngestError::Storage(format!("序列化链接任务失败: {error}"))
         })?;
         let temp = queue.join(format!(".{}.tmp", job.job_id));
-        std::fs::write(&temp, body.as_bytes())
+        // `0600` from the first byte: a share link may carry `?password=`, and
+        // the job file must be as private as the state file (`rename` keeps the
+        // mode, so 已处理/ stays 0600 as well).
+        write_private_file(&temp, body.as_bytes())
             .map_err(|error| LinkIngestError::Storage(format!("写入 {} 失败: {error}", temp.display())))?;
         std::fs::rename(&temp, &target).map_err(|error| {
             let _ = std::fs::remove_file(&temp);
@@ -3194,6 +3197,26 @@ fn append_link_state(path: &Path, record: &LinkJobStateRecord) -> std::io::Resul
     file.sync_all()
 }
 
+/// Write `contents` to `path` with mode `0600` on Unix. The queue holds share
+/// links, so a job file must not be world-readable even for the instant before
+/// it is renamed into place.
+fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    // A leftover temp file would keep its old mode through `truncate`; remove it
+    // first so the fresh `OpenOptions` mode applies.
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 /// Parse `状态.jsonl` into its records.
 ///
 /// A missing file means "nothing was consumed yet". Any other read error is
@@ -3953,6 +3976,38 @@ mod tests {
             1,
             "the retried job is not recorded twice: {state}"
         );
+    }
+
+    /// Job files carry share links (possibly `?password=`), so they are as
+    /// private as `状态.jsonl` — before and after the move into 已处理/.
+    #[cfg(unix)]
+    #[test]
+    fn link_job_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        }
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queued = service
+            .enqueue_link_job(link_job("https://115.com/s/secret?password=1"))
+            .expect("queued");
+        assert_eq!(mode_of(Path::new(&queued.file)), 0o600, "job file");
+
+        service.ingest_link_queue(false).expect("consumed");
+        let done = service.config.link_done_dir().join(
+            Path::new(&queued.file)
+                .file_name()
+                .expect("job file name"),
+        );
+        assert_eq!(mode_of(&done), 0o600, "已处理/ keeps the mode");
+        assert_eq!(mode_of(&service.config.link_state_file()), 0o600, "状态.jsonl");
     }
 
     #[test]
