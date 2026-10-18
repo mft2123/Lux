@@ -979,6 +979,37 @@ mod tests {
         )));
     }
 
+    /// End-to-end check for F2: run inside a container that bind-mounts a
+    /// single host file onto `LUX_BIND_MOUNT_TEST_PATH`, e.g.
+    /// `docker run … -e LUX_BIND_MOUNT_TEST_PATH=/tmp/archive-settings.json
+    ///  -v /host/archive-settings.json:/tmp/archive-settings.json …
+    ///  cargo test --lib bind_mount_save_end_to_end -- --ignored`.
+    #[test]
+    #[ignore = "requires a single-file bind mount and LUX_BIND_MOUNT_TEST_PATH"]
+    fn bind_mount_save_end_to_end() {
+        let Ok(raw) = std::env::var("LUX_BIND_MOUNT_TEST_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(raw);
+        let settings = ArchiveSettings {
+            tmdb_api_key: "bind-mount-test".to_owned(),
+            poll_seconds: 42,
+            ..ArchiveSettings::default()
+        };
+        settings
+            .save_to(&path)
+            .expect("save over single-file bind mount");
+        let loaded = ArchiveSettings::load_from_with_base(&path, &ArchiveSettings::default());
+        assert_eq!(loaded.tmdb_api_key, "bind-mount-test");
+        assert_eq!(loaded.poll_seconds, 42);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
     #[test]
     fn a_missing_file_keeps_the_environment_base() {
         let directory = temporary_directory("missing");
