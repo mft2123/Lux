@@ -12,7 +12,7 @@
 //! document first and then the code, never the other way around.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -329,6 +329,10 @@ pub(crate) struct LinkQueueReport {
     pub(crate) examined: usize,
     pub(crate) accepted: Vec<AcceptedLinkJob>,
     pub(crate) invalid: Vec<FailedItem>,
+    /// Jobs that could not be finished this round (state write or move failed).
+    /// They stay queued and are retried by the next round; a failure here never
+    /// stops the other jobs or the rest of the pipeline.
+    pub(crate) failed: Vec<FailedItem>,
     pub(crate) skipped_incomplete: Vec<String>,
 }
 
@@ -1787,6 +1791,14 @@ impl ArchiveService {
     /// `链接队列/状态.jsonl` with the `needs_115_client` status, moved into
     /// `链接队列/已处理/` and logged. Junk is quarantined in
     /// `链接队列/无效/`. Nothing outside the archive root is touched.
+    ///
+    /// Every job is handled **best effort**: a state write or a move that fails
+    /// is reported in `failed` and the round continues with the next job. One
+    /// stuck job must never abort `run_once`, otherwise a full disk or a name
+    /// collision would stop the whole archive pipeline for every round. The
+    /// state line is appended before the file is moved, and the job id is
+    /// remembered in `状态.jsonl`, so a job whose move failed is retried
+    /// without being accounted for twice.
     pub(crate) fn ingest_link_queue(&self, dry_run: bool) -> Result<LinkQueueReport, String> {
         let queue = self.config.link_queue_dir();
         let entries = read_dir_entries(&queue)?;
@@ -1794,6 +1806,16 @@ impl ArchiveService {
             dry_run,
             ..LinkQueueReport::default()
         };
+        // What an earlier round already recorded: read once up front instead of
+        // once per job, because the queue can hold thousands of files.
+        let mut accounted: HashSet<String> = HashSet::new();
+        if !dry_run {
+            for record in read_link_state(&self.config.link_state_file())? {
+                if record.status == LINK_JOB_STATUS_NEEDS_115 && !record.job_id.is_empty() {
+                    accounted.insert(record.job_id);
+                }
+            }
+        }
         for entry in entries {
             let name = entry
                 .file_name()
@@ -1849,36 +1871,147 @@ impl ArchiveService {
                 });
                 continue;
             }
-            let record = LinkJobStateRecord {
-                recorded_at_unix: unix_now(),
-                status: LINK_JOB_STATUS_NEEDS_115,
-                job_id: job.job_id.clone(),
-                url: job.url.clone(),
-                title: job.title.clone().unwrap_or_default(),
-                mode: job.mode.clone().unwrap_or_default(),
-                source: job.source.clone().unwrap_or_default(),
-                reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
-                job_file: name.clone(),
+            // Where the job file has to end up. `job_id` is the file name
+            // (docs §2.1), so a directory (or anything that is not a job file)
+            // squatting on that exact name is a real error the operator has to
+            // fix: renaming around it would break the reconciliation contract.
+            // A *different* job with the same name can only come from two links
+            // captured in the same millisecond and gets a suffix.
+            let done_dir = self.config.link_done_dir();
+            let direct = done_dir.join(&name);
+            let target = match std::fs::symlink_metadata(&direct) {
+                Ok(metadata) if metadata.file_type().is_file() => match job_file_job_id(&direct) {
+                    Some(parked) if parked == job.job_id => None,
+                    _ => Some(unique_target(&done_dir, &name)),
+                },
+                Ok(_) => {
+                    let reason = format!("已处理/{name} 已存在且不是作业文件，无法移入已处理");
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        file = %name,
+                        %reason,
+                        "link job could not be archived this round"
+                    );
+                    report.failed.push(FailedItem {
+                        source: name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(direct),
+                Err(error) => {
+                    let reason = format!("检查 已处理/{name} 失败: {error}");
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        file = %name,
+                        %reason,
+                        "link job could not be archived this round"
+                    );
+                    report.failed.push(FailedItem {
+                        source: name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
+            // The state line records the file it will really be parked under.
+            let job_file = match &target {
+                Some(target) => target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| name.clone()),
+                None => name.clone(),
             };
             let state_path = self.config.link_state_file();
-            append_link_state(&state_path, &record).map_err(|error| {
-                format!("写链接状态文件 {} 失败: {error}", state_path.display())
-            })?;
-            let done = unique_target(&self.config.link_done_dir(), &name);
-            move_entry(&entry, &done).map_err(|error| {
-                format!("移动任务文件 {name} 失败: {error}")
-            })?;
+            if !accounted.contains(&job.job_id) {
+                let record = LinkJobStateRecord {
+                    recorded_at_unix: unix_now(),
+                    status: LINK_JOB_STATUS_NEEDS_115,
+                    job_id: job.job_id.clone(),
+                    url: job.url.clone(),
+                    title: job.title.clone().unwrap_or_default(),
+                    mode: job.mode.clone().unwrap_or_default(),
+                    source: job.source.clone().unwrap_or_default(),
+                    reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+                    job_file,
+                };
+                if let Err(error) = append_link_state(&state_path, &record) {
+                    // Leave the file queued and retry next round: a record
+                    // failure is the same class of transient IO as a move
+                    // failure and must not abort the round either.
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        file = %name,
+                        %error,
+                        "failed to record a link job; the file stays queued for the next round"
+                    );
+                    report.failed.push(FailedItem {
+                        source: name.clone(),
+                        reason: format!("写链接状态文件失败: {error}"),
+                    });
+                    continue;
+                }
+                accounted.insert(job.job_id.clone());
+            }
+            let Some(target) = target else {
+                // The file is already in `已处理/`: an earlier round moved it
+                // but failed to record it. The single state line was recovered
+                // above, so drop the queue copy instead of leaving it pending.
+                match std::fs::remove_file(&entry) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            file = %name,
+                            "link job was already in 已处理/; removed the duplicate queue copy"
+                        );
+                        report.accepted.push(AcceptedLinkJob {
+                            job_id: job.job_id,
+                            url: job.url,
+                            file: done_dir.join(&name).display().to_string(),
+                            status: LINK_JOB_STATUS_NEEDS_115,
+                        });
+                    }
+                    Err(error) => {
+                        let reason = format!("删除重复的任务文件 {name} 失败: {error}");
+                        tracing::warn!(
+                            job_id = %job.job_id,
+                            file = %name,
+                            %reason,
+                            "link job retry failed"
+                        );
+                        report.failed.push(FailedItem {
+                            source: name.clone(),
+                            reason,
+                        });
+                    }
+                }
+                continue;
+            };
+            if let Err(error) = move_entry(&entry, &target) {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    file = %name,
+                    target = %target.display(),
+                    %error,
+                    "failed to move a link job into 已处理; the next round retries the move without recording it again"
+                );
+                report.failed.push(FailedItem {
+                    source: name.clone(),
+                    reason: format!("移动任务文件失败: {error}"),
+                });
+                continue;
+            }
             tracing::warn!(
-                job_id = %record.job_id,
-                url = %record.url,
-                title = %record.title,
-                mode = %record.mode,
+                job_id = %job.job_id,
+                url = %job.url,
+                title = job.title.as_deref().unwrap_or(""),
+                mode = job.mode.as_deref().unwrap_or(""),
                 "link job needs the 115 transfer client (not implemented): recorded, nothing downloaded"
             );
             report.accepted.push(AcceptedLinkJob {
-                job_id: record.job_id,
-                url: record.url,
-                file: done.display().to_string(),
+                job_id: job.job_id,
+                url: job.url,
+                file: target.display().to_string(),
                 status: LINK_JOB_STATUS_NEEDS_115,
             });
         }
@@ -3061,6 +3194,48 @@ fn append_link_state(path: &Path, record: &LinkJobStateRecord) -> std::io::Resul
     file.sync_all()
 }
 
+/// Parse `状态.jsonl` into its records.
+///
+/// A missing file means "nothing was consumed yet". Any other read error is
+/// returned instead of being treated as "no duplicates": silently deciding that
+/// a link is new would queue it a second time and hand the same share link to
+/// the transfer client twice.
+fn read_link_state(path: &Path) -> Result<Vec<LinkStateLine>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "读取链接状态文件 {} 失败: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut records = Vec::new();
+    let mut broken = 0usize;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<LinkStateLine>(line) {
+            Ok(record) => records.push(record),
+            Err(_) => broken += 1,
+        }
+    }
+    if broken > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            broken,
+            "link state file has unparsable lines; they are ignored"
+        );
+    }
+    Ok(records)
+}
+
+/// `job_id` stored inside a job file, if `path` is one.
+fn job_file_job_id(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let job = serde_json::from_str::<LinkJob>(&text).ok()?;
+    (!job.job_id.trim().is_empty()).then_some(job.job_id)
+}
+
 /// Comparison key for library titles: lowercase alphanumerics only, so
 /// `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
 fn normalize_title_key(value: &str) -> String {
@@ -3684,6 +3859,100 @@ mod tests {
         assert_eq!(report.skipped_incomplete.len(), 1);
         assert!(report.invalid.is_empty());
         assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    /// One stuck job must not block the others: the healthy job is archived
+    /// and recorded, the blocked one is counted once and retried next round.
+    #[test]
+    fn an_unmovable_link_job_does_not_stop_the_round() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        let blocked = LinkJob {
+            job_id: "1700000000000-blocked".to_owned(),
+            url: "https://115.com/s/blocked".to_owned(),
+            title: Some("被卡住的剧".to_owned()),
+            ..LinkJob::default()
+        };
+        let healthy = LinkJob {
+            job_id: "1700000000001-ok".to_owned(),
+            url: "https://115.com/s/ok".to_owned(),
+            title: Some("正常的剧".to_owned()),
+            ..LinkJob::default()
+        };
+        std::fs::write(queue.join("blocked.json"), serde_json::to_vec(&blocked).unwrap()).unwrap();
+        std::fs::write(queue.join("ok.json"), serde_json::to_vec(&healthy).unwrap()).unwrap();
+        // A directory squatting on the exact destination name of the blocked
+        // job: it cannot be moved, and nothing may be renamed around it.
+        let blocker = service.config.link_done_dir().join("blocked.json");
+        std::fs::create_dir_all(blocker.join("keep")).expect("blocker dir");
+        std::fs::write(blocker.join("keep").join("note.txt"), b"x").unwrap();
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 2);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].job_id, healthy.job_id);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].source, "blocked.json");
+        assert!(report.invalid.is_empty());
+
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(
+            state.lines().count(),
+            1,
+            "only the healthy job is recorded: {state}"
+        );
+        assert_eq!(service.status().pending_link_jobs, 1);
+        assert!(service.config.link_done_dir().join("ok.json").exists());
+        assert!(blocker.is_dir());
+
+        // The next round retries the blocked job and still accounts it once.
+        let again = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(again.failed.len(), 1);
+        assert!(again.accepted.is_empty());
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(state.lines().count(), 1);
+    }
+
+    /// State write and file move are two steps: a job recorded last round but
+    /// not moved is retried without a second state line.
+    #[test]
+    fn a_recorded_link_job_is_not_accounted_twice() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        let job = LinkJob {
+            job_id: "1700000000002-retry".to_owned(),
+            url: "https://115.com/s/retry".to_owned(),
+            title: Some("重试的剧".to_owned()),
+            ..LinkJob::default()
+        };
+        std::fs::write(queue.join("retry.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+        let record = LinkJobStateRecord {
+            recorded_at_unix: 1_700_000_000,
+            status: LINK_JOB_STATUS_NEEDS_115,
+            job_id: job.job_id.clone(),
+            url: job.url.clone(),
+            title: job.title.clone().unwrap_or_default(),
+            mode: String::new(),
+            source: String::new(),
+            reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+            job_file: "retry.json".to_owned(),
+        };
+        append_link_state(&service.config.link_state_file(), &record).expect("state");
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.accepted.len(), 1);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(service.config.link_done_dir().join("retry.json").exists());
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(
+            state.lines().count(),
+            1,
+            "the retried job is not recorded twice: {state}"
+        );
     }
 
     #[test]
