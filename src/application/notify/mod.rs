@@ -63,6 +63,7 @@ pub(crate) struct NotifyStatus {
     pub enabled: bool,
     /// Masked for display; the full id never leaves the server.
     pub chat_id: Option<String>,
+    /// Masked base URL: credentials and token-bearing paths are hidden.
     pub api_base: String,
     pub categories: Vec<NotifyCategoryStatus>,
     pub stats: NotifyStats,
@@ -121,13 +122,19 @@ pub(crate) fn spawn_playback(notice: PlaybackNotice) {
     spawn_event(NotifyEvent::playback(notice));
 }
 
+/// Cheap check used by callers to skip gathering notification context when the
+/// bot is not configured and no other delivery path needs the data.
+pub(crate) fn is_configured() -> bool {
+    NotifyConfig::load().configured()
+}
+
 pub(crate) fn status() -> NotifyStatus {
     let config = NotifyConfig::load();
     NotifyStatus {
         configured: config.configured(),
         enabled: config.enabled,
         chat_id: config.masked_chat_id(),
-        api_base: config.api_base.clone(),
+        api_base: config.masked_api_base(),
         categories: NotifyCategory::ALL
             .into_iter()
             .map(|category| NotifyCategoryStatus {
@@ -363,7 +370,7 @@ mod tests {
             max_per_minute: 20,
         };
         let json = serde_json::to_value(&status).expect("serialize status");
-        assert_eq!(json["categories"].as_array().map(Vec::len), Some(10));
+        assert_eq!(json["categories"].as_array().map(Vec::len), Some(11));
         assert_eq!(json["dedupeWindowSeconds"], 60);
         assert_eq!(json["chatId"], "586***60");
     }
