@@ -2,6 +2,7 @@
 
 > 用法：每个新对话框开场说「读 docs/handoff/PROGRESS.md 和对应的 module-*.md，然后继续」。
 > 总控对话框负责审核、合并、更新本文件；模块对话框只改动自己模块的文件。
+> 交接与整体规划见 `docs/handoff/HANDOFF.md`（新人/新对话先读它）。
 
 ## 环境速查
 
