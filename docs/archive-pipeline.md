@@ -311,8 +311,10 @@
   配置优先级：**文件 > 环境变量 > 默认值**（按字段合并，见 §8）。设置文件若是单文件 bind mount，
   `rename` 不可用时退化为原地写（0600）；写入窗口内读到半截 JSON 会回退到环境变量。
 - `POST /api/v1/admin/archive/ingest` — 旁挂交接入口。Body `{"url":"…","title":"…","mode":"…"}`（其余字段可选，
-  见 2.1）；返回 `202 {"ok":true,"jobId":"…","file":"…","status":"needs_115_client","duplicate":false}`。
-  同一 URL 重复投递时 `duplicate` 为 `true` 且不会再写文件。
+  见 2.1）；返回 `202 {"ok":true,"jobId":"…","file":"…","status":"queued","duplicate":false}`。
+  202 的 `status` 是**入队态** `queued`：消费者下一轮才写 `needs_115_client`。
+  同一 URL 重复投递时 `duplicate` 为 `true` 且不会再写文件；需要重新投递已消费的链接时，
+  body 加 `"force": true`（跳过 URL 幂等检查、重新入队并分配新 jobId）。
   鉴权同管理接口（`X-Lux-Api-Key` 或 `Bearer`），且**先鉴权再解析 body**：未认证一律 401，
   body 非法 400（不是 axum 的 422）；URL / `mode` 非法返回 `400`；
   队列不可写、或查重所需的 `状态.jsonl` / 队列目录读不出来返回 `500`（拒绝而不是重复排队）。

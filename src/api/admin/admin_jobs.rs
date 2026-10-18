@@ -1498,7 +1498,9 @@ pub(crate) async fn admin_archive_ingest(
                 "ok": true,
                 "jobId": queued.job_id,
                 "file": queued.file,
-                "status": queued.status,
+                // The job is queued, not transferred: `needs_115_client` is
+                // what the consumer will record, the response describes now.
+                "status": "queued",
                 "duplicate": queued.duplicate,
                 "note": crate::application::archive::LINK_JOB_NEEDS_115_REASON,
             })),

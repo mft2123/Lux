@@ -12,6 +12,10 @@ use super::event::NotifyEvent;
 pub(crate) const MAX_MESSAGE_UNITS: usize = 3_900;
 const MAX_OVERVIEW_CHARS: usize = 320;
 const MAX_FIELD_VALUE_CHARS: usize = 400;
+/// Hard cap for one rendered field value, measured in UTF-16 units *after*
+/// escaping: `&` becomes `&amp;`, so a 400-character value could otherwise
+/// expand to ~2000 units and starve every following field.
+const MAX_FIELD_UNITS: usize = 400;
 const FOOTER: &str = "— Lux";
 
 pub(crate) fn format_message(event: &NotifyEvent, timezone_offset_hours: i64) -> String {
@@ -35,7 +39,8 @@ fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: u
 
     for field in &event.fields {
         let label = escape_html(field.label.trim());
-        let value = escape_html(&truncate_chars(field.value.trim(), MAX_FIELD_VALUE_CHARS));
+        let escaped = escape_html(&truncate_chars(field.value.trim(), MAX_FIELD_VALUE_CHARS));
+        let value = truncate_escaped(&escaped, MAX_FIELD_UNITS);
         if label.is_empty() || value.is_empty() {
             continue;
         }
@@ -102,8 +107,8 @@ fn append_with_budget(line: &str, budget: usize) -> Option<String> {
     if budget <= 2 {
         return None;
     }
-    // Keep one unit for the ellipsis.
-    Some(truncate_units(line, budget - 1))
+    // Keep one unit for the ellipsis, and never cut inside an HTML entity.
+    Some(truncate_escaped(line, budget - 1))
 }
 
 /// Hard cap for the final message (defensive: parts are already budgeted).
@@ -147,15 +152,22 @@ fn truncate_units(value: &str, max_units: usize) -> String {
 /// When a cut lands inside an HTML entity (`&amp;`), drop the partial entity so
 /// Telegram's parser does not reject the message.
 fn repair_incomplete_entity(value: &mut String) {
-    let Some(index) = value.rfind('&') else {
+    // The trailing ellipsis belongs to the output, not to the entity: ignore it
+    // while checking, and keep it when the entity is dropped.
+    let ellipsis = value.ends_with('…');
+    let body_len = value.len() - if ellipsis { '…'.len_utf8() } else { 0 };
+    let Some(index) = value[..body_len].rfind('&') else {
         return;
     };
-    let tail = &value[index + 1..];
-    let incomplete = !tail.is_empty()
-        && tail.len() <= 8
-        && tail.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '#');
+    let tail = &value[index + 1..body_len];
+    let incomplete = tail.len() <= 8
+        && (tail.is_empty() || tail.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '#'));
     if incomplete {
-        value.truncate(index);
+        let mut repaired = value[..index].to_owned();
+        if ellipsis {
+            repaired.push('…');
+        }
+        *value = repaired;
     }
 }
 
@@ -325,6 +337,38 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(2_500_000_000), "2.3 GB");
         assert_eq!(format_bytes(1_099_511_627_776), "1.0 TB");
+    }
+
+    #[test]
+    fn entity_dense_fields_do_not_starve_the_following_lines() {
+        // 400 ampersands escape to 2000 units; the field must be capped so the
+        // next field still renders.
+        let event = NotifyEvent::new(NotifyCategory::Task, "T")
+            .field("A", "&".repeat(400))
+            .field("B", "still here");
+        let message = format_message(&event, 8);
+        assert!(utf16_len(&message) <= MAX_MESSAGE_UNITS);
+        assert!(message.contains("still here"), "second field was dropped: {message}");
+        assert!(!message.contains('&') || message.contains("&amp;"));
+    }
+
+    #[test]
+    fn a_truncated_field_never_ends_with_half_an_entity() {
+        // The escape expands to ~2000 units, so the field has to be cut: the cut
+        // must not leave a dangling `&am` behind.
+        let event = NotifyEvent::new(NotifyCategory::Task, "T")
+            .field("A", format!("{}&amp;", "x".repeat(395)));
+        let message = format_message(&event, 8);
+        for (index, _) in message.match_indices('&') {
+            let tail = &message[index + 1..];
+            let complete = match tail.find(';') {
+                Some(end) if end <= 8 => tail[..end]
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '#'),
+                _ => false,
+            };
+            assert!(complete, "half an entity survived near: {:?}", &message[index..]);
+        }
     }
 
     #[test]

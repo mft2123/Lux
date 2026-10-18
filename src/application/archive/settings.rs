@@ -158,6 +158,10 @@ impl Default for TelegramSettings {
     }
 }
 
+/// Set once the first settings read fails, so the poller does not log the same
+/// warning every tick.
+static SETTINGS_READ_WARNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl ArchiveSettings {
     /// Path of the active settings file (`LUX_ARCHIVE_SETTINGS`, else the
     /// container default).
@@ -186,11 +190,21 @@ impl ArchiveSettings {
             Ok(Some(document)) => Self::from_document(base, &document).sanitized(),
             Ok(None) => base.clone(),
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    path = %path.display(),
-                    "archive settings file could not be read; using environment values"
-                );
+                // The poller re-reads the settings every tick; warn once, then
+                // keep the noise at debug level (D9).
+                if SETTINGS_READ_WARNING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::debug!(
+                        %error,
+                        path = %path.display(),
+                        "archive settings file still unreadable; using environment values"
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "archive settings file could not be read; using environment values"
+                    );
+                }
                 base.clone()
             }
         }
@@ -383,6 +397,11 @@ impl ArchiveSettings {
             for directory in &self.watch_dirs {
                 validate_directory("监听目录", directory)?;
             }
+        }
+        if let Some(Value::Object(telegram)) = document.get("telegram")
+            && telegram.contains_key("api_base")
+        {
+            validate_api_base(self.telegram.api_base.as_deref().unwrap_or_default())?;
         }
         if let Some(Value::Object(telegram)) = document.get("telegram")
             && telegram.contains_key("listen_mode")
@@ -672,6 +691,28 @@ fn is_listen_mode(value: &str) -> bool {
     LISTEN_MODES.contains(&value) || LISTEN_MODE_ALIASES.contains(&value.to_ascii_lowercase().as_str())
 }
 
+/// The notification API base is a plain origin: credentials, paths, queries and
+/// fragments are rejected so a pasted URL cannot smuggle a token into the log
+/// or into the request path.
+fn validate_api_base(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let lowered = value.to_ascii_lowercase();
+    if !(lowered.starts_with("https://") || lowered.starts_with("http://")) {
+        return Err("通知 API 地址必须以 http:// 或 https:// 开头".to_owned());
+    }
+    if value.contains(['?', '#']) {
+        return Err("通知 API 地址不能带查询串或锚点（凭据不应出现在 URL 里）".to_owned());
+    }
+    let rest = value.split_once("://").map(|(_, rest)| rest).unwrap_or_default();
+    if rest.trim_matches('/').is_empty() {
+        return Err("通知 API 地址缺少主机名".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_directory(label: &str, value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() {
@@ -756,8 +797,12 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "archive-settings.json".to_owned());
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or_default();
     let temp = path.with_file_name(format!(
-        ".{name}.{}.{}.tmp",
+        ".{name}.{}.{}.{nonce}.tmp",
         std::process::id(),
         TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
@@ -1267,6 +1312,26 @@ mod tests {
         // Nothing was written into the in-memory settings by the rejected updates.
         assert_eq!(settings.poll_seconds, 0);
         assert_eq!(settings.wash_tolerance_ratio, DEFAULT_WASH_TOLERANCE_RATIO);
+    }
+
+    #[test]
+    fn api_base_urls_cannot_smuggle_a_token() {
+        let mut settings = ArchiveSettings::default();
+        for bad in ["ftp://x", "https://", "https://api.telegram.org/?token=1", "https://h/#x"] {
+            assert!(
+                settings
+                    .apply_update(&json!({ "telegram": { "api_base": bad } }))
+                    .is_err(),
+                "accepted {bad}"
+            );
+        }
+        settings
+            .apply_update(&json!({ "telegram": { "api_base": "https://tg.example:8443" } }))
+            .expect("plain origin is fine");
+        assert_eq!(
+            settings.telegram.api_base.as_deref(),
+            Some("https://tg.example:8443")
+        );
     }
 
     #[test]

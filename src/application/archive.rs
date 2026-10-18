@@ -272,6 +272,11 @@ pub(crate) struct LinkJob {
     pub(crate) captured_at: Option<String>,
     #[serde(default)]
     pub(crate) received_at_unix: i64,
+    /// Re-queue a URL that was already consumed. The idempotency key is the URL
+    /// and it never expires on its own, so this is the explicit way to retry a
+    /// link whose 115 transfer was lost.
+    #[serde(default)]
+    pub(crate) force: bool,
 }
 
 impl LinkJob {
@@ -547,6 +552,25 @@ impl ArchiveService {
     /// anything, which is the default first-run mode for safety.
     pub(crate) async fn run_once(&self, dry_run: bool) -> Result<ArchiveReport, String> {
         let _run_guard = ARCHIVE_RUN_LOCK.lock().await;
+        let result = self.run_once_inner(dry_run).await;
+        if let Err(error) = &result
+            && !dry_run
+        {
+            // A stage that returned an error would otherwise fail silently as far
+            // as Telegram is concerned: the report is never built.
+            crate::application::notify::spawn_event(
+                crate::application::notify::NotifyEvent::new(
+                    crate::application::notify::NotifyCategory::Failure,
+                    "归档运行中断",
+                )
+                .field("📝 原因", error.as_str())
+                .dedupe_key("archive:run-interrupted"),
+            );
+        }
+        result
+    }
+
+    async fn run_once_inner(&self, dry_run: bool) -> Result<ArchiveReport, String> {
         if !dry_run {
             self.config
                 .ensure_directories()
@@ -1736,14 +1760,22 @@ impl ArchiveService {
         // A broken queue / state file means "cannot tell whether this is a
         // duplicate": answer 500 and queue nothing, instead of writing a
         // possible second job for one link.
-        let existing = self.find_existing_link_job(&job.url).map_err(|error| {
+        let existing = if job.force {
+            tracing::info!(
+                url = %mask_link_for_log(&job.url),
+                "link job forced: skipping the URL idempotency check"
+            );
+            None
+        } else {
+            self.find_existing_link_job(&job.url).map_err(|error| {
             tracing::warn!(
                 url = %mask_link_for_log(&job.url),
                 %error,
                 "could not check for an existing link job; refusing to queue a possible duplicate"
             );
-            LinkIngestError::Storage(error)
-        })?;
+                LinkIngestError::Storage(error)
+            })?
+        };
         if let Some(existing) = existing {
             tracing::info!(
                 url = %mask_link_for_log(&job.url),
@@ -4359,6 +4391,31 @@ mod tests {
             .enqueue_link_job(link_job("https://115.com/s/def"))
             .expect("queued");
         assert!(!other.duplicate);
+        assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    /// The URL idempotency key never expires, so `force` is the explicit retry
+    /// path: it queues the link again instead of answering `duplicate`.
+    #[test]
+    fn a_forced_link_job_is_queued_again() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let first = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+        service.ingest_link_queue(false).expect("consumed");
+        let duplicate = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.job_id, first.job_id);
+        assert_eq!(service.status().pending_link_jobs, 0);
+
+        let mut forced = link_job("https://115.com/s/abc");
+        forced.force = true;
+        let again = service.enqueue_link_job(forced).expect("queued");
+        assert!(!again.duplicate, "force must bypass the URL check");
+        assert_ne!(again.job_id, first.job_id);
         assert_eq!(service.status().pending_link_jobs, 1);
     }
 
