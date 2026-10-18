@@ -250,6 +250,10 @@ impl TmdbMatch {
     }
 }
 
+/// The poller and an admin request can both call `run_once`; a shared lock
+/// serializes them so one never moves an entry the other is already moving.
+static ARCHIVE_RUN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(crate) struct ArchiveService {
     config: Arc<ArchiveConfig>,
     http: reqwest::Client,
@@ -280,6 +284,7 @@ impl ArchiveService {
     /// Run the pipeline once. `dry_run` reports what would happen without moving
     /// anything, which is the default first-run mode for safety.
     pub(crate) async fn run_once(&self, dry_run: bool) -> Result<ArchiveReport, String> {
+        let _run_guard = ARCHIVE_RUN_LOCK.lock().await;
         if !dry_run {
             self.config
                 .ensure_directories()
@@ -1111,6 +1116,10 @@ fn sanitize_component(value: &str) -> String {
 }
 
 fn move_entry(source: &Path, target: &Path) -> std::io::Result<()> {
+    if !source.exists() {
+        // Already moved by someone else (poller race): nothing left to do.
+        return Ok(());
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
