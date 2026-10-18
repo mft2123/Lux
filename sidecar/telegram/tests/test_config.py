@@ -216,6 +216,58 @@ class LoadTest(unittest.TestCase):
         self.assertEqual(cfg.ingest_url, "http://lux.local/ingest")
 
 
+class SettingsPermissionTest(unittest.TestCase):
+    """review SC2：设置文件读不到时要给可操作的属组/权限提示，不能笼统报 ConfigError。"""
+
+    def setUp(self):
+        self.dir = support.mkdtemp()
+        self.addCleanup(support.cleanup, self.dir)
+
+    def test_permission_error_message_is_actionable(self):
+        path = write_settings(self.dir, BASE)
+        with patch.dict(os.environ, CLEAN_ENV, clear=True), patch.object(
+            Path, "read_text", side_effect=PermissionError(13, "Permission denied")
+        ):
+            with self.assertRaises(config_mod.ConfigError) as ctx:
+                config_mod.load(path)
+        message = str(ctx.exception)
+        self.assertIn("设置文件不可读", message)
+        self.assertIn("部署检查清单", message)
+        self.assertIn("LUX_ARCHIVE_SETTINGS_GROUP", message)
+        self.assertIn(str(path), message)
+        self.assertIn("Permission denied", message)
+
+    @unittest.skipUnless(os.name == "posix", "需要 POSIX 权限位")
+    def test_unreadable_file_on_disk_is_actionable(self):
+        if not support.permissions_enforced(self.dir):
+            self.skipTest("文件系统不校验 chmod（root 或忽略权限位的挂载点）")
+        path = write_settings(self.dir, BASE)
+        os.chmod(path, 0o000)
+        self.addCleanup(os.chmod, path, 0o600)
+        with patch.dict(os.environ, CLEAN_ENV, clear=True):
+            with self.assertRaises(config_mod.ConfigError) as ctx:
+                config_mod.load(path)
+        self.assertIn("设置文件不可读", str(ctx.exception))
+
+    def test_missing_file_still_falls_back_to_env(self):
+        # 文件不存在 ≠ 权限错误：仍然走 env 兜底，不报「不可读」
+        with patch.dict(
+            os.environ,
+            {**CLEAN_ENV, "LUX_TG_API_ID": "7", "LUX_TG_API_HASH": "h", "LUX_TG_API_KEY": "k"},
+            clear=True,
+        ):
+            cfg = config_mod.load(self.dir / "missing.json")
+        self.assertEqual(cfg.api_id, 7)
+
+    def test_broken_json_is_reported_as_json_error(self):
+        path = self.dir / "archive-settings.json"
+        path.write_text("{not json", encoding="utf-8")
+        with patch.dict(os.environ, CLEAN_ENV, clear=True):
+            with self.assertRaises(config_mod.ConfigError) as ctx:
+                config_mod.load(path)
+        self.assertIn("JSON", str(ctx.exception))
+
+
 class MaskTest(unittest.TestCase):
     def test_masked_hides_secrets(self):
         with support.temp_dir() as tmp:

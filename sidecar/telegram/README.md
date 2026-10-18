@@ -105,6 +105,27 @@ sidecar/telegram/
 | `LUX_TG_DRY_RUN` | `0` | 只判定记录，不写下游 |
 | `LUX_TG_LOG_LEVEL` | `INFO` | 日志级别 |
 
+## 部署检查清单（设置文件 0640 + 属组）
+
+Lux 保存设置时会把 `/vol5/1000/build/archive-settings.json` 写成 `0640`，属组为
+`$LUX_ARCHIVE_SETTINGS_GROUP`（未设置则该组不存在时保持 0600）。旁挂容器以 uid `10001`
+运行，只能通过**附加组**读到这个只读挂载的文件；`compose.fragment.yml` 里的
+`group_add: ["${LUX_ARCHIVE_SETTINGS_GROUP:-10001}"]` 就是干这个的。上线前逐条核对：
+
+1. **属主/权限**：`ls -l /vol5/1000/build/archive-settings.json`
+   应为 `-rw-r----- 1 <lux>:<gid>`；`stat -c '%a %g %U' …` 应为 `640 <gid> <lux>`。
+2. **gid 对齐**：`<gid>` 必须等于 compose 里的 `${LUX_ARCHIVE_SETTINGS_GROUP:-10001}`
+   （默认 `10001`；Lux 侧改了设置组就必须同步改这里，否则容器里是另一个组）。
+3. **compose 生效**：`docker compose config | grep -A2 group_add` 能看到
+   `group_add: 10001`（或你的 gid）。
+4. **容器内组**：`docker exec lux-telegram id` 的 `groups=` 里包含该 gid。
+5. **能读到文件**：`docker exec -u 10001 lux-telegram python main.py check`
+   不再报「设置文件不可读」。
+6. **失败怎么办**：错误信息是「设置文件不可读：检查属组/权限（见 README 的部署检查清单）：<路径>（<原因>）」。
+   先回第 1、2 步；`main.py status` 里的 `settings_path` 能确认挂载路径对不对。
+   若 Lux 还没把文件改成 0640（仍是 0600），旁挂必然读不到——要么等 Lux 侧保存一次设置，
+   要么临时用 `LUX_TG_API_KEY` / `LUX_TG_API_ID` 等环境变量跑起来（见下一节）。
+
 ## 首次登录
 
 首次 `run` 自动走登录流程：

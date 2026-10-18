@@ -227,14 +227,28 @@ def _as_list(value) -> tuple[str, ...]:
 
 
 def load_settings_file(path: str | Path) -> dict:
-    """读设置文件；文件缺失返回空 dict（此时全靠 env）。"""
+    """读设置文件；文件缺失返回空 dict（此时全靠 env）。
+
+    权限错误单独给可操作提示（review SC2）：容器以 uid 10001 只读挂载设置文件，
+    Lux 保存后写成 0640 + 属组；读不到时多半是属组没对上，不能再笼统报 ConfigError。
+    """
     target = Path(path)
     if not target.exists():
         return {}
     try:
-        raw = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        text = target.read_text(encoding="utf-8")
+    except PermissionError as error:
+        raise ConfigError(
+            f"设置文件不可读：检查属组/权限（见 README 的部署检查清单）：{target}（{error}）。"
+            "文件应为 0640 + 属组 $LUX_ARCHIVE_SETTINGS_GROUP，"
+            "compose 用 group_add 让 uid 10001 加入同一个 gid"
+        ) from error
+    except OSError as error:
         raise ConfigError(f"无法读取设置文件 {target}: {error}") from error
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ConfigError(f"设置文件不是合法 JSON（{target}）：{error}") from error
     return raw if isinstance(raw, dict) else {}
 
 

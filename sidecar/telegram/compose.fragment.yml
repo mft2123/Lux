@@ -6,6 +6,8 @@
 #   chmod 700 /vol5/1000/build/lux-telegram/session
 #   在 /vol5/1000/build/archive-settings.json 的 telegram 段里填 api_key
 #   （Lux 管理 API key：管理页「API key」或 POST /api/v1/admin/api-key/rotate）
+#   设置文件由 Lux 保存时写成 0640 + 属组 $LUX_ARCHIVE_SETTINGS_GROUP，
+#   本片段用 group_add 让 uid 10001 以附加组身份加入同一 gid（见 README「部署检查清单」）。
 #
 # 首次登录：`docker compose up -d telegram` 后看日志里的验证码提示，
 # 把收到的验证码写进 /vol5/1000/build/lux-telegram/session/code.txt
@@ -18,6 +20,9 @@ services:
     container_name: lux-telegram
     # 非 root：session 授权密钥不该只有 root 能读
     user: "10001:10001"
+    # 设置文件是 0640 + 属组（Lux 保存时 chmod 0640 / chgrp $LUX_ARCHIVE_SETTINGS_GROUP）：
+    # 容器进程必须加入同一个 gid 才读得到只读挂载的 /config/archive-settings.json
+    group_add: ["${LUX_ARCHIVE_SETTINGS_GROUP:-10001}"]
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
