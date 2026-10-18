@@ -1141,6 +1141,8 @@ export type ArchiveTelegramSettings = {
   api_id: string;
   api_hash: string;
   phone: string;
+  /** Shared admin API key the Telegram sidecar calls Lux with. */
+  api_key: string;
   notify: ArchiveNotifySelection;
   listen_mode: string;
   listen_channels: string[];
@@ -1155,6 +1157,8 @@ export type ArchiveTelegramSettings = {
   timezone_offset_hours?: number | null;
 };
 
+export type ArchiveNotifyCategory = { key: string; label: string; emoji: string };
+
 export type ArchiveSettings = {
   tmdb_api_key: string;
   watch_dirs: string[];
@@ -1166,6 +1170,8 @@ export type ArchiveSettings = {
   wash_enabled: boolean;
   wash_tolerance_ratio: number;
   telegram: ArchiveTelegramSettings;
+  /** Server-owned list of notification categories (absent on older servers). */
+  known_categories?: ArchiveNotifyCategory[];
 };
 
 export type ArchiveSettingsPatch = Partial<Omit<ArchiveSettings, "telegram">> & {

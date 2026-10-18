@@ -11,13 +11,15 @@ import type {
 } from "../../lib/api/types";
 import "./archive-settings.css";
 
-// Categories are stored by the label the notify module accepts, so the file
-// stays readable and the notify module can keep its English-key aliases.
-const NOTIFY_CATEGORIES = [
+// The server sends the authoritative list (`known_categories`), so a category
+// added in the notify module shows up here without a frontend change. This list
+// is only the fallback for an older server that does not send one yet.
+const FALLBACK_NOTIFY_CATEGORIES = [
   { value: "播放", label: "播放" },
   { value: "入库", label: "入库" },
   { value: "整理", label: "整理" },
   { value: "洗版", label: "洗版" },
+  { value: "重复", label: "重复" },
   { value: "转存", label: "转存" },
   { value: "115妙传", label: "115 妙传" },
   { value: "媒体整理", label: "媒体整理" },
@@ -33,6 +35,7 @@ const NOTIFY_ALIASES: Record<string, string> = {
   organize: "整理",
   archive: "整理",
   wash_result: "洗版",
+  duplicate: "重复",
   resource_transfer: "转存",
   drive115_upload: "115妙传",
   magic_upload: "115妙传",
@@ -42,7 +45,19 @@ const NOTIFY_ALIASES: Record<string, string> = {
   failure: "失败",
 };
 
-const ALL_NOTIFY_CATEGORIES: string[] = NOTIFY_CATEGORIES.map((category) => category.value);
+const FALLBACK_NOTIFY_VALUES: string[] = FALLBACK_NOTIFY_CATEGORIES.map((category) => category.value);
+
+type NotifyCategoryOption = { value: string; label: string };
+
+function categoryOptions(settings?: ArchiveSettings): NotifyCategoryOption[] {
+  const known = settings?.known_categories;
+  if (!known || known.length === 0) {
+    return FALLBACK_NOTIFY_CATEGORIES.map((category) => ({ ...category }));
+  }
+  // The backend accepts the Chinese label as well as the English key, and the
+  // file stays human readable when it stores labels.
+  return known.map((category) => ({ value: category.label, label: category.label }));
+}
 
 const LISTEN_MODES = [
   { value: "手动", label: "手动", hint: "只记录频道消息，不自动投递；由管理员手动触发。" },
@@ -73,6 +88,7 @@ type ArchiveSettingsDraft = {
   notifyEnabled: boolean;
   botToken: string;
   chatId: string;
+  apiKey: string;
   apiId: string;
   apiHash: string;
   phone: string;
@@ -80,6 +96,9 @@ type ArchiveSettingsDraft = {
   listenChannels: string;
   followList: string;
   notify: string[];
+  /** The value as stored, so an untouched save keeps `null`/object shape. */
+  notifyOriginal: ArchiveNotifySelection;
+  notifyTouched: boolean;
 };
 
 const EMPTY_DRAFT: ArchiveSettingsDraft = {
@@ -95,13 +114,16 @@ const EMPTY_DRAFT: ArchiveSettingsDraft = {
   notifyEnabled: true,
   botToken: "",
   chatId: "",
+  apiKey: "",
   apiId: "",
   apiHash: "",
   phone: "",
   listenMode: "手动",
   listenChannels: "",
   followList: "",
-  notify: ALL_NOTIFY_CATEGORIES,
+  notify: FALLBACK_NOTIFY_VALUES,
+  notifyOriginal: null,
+  notifyTouched: false,
 };
 
 export function ArchiveSettingsSection() {
@@ -117,6 +139,7 @@ export function ArchiveSettingsSection() {
   });
   const [draft, setDraft] = useState<ArchiveSettingsDraft>(EMPTY_DRAFT);
   const [saved, setSaved] = useState(false);
+  const categories = categoryOptions(settings.data);
 
   useEffect(() => {
     if (!settings.data) return;
@@ -154,7 +177,8 @@ export function ArchiveSettingsSection() {
         : current.notify.filter((item) => item !== category);
       return {
         ...current,
-        notify: ALL_NOTIFY_CATEGORIES.filter((item) => next.includes(item)),
+        notifyTouched: true,
+        notify: categories.map((item) => item.value).filter((item) => next.includes(item)),
       };
     });
   }
@@ -335,6 +359,18 @@ export function ArchiveSettingsSection() {
                 onChange={(event) => update("chatId", event.target.value)}
               />
             </label>
+            <label>
+              <span>Lux 管理 API Key</span>
+              <small>旁挂调用 Lux 管理接口用的密钥。打码返回，留空表示不修改。</small>
+              <input
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                value={draft.apiKey}
+                placeholder={loaded.telegram.api_key || "未配置"}
+                onChange={(event) => update("apiKey", event.target.value)}
+              />
+            </label>
           </div>
           <label className="lux-admin-toggle">
             <input
@@ -347,7 +383,7 @@ export function ArchiveSettingsSection() {
           <div className="lux-archive-settings-fieldset">
             <span className="lux-archive-settings-legend">通知项</span>
             <div className="lux-archive-settings-toggles">
-              {NOTIFY_CATEGORIES.map((category) => (
+              {categories.map((category) => (
                 <label key={category.value} className="lux-admin-toggle">
                   <input
                     type="checkbox"
@@ -501,6 +537,7 @@ function ArchiveSettingsState({ label, error = false }: { label: string; error?:
 }
 
 function draftFromSettings(settings: ArchiveSettings): ArchiveSettingsDraft {
+  const categories = categoryOptions(settings);
   return {
     tmdbApiKey: "",
     watchDirs: settings.watch_dirs.join("\n"),
@@ -514,13 +551,16 @@ function draftFromSettings(settings: ArchiveSettings): ArchiveSettingsDraft {
     notifyEnabled: settings.telegram.enabled ?? true,
     botToken: "",
     chatId: "",
+    apiKey: "",
     apiId: settings.telegram.api_id,
     apiHash: "",
     phone: "",
     listenMode: normalizeListenMode(settings.telegram.listen_mode),
     listenChannels: settings.telegram.listen_channels.join("\n"),
     followList: settings.telegram.follow_list.join("\n"),
-    notify: selectedNotifyCategories(settings.telegram.notify),
+    notify: selectedNotifyCategories(settings.telegram.notify, categories),
+    notifyOriginal: settings.telegram.notify,
+    notifyTouched: false,
   };
 }
 
@@ -530,12 +570,16 @@ function payloadFromDraft(draft: ArchiveSettingsDraft): ArchiveSettingsPatch {
     listen_mode: draft.listenMode,
     listen_channels: splitLines(draft.listenChannels),
     follow_list: splitLines(draft.followList),
-    notify: draft.notify,
+    // Only rewrite the selection when the admin actually toggled something:
+    // an untouched save must keep `null` (everything on) or the stored object
+    // shape instead of turning it into a fixed list.
+    notify: draft.notifyTouched ? draft.notify : draft.notifyOriginal,
     enabled: draft.notifyEnabled,
   };
   // Blank secrets are left out entirely: the server keeps the stored value.
   if (draft.botToken.trim()) telegram.bot_token = draft.botToken.trim();
   if (draft.chatId.trim()) telegram.chat_id = draft.chatId.trim();
+  if (draft.apiKey.trim()) telegram.api_key = draft.apiKey.trim();
   if (draft.apiHash.trim()) telegram.api_hash = draft.apiHash.trim();
   if (draft.phone.trim()) telegram.phone = draft.phone.trim();
 
@@ -572,26 +616,30 @@ function validateDraft(draft: ArchiveSettingsDraft): string | null {
   return null;
 }
 
-function selectedNotifyCategories(selection: ArchiveNotifySelection): string[] {
-  if (selection === null || selection === undefined) return ALL_NOTIFY_CATEGORIES;
+function selectedNotifyCategories(
+  selection: ArchiveNotifySelection,
+  categories: NotifyCategoryOption[],
+): string[] {
+  const all = categories.map((category) => category.value);
+  if (selection === null || selection === undefined) return all;
   if (Array.isArray(selection)) {
     const items = selection.map((item) => item.trim());
     if (items.some((item) => ["全部", "所有", "all", "*"].includes(item.toLowerCase()))) {
-      return ALL_NOTIFY_CATEGORIES;
+      return all;
     }
     const selected = items.map((item) => NOTIFY_ALIASES[item.toLowerCase()] ?? item);
-    return ALL_NOTIFY_CATEGORIES.filter((category) => selected.includes(category));
+    return all.filter((category) => selected.includes(category));
   }
   if (typeof selection === "object") {
     const selected: string[] = [];
     for (const [key, enabled] of Object.entries(selection)) {
       if (!enabled) continue;
       const label = NOTIFY_ALIASES[key.trim().toLowerCase()] ?? key.trim();
-      if (ALL_NOTIFY_CATEGORIES.includes(label)) selected.push(label);
+      if (all.includes(label)) selected.push(label);
     }
-    return ALL_NOTIFY_CATEGORIES.filter((category) => selected.includes(category));
+    return all.filter((category) => selected.includes(category));
   }
-  return ALL_NOTIFY_CATEGORIES;
+  return all;
 }
 
 function normalizeListenMode(value: string): string {
