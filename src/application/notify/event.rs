@@ -7,10 +7,10 @@
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::application::archive::{ArchiveReport, OrganizedItem, WashedItem};
+use crate::application::archive::{ArchiveReport, DuplicateItem, OrganizedItem, WashedItem};
 
 #[cfg(test)]
-use crate::application::archive::{DuplicateItem, FailedItem};
+use crate::application::archive::FailedItem;
 
 use super::{
     config::NotifyCategory,
@@ -203,6 +203,7 @@ pub(crate) fn archive_events(report: &ArchiveReport) -> Vec<NotifyEvent> {
     let truncated = report.archived_to_pending.len() > MAX_ITEM_EVENTS_PER_RUN
         || report.organized.len() > MAX_ITEM_EVENTS_PER_RUN
         || report.washed.len() > MAX_ITEM_EVENTS_PER_RUN
+        || report.duplicates.len() > MAX_ITEM_EVENTS_PER_RUN
         || report.failed.len() > MAX_ITEM_EVENTS_PER_RUN;
 
     for name in report.archived_to_pending.iter().take(MAX_ITEM_EVENTS_PER_RUN) {
@@ -217,6 +218,9 @@ pub(crate) fn archive_events(report: &ArchiveReport) -> Vec<NotifyEvent> {
     }
     for item in report.washed.iter().take(MAX_ITEM_EVENTS_PER_RUN) {
         events.push(washed_event(item));
+    }
+    for item in report.duplicates.iter().take(MAX_ITEM_EVENTS_PER_RUN) {
+        events.push(duplicate_event(item));
     }
     for item in report.failed.iter().take(MAX_ITEM_EVENTS_PER_RUN) {
         events.push(
@@ -266,8 +270,14 @@ fn washed_event(item: &WashedItem) -> NotifyEvent {
         .field("📈 变化", delta)
 }
 
-fn summary_event(report: &ArchiveReport, truncated: bool) -> NotifyEvent {
-    let mut event = NotifyEvent::new(NotifyCategory::Task, "归档任务完成")
+fn duplicate_event(item: &DuplicateItem) -> NotifyEvent {
+    NotifyEvent::new(NotifyCategory::Duplicate, format!("发现重复 {}", item.source))
+        .field("📦 条目", item.source.as_str())
+        .field("📁 已存在", item.existing.as_str())
+        .field("⏭️ 处理", "跳过，未重复转存")
+}
+
+fn summary_event(report: &ArchiveReport, truncated: bool) -> NotifyEvent {    let mut event = NotifyEvent::new(NotifyCategory::Task, "归档任务完成")
         .field("📥 转存", report.archived_to_pending.len().to_string())
         .field("🗂️ 整理", report.organized.len().to_string())
         .field("🔁 洗版", report.washed.len().to_string())
@@ -415,6 +425,7 @@ mod tests {
                 NotifyCategory::Transfer,
                 NotifyCategory::Organize,
                 NotifyCategory::Wash,
+                NotifyCategory::Duplicate,
                 NotifyCategory::Failure,
                 NotifyCategory::Task,
             ]
@@ -426,6 +437,25 @@ mod tests {
                 .fields
                 .iter()
                 .any(|field| field.label == "❌ 失败" && field.value == "1")
+        );
+        assert!(
+            summary
+                .fields
+                .iter()
+                .any(|field| field.label == "♻️ 重复" && field.value == "1")
+        );
+    }
+
+    #[test]
+    fn duplicate_event_carries_the_existing_path() {
+        let event = duplicate_event(&report().duplicates[0]);
+        assert_eq!(event.category, NotifyCategory::Duplicate);
+        assert!(event.title.contains("重复资源"));
+        assert!(
+            event
+                .fields
+                .iter()
+                .any(|field| field.label == "📁 已存在" && field.value.contains("示例"))
         );
     }
 
