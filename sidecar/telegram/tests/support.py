@@ -34,3 +34,23 @@ def temp_dir():
 
 def cleanup(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
+
+
+def permissions_enforced(directory: Path) -> bool:
+    """文件系统的权限位是否真的生效。
+
+    root 和「忽略 chmod」的挂载点（某些 NAS 的 ZFS/ACL 配置）会让 `chmod 0400`
+    之后的文件照样可写；这时权限类用例会失真，应当 skip 而不是假装通过。
+    """
+    probe = Path(directory) / f"perm-probe-{uuid.uuid4().hex[:8]}"
+    probe.write_text("x", encoding="utf-8")
+    os.chmod(probe, 0o400)
+    try:
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("y")
+        return False
+    except OSError:
+        return True
+    finally:
+        os.chmod(probe, 0o600)
+        probe.unlink(missing_ok=True)

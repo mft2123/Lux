@@ -349,6 +349,147 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(config.state_dir.stat().st_mode), 0o700)
 
 
+class SessionErrorClassificationTest(unittest.TestCase):
+    """review SC3：只有「文件被写坏」才叫 session 损坏，权限/磁盘类错误要原样报出。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+        self.config = make_config(self.tmp)
+        self.config.session_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def _open_and_write(self):
+        connection = sqlite3.connect(self.config.session_path)
+        try:
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchall()
+            connection.execute("CREATE TABLE IF NOT EXISTS probes (id INTEGER)")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_garbage_file_is_corrupt(self):
+        self.config.session_path.write_bytes(b"not a database, just junk" * 32)
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                self._open_and_write()
+        message = str(ctx.exception)
+        self.assertIn("session 文件损坏", message)
+        self.assertIn(str(self.config.session_path), message)
+        self.assertIn("not a database", message.lower())
+        self.assertIn("重新走登录流程", message)
+
+    def test_other_database_error_is_not_called_corrupt(self):
+        # 不含 not a database / malformed 的 DatabaseError 不许被说成损坏
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                raise sqlite3.DatabaseError("disk image mismatch on page 7")
+        message = str(ctx.exception)
+        self.assertNotIn("损坏", message)
+        self.assertIn("session 读取失败", message)
+        self.assertIn("disk image mismatch on page 7", message)
+
+    @unittest.skipUnless(os.name == "posix", "需要 POSIX 权限位")
+    def test_readonly_session_file_reports_operational_error(self):
+        if not support.permissions_enforced(self.tmp):
+            self.skipTest("文件系统不校验 chmod（root 或忽略权限位的挂载点），权限用例会失真")
+        # 文件是真的 sqlite，但不可写：报「不可写」，不许叫人删 session
+        connection = sqlite3.connect(self.config.session_path)
+        connection.execute("CREATE TABLE sessions (id INTEGER)")
+        connection.commit()
+        connection.close()
+        os.chmod(self.config.session_path, 0o400)
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                connection = sqlite3.connect(self.config.session_path)
+                try:
+                    connection.execute("INSERT INTO sessions (id) VALUES (1)")
+                    connection.commit()
+                finally:
+                    connection.close()
+        message = str(ctx.exception)
+        self.assertNotIn("损坏", message)
+        self.assertIn("session 无法打开或写入", message)
+        self.assertIn(str(self.config.session_path), message)
+        # 原始 sqlite 文案要带上（readonly / unable to open），操作者才能对症
+        self.assertIn(str(ctx.exception.__cause__), message)
+        self.assertIn("权限", message)
+
+    @unittest.skipUnless(os.name == "posix", "需要 POSIX 权限位")
+    def test_readonly_directory_reports_operational_error(self):
+        if not support.permissions_enforced(self.tmp):
+            self.skipTest("文件系统不校验 chmod（root 或忽略权限位的挂载点），权限用例会失真")
+        # session 目录只读：sqlite 连文件都建不出来（unable to open database file）
+        directory = self.config.session_dir / "ro"
+        directory.mkdir()
+        os.chmod(directory, 0o500)
+        self.addCleanup(os.chmod, directory, 0o700)
+        config = make_config(self.tmp, session_dir=directory)
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(config):
+                connection = sqlite3.connect(config.session_path)
+                try:
+                    connection.execute("CREATE TABLE sessions (id INTEGER)")
+                    connection.commit()
+                finally:
+                    connection.close()
+        message = str(ctx.exception)
+        self.assertNotIn("损坏", message)
+        self.assertIn("session 无法打开或写入", message)
+        self.assertIn(str(config.session_path), message)
+        self.assertIn(str(ctx.exception.__cause__), message)
+        self.assertIn("磁盘空间", message)
+
+    def test_read_only_database_mode_reports_operational_error(self):
+        """与容器里「session 属 root、进程是 10001」等价：sqlite 报 readonly database。"""
+        connection = sqlite3.connect(self.config.session_path)
+        connection.execute("CREATE TABLE sessions (id INTEGER)")
+        connection.commit()
+        connection.close()
+        read_only = f"file:{self.config.session_path}?mode=ro"
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                connection = sqlite3.connect(read_only, uri=True)
+                try:
+                    connection.execute("INSERT INTO sessions (id) VALUES (1)")
+                    connection.commit()
+                finally:
+                    connection.close()
+        message = str(ctx.exception)
+        self.assertNotIn("损坏", message)
+        self.assertIn("session 无法打开或写入", message)
+        self.assertIn("readonly", message.lower())
+
+    def test_missing_session_directory_reports_operational_error(self):
+        # 目录不可用（拿一个普通文件当父目录）：sqlite 建不出文件
+        blocker = self.tmp / "not-a-directory"
+        blocker.write_text("x", encoding="utf-8")
+        config = make_config(self.tmp, session_dir=blocker / "nested")
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(config):
+                connection = sqlite3.connect(config.session_path)
+                try:
+                    connection.execute("CREATE TABLE sessions (id INTEGER)")
+                    connection.commit()
+                finally:
+                    connection.close()
+        message = str(ctx.exception)
+        self.assertNotIn("损坏", message)
+        self.assertIn("session 无法打开或写入", message)
+        self.assertIn(str(config.session_path), message)
+
+    def test_errno_from_the_driver_is_kept(self):
+        cause = sqlite3.OperationalError("disk I/O error")
+        cause.errno = 28  # sqlite3 通常不带 errno；带上时必须原样露出来
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                raise cause
+        message = str(ctx.exception)
+        self.assertIn("disk I/O error", message)
+        self.assertIn("errno 28", message)
+
+
 class LoginFlowTest(unittest.TestCase):
     """文档要求的登录录入方式：验证码写进 session/code.txt，或 tty 里直接敲。"""
 

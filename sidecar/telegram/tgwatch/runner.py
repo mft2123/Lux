@@ -188,19 +188,69 @@ async def _authorize(client, config: config_mod.SidecarConfig) -> None:
     )
 
 
+# 只有这两类消息才说明 session 文件本身被写坏（review SC3）。
+# sqlite 用 "file is not a database" / "database disk image is malformed" 报损坏。
+_SESSION_CORRUPT_MARKERS = ("not a database", "malformed")
+
+_SESSION_OPS_HINT = (
+    "检查 session 文件的属主/属组与权限（目录 0700、文件 0600，容器内 uid 10001）、"
+    "磁盘空间，以及是否有别的进程占用；修好后重启"
+)
+
+
+def _session_is_corrupt(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _SESSION_CORRUPT_MARKERS)
+
+
+def _sqlite_detail(error: BaseException) -> str:
+    """sqlite 原文 + errno/code：无权限、磁盘满、被锁的文案各不相同，不能被抹平。"""
+    detail = str(error) or error.__class__.__name__
+    extras: list[str] = []
+    errno_value = getattr(error, "errno", None)
+    if errno_value is not None:
+        extras.append(f"errno {errno_value}")
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        extras.append(f"{getattr(error, 'sqlite_errorname', None) or 'sqlite'} {code}")
+    return f"{detail}（{'，'.join(extras)}）" if extras else detail
+
+
 @contextlib.contextmanager
 def session_errors(config: config_mod.SidecarConfig):
-    """把 sqlite 层面的 session 损坏翻译成干净的中文错误（review F6）。
+    """把 sqlite 层面的 session 故障翻译成干净的中文错误（review F6 / SC3）。
 
-    Telethon 的 session 就是 sqlite 文件；被截断/写坏时 `TelegramClient(...)`
-    或 `start()` 会抛 `sqlite3.DatabaseError`，默认会连栈一起打到日志里，
-    再被 `restart: unless-stopped` 反复刷屏。
+    Telethon 的 session 就是 sqlite 文件；出错时默认会连栈打到日志里，再被
+    `restart: unless-stopped` 反复刷屏。分类比「一律说损坏」重要：
+
+    - `DatabaseError` 且消息含 `not a database` / `malformed`：文件真的坏了，
+      删掉重登即可；
+    - `OperationalError`（无权限、磁盘满、被锁）：文件没坏，原样带 errno 报出，
+      让人去修权限/空间，**不能**叫人删 session（删了要重新登录，问题还在）；
+    - 其余 sqlite 错误也只报一次，不猜成损坏。
     """
     try:
         yield
+    except sqlite3.OperationalError as error:
+        raise RunnerError(
+            f"session 无法打开或写入（{config.session_path}）：{_sqlite_detail(error)}；"
+            f"{_SESSION_OPS_HINT}"
+        ) from error
+    except sqlite3.DatabaseError as error:
+        detail = _sqlite_detail(error)
+        if _session_is_corrupt(error):
+            raise RunnerError(
+                f"session 文件损坏（{config.session_path}）：{detail}。"
+                "删掉它后重启，会重新走登录流程"
+            ) from error
+        raise RunnerError(
+            f"session 读取失败（{config.session_path}）：{detail}；"
+            "文件本身没被写坏，按提示检查权限/磁盘后再试"
+        ) from error
     except sqlite3.Error as error:
         raise RunnerError(
-            f"session 文件损坏（{config.session_path}）：删掉它后重启，会重新走登录流程"
+            f"session 访问失败（{config.session_path}）：{type(error).__name__}: "
+            f"{_sqlite_detail(error)}；{_SESSION_OPS_HINT}"
         ) from error
 
 
@@ -526,7 +576,9 @@ async def run(config: config_mod.SidecarConfig) -> None:
         except RunnerError:
             raise
         except sqlite3.Error as error:  # pragma: no cover - session_errors 已兜住
-            raise RunnerError(f"session 文件损坏：{error}") from error
+            raise RunnerError(
+                f"session 访问失败（{config.session_path}）：{_sqlite_detail(error)}"
+            ) from error
 
         resolved: list[tuple[config_mod.ChannelConfig, object]] = []
         for channel in config.channels:
