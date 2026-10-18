@@ -305,7 +305,10 @@ impl LinkJob {
     fn cleaned(mut self) -> Result<Self, String> {
         self.url = validate_link_url(&self.url)?;
         self.title = clean_optional_text(self.title, LINK_JOB_MAX_TITLE_CHARS);
-        self.mode = clean_optional_text(self.mode, 32);
+        self.mode = match clean_optional_text(self.mode, 32) {
+            Some(mode) => Some(validate_link_mode(&mode)?),
+            None => None,
+        };
         self.source = clean_optional_text(self.source, 32);
         self.kind = clean_optional_text(self.kind, 32);
         self.channel = clean_optional_text(self.channel, 128);
@@ -3225,6 +3228,21 @@ pub(crate) fn mask_link_for_log(raw: &str) -> String {
     format!("{scheme}://{host}")
 }
 
+/// The five listening modes of the sidecar (`settings::LISTEN_MODES`). The
+/// queue is an operator-facing record, so `mode` is an enum, not a free-form
+/// tag: anything else is a 400 on ingest and an `invalid` job file in the
+/// queue.
+fn validate_link_mode(mode: &str) -> Result<String, String> {
+    let mode = mode.trim();
+    if settings::LISTEN_MODES.contains(&mode) {
+        return Ok(mode.to_owned());
+    }
+    Err(format!(
+        "mode 只能是 {}（收到 {mode:?}）",
+        settings::LISTEN_MODES.join(" / ")
+    ))
+}
+
 /// Human-readable, file-name-safe job slug: alphanumerics and CJK kept,
 /// everything else collapsed to `-`, capped at 40 characters.
 fn link_slug(title: Option<&str>, url: &str) -> String {
@@ -3993,6 +4011,59 @@ mod tests {
         let masked = mask_link_for_log("https://115.com/s/abc?password=9999");
         assert!(!masked.contains("password"));
         assert!(!masked.contains("115.com/s/abc"));
+    }
+
+    /// `mode` is one of the five listening modes; anything else is rejected on
+    /// ingest and quarantined when a hand-written file carries it.
+    #[test]
+    fn rejects_unknown_link_modes() {
+        let job = LinkJob {
+            url: "https://115.com/s/abc".to_owned(),
+            mode: Some("随便".to_owned()),
+            ..LinkJob::default()
+        };
+        let error = job.normalized().expect_err("unknown mode is rejected");
+        assert!(error.contains("mode 只能是"), "{error}");
+
+        for mode in settings::LISTEN_MODES {
+            let job = LinkJob {
+                url: "https://115.com/s/abc".to_owned(),
+                mode: Some(mode.to_owned()),
+                ..LinkJob::default()
+            };
+            assert!(job.normalized().is_ok(), "{mode} is a valid mode");
+        }
+        // The field stays optional: an old producer that omits it still works.
+        let untagged = LinkJob {
+            url: "https://115.com/s/abc".to_owned(),
+            ..LinkJob::default()
+        };
+        assert_eq!(untagged.cleaned().expect("valid").mode, None);
+        let blank = LinkJob {
+            url: "https://115.com/s/abc".to_owned(),
+            mode: Some("  ".to_owned()),
+            ..LinkJob::default()
+        };
+        assert_eq!(blank.cleaned().expect("valid").mode, None);
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        std::fs::write(
+            queue.join("bad-mode.json"),
+            r#"{"job_id":"1700000000003-bad-mode","url":"https://115.com/s/bad","mode":"乱写"}"#,
+        )
+        .unwrap();
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.invalid.len(), 1);
+        assert!(report.accepted.is_empty());
+        assert_eq!(
+            std::fs::read_dir(service.config.link_invalid_dir())
+                .expect("invalid dir")
+                .count(),
+            1
+        );
     }
 
     #[test]
