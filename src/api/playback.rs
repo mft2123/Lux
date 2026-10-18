@@ -1925,13 +1925,6 @@ pub(super) async fn publish_playback_webhook(
     remote_ip: Option<&str>,
     resumed: bool,
 ) {
-    let Some(webhooks) = state.webhooks.as_ref() else {
-        return;
-    };
-    let dedupe_key = format!(
-        "playback:{play_session_id}:{}:{occurred_at}:{position_ticks}",
-        event_type.as_str(),
-    );
     let context = playback_notification_context(
         state,
         principal,
@@ -1940,6 +1933,34 @@ pub(super) async fn publish_playback_webhook(
         requested_play_method,
     )
     .await;
+    if event_type == WebhookEventType::PlaybackStarted {
+        crate::application::notify::spawn_playback(crate::application::notify::PlaybackNotice {
+            item_title: context.item_title.clone(),
+            series_title: context.series_title.clone(),
+            season_number: context.season_number,
+            season_count: context.series_season_count,
+            user_name: user_name.to_owned(),
+            client: client.map(str::to_owned),
+            device_name: device_name.map(str::to_owned),
+            device_type: device_type.map(str::to_owned),
+            remote_ip: remote_ip.map(str::to_owned),
+            play_method: context.play_method.clone(),
+            container: context.container.clone(),
+            size: context.size,
+            bitrate: context.bitrate,
+            overview: context.overview.clone(),
+            resumed,
+            observed_at: occurred_at,
+            session_key: play_session_id.to_owned(),
+        });
+    }
+    let Some(webhooks) = state.webhooks.as_ref() else {
+        return;
+    };
+    let dedupe_key = format!(
+        "playback:{play_session_id}:{}:{occurred_at}:{position_ticks}",
+        event_type.as_str(),
+    );
     let data = json!({
         "itemId": emby_public_id(item_id),
         "itemTitle": context.item_title,

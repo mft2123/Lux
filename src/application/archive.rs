@@ -386,6 +386,9 @@ impl ArchiveService {
         }
         self.archive_transfer_entries(&mut report).await?;
         self.organize_pending_entries(&mut report).await?;
+        if !dry_run {
+            crate::application::notify::spawn_archive_report(&report);
+        }
         Ok(report)
     }
 

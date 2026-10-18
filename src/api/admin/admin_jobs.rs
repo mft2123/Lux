@@ -37,6 +37,9 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/admin/archive/status", get(admin_archive_status))
         .route("/api/v1/admin/archive/run", post(admin_archive_run))
         .route("/api/v1/admin/archive/metadata", post(admin_archive_metadata))
+        .route("/api/v1/admin/notify/status", get(admin_notify_status))
+        .route("/api/v1/admin/notify/test", post(admin_notify_test))
+        .route("/api/v1/admin/notify/send", post(admin_notify_send))
         .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
@@ -1341,4 +1344,63 @@ pub(crate) async fn admin_archive_metadata(
         )
         .into_response(),
     }
+}
+
+pub(crate) async fn admin_notify_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    Json(crate::application::notify::status()).into_response()
+}
+
+pub(crate) async fn admin_notify_test(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let outcome = crate::application::notify::send_test().await;
+    Json(serde_json::json!({
+        "ok": outcome.sent,
+        "skipped": outcome.skipped,
+        "messageId": outcome.message_id,
+        "error": outcome.error,
+    }))
+    .into_response()
+}
+
+pub(crate) async fn admin_notify_send(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<crate::application::notify::NotifySendRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let event = match crate::application::notify::NotifyEvent::from_request(request) {
+        Ok(event) => event,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                &message,
+            )
+            .into_response();
+        }
+    };
+    let category = event.category.key();
+    let outcome = crate::application::notify::send_event(event).await;
+    Json(serde_json::json!({
+        "ok": outcome.sent,
+        "skipped": outcome.skipped,
+        "category": category,
+        "messageId": outcome.message_id,
+        "error": outcome.error,
+    }))
+    .into_response()
 }
