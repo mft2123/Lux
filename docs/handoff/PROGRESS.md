@@ -44,13 +44,26 @@
 3. **module-telethon**：Python 旁挂，Userbot 登录 + 频道监听 5 模式（手动/上新/追更/洗版/全量）
 4. 存量迁移 + chill 退役（用户要求先跑几天测试，暂缓）
 
+## 第二轮审核（2026-10-18 · 审核组）
+
+- **F1 剧集包按季判定已修并合入 `fork/phase-a`**（`42134498`）：剧集包按每个 `Season NN` 独立判定，
+  缺季入库、同季重复进 `重复目录/<包名>/Season NN`、更大季洗版；全季重复才退回整包判定。
+  - 单测 `cargo test --locked --lib archive` **34 通过**（新增 3 个季判定用例）
+  - 测试库 `聊斋 (1996)` 数据已修：库里有 Season 01+02，重复目录只剩 Season 01，镜像 80 个 sidecar 就位（strm 目标逐条校验通过）
+  - 规范：`docs/archive-pipeline.md` §5.1
+- 四个在飞模块本轮**全部 CHANGES**，整改单：`fix-settings-round2.md` / `fix-notify-round2.md` /
+  `fix-sidecar-round2.md` / `fix-ingest-round2.md`；决策见 `REVIEW-BUS.md` D1–D10。
+- 合并门禁与状态机见 `WORKFLOW.md`；镜像仍只由总控构建（本轮 `lux:phase-a` 由审核组重建）。
+
 ## 模块分工
 
 | 模块 | 文档 | 负责文件 | 状态 |
 | --- | --- | --- | --- |
-| 设置与 UI | module-settings.md | `src/application/archive/settings.rs`、`src/api/admin/admin_jobs.rs`、`web/src/features/settings/…` | 待开工 |
-| 通知 | module-notify.md | `src/application/archive/notify.rs`、admin 路由 | 待开工 |
-| Telethon 旁挂 | module-telethon.md | Lux 侧 `src/application/archive.rs` + admin 路由；Python 侧车在 `sidecar/telegram/` | Lux 侧交接已交付（`feat/telegram-ingest`）；侧车由用户对话框推进 |
+| 设置与 UI | module-settings.md | `src/application/archive/settings.rs`、`src/api/admin/admin_jobs.rs`、`web/src/features/settings/…` | CHANGES（`feat/notify-settings`），见 fix-settings-round2 |
+| 通知 | module-notify.md | `src/application/notify/`、admin 路由 | CHANGES（`feat/notify-settings`），见 fix-notify-round2 |
+| Telethon 旁挂 | module-telethon.md | Lux 侧 `src/application/archive.rs` + admin 路由；Python 侧车在 `sidecar/telegram/` | CHANGES（`feat/telegram-sidecar`），见 fix-sidecar-round2 |
+| 归档 / ingest | archive-pipeline.md | `src/application/archive.rs` + admin 路由 | CHANGES（`feat/telegram-ingest`），见 fix-ingest-round2；F1 已合并 |
+
 
 ## 审核规则（总控对话框用）
 
