@@ -89,7 +89,7 @@
 - ✅ S5 对象型 `listen_channels` 与未知键在保存时原样保留（`existing` 为底稿合并）
 - ✅ S7 PUT 进程内串行（`ARCHIVE_SETTINGS_WRITE_LOCK`）
 - ✅ S10 `api_base` 打码；S11 类型错误 400；S12 只校验本次改动涉及的路径
-- ⏭️ S8 临时文件名 pid+自增（跨进程不可撞，未再加随机后缀）；S6 由后端下发类别清单解决
+- ✅ S8 临时文件名 pid+自增+纳秒 nonce（跨进程也不会撞）；S6 由后端 `known_categories` 解决（`aaad6826`）
 测试：`cargo test --locked --lib archive` → 71 通过（含 settings 8 个、季判定 3 个、ingest 9 个）
 
 ---
@@ -104,7 +104,10 @@
 - ✅ N4 转存/整理/洗版/重复/失败事件都带 `dedupe_key`，坏条目每窗口只提醒一次
 - ✅ N5 去重键改为发送成功后写入，失败不再自我抑制
 - ✅ N12 `NotifyConfig` 手写 Debug，token/chat_id/api_base 打码
-- ⏭️ N6/N7（行内截断、字段预算）、N9、N10、N11、N13 记录在案，留待下一轮
+- ✅ N6/N7 截断不再切断 HTML 实体、字段按转义后码元封顶 400（`aaad6826`）
+- ✅ N8 `telegram.notify` 是字符串时 WARN 一次并当 `null`（`1d6783f5`）
+- ✅ N9 设置读失败每进程只 WARN 一次、N10 `api_base` 校验（禁 query/fragment）
+- ✅ N11 归档中途中止会发一条去重的失败通知、N13 文档改为「准入串行」
 测试：`cargo test --locked --lib notify` → 41 通过；`--lib playback` → 97 通过
 
 ---
@@ -120,7 +123,11 @@
 - ✅ SC6 payload 补齐 `source/kind/channel/message_id/size_bytes/captured_at`
 - ✅ SC1（旁挂侧）key 文件优先、env 兜底；SC2（旁挂侧）`group_add` + 部署检查清单 + 权限错误提示
 - ✅ SC8 status 打码、SC14 文档/注释、SC15 HTML 实体、SC16 phone 校验、SC17 假号码、SC18 deliver 兜底、SC11 关停顺序
-- ⏭️ SC7/SC9/SC10/SC12/SC13 保留（理由见模块方汇报）
+- ✅ SC7 多链接逐链接取标题（缺标题的链接 held/title_ambiguous）— `d6c77749`
+- ✅ SC9 `check --deep` + Dockerfile healthcheck 深检 — `60465bf6`
+- ✅ SC10 依赖全钉（telethon/pyaes/rsa/pyasn1/python-socks）— `d68a1c86`
+- ✅ SC12 去重键统一 `channel:msg_id`（旧键不再命中，最坏重复一次，Lux URL 幂等兜底）— `4481cd34`
+- ✅ SC13 真 sqlite/client 损坏用例 + api_smoke 覆盖 catch_up/min_id — `35fd9219`
 测试：`python3 -m unittest discover -s tests -t .` → **184 OK**（3 条权限用例在 ZFS 上 skip）
 
 ---
@@ -138,7 +145,10 @@
 - ✅ I5 lookup 只匹配标题层、年份一致、短标题精确、续集不误配（4 组用例）
 - ✅ I6 walk 深度上限 + 不跟随符号链接 + 60s 缓存 + `spawn_blocking`（72k 条目 bench：冷 137ms / 命中 5.9µs）
 - ✅ I8 `mode` 只认 5 种；I9 作业判定共用；I10 URL 必须有 host/target；I11 全角归一；I12 读失败不再当"没有重复"
-- ⏭️ I7（幂等 TTL/轮转）、I13（202 状态语义）、I14（duplicate 的 file 路径）、I15 已由审核组在 admin_jobs 完成
+- ✅ I7 `force: true` 重新入队已消费的 URL（幂等键不设 TTL，这是显式重试口）— `aaad6826`
+- ✅ I13 202 的 `status` 改为入队态 `queued` — `aaad6826`
+- ✅ I14 状态记录的是实际落盘文件名（`job_file`），duplicate 响应的路径一定存在 — 由 ingest 侧实现，审核复核
+- ✅ I15 鉴权先于 body 解析 — `6eadd2d1`
 测试：`cargo test --locked --lib archive` → 71 通过（2 ignored 为手工 bench）
 
 ---
@@ -148,3 +158,15 @@
 - `application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`
   在 `fork/phase-a`（`385c421e`）上单独跑也失败：断言哪个条目失败依赖内部顺序，属于既有不稳定用例。
   本轮所有模块测试（archive/notify/playback、sidecar）不受影响；整库 `cargo test --lib` 因此仍报 1 failed。
+
+---
+
+## 第三轮收尾（2026-10-18 · 审核组）
+
+第三轮把剩余小项全部收掉：S8；N6/N7/N8/N9/N10/N11/N13；SC7/SC9/SC10/SC12/SC13；I7/I13/I14。
+
+- 代码：`aaad6826`（N6/N7/N9/N10/N11/N13/I7/I13/S8）、`1d6783f5`（N8）、旁挂 `d6c77749`…`35fd9219`。
+- 测试：archive 73、notify 43、playback 97、旁挂 **207**（tgvenv 下 3 skip 为 ZFS 权限用例）；
+  整库 `cargo test --lib` 仍只剩那个**既有** metadata 不稳定用例（trunk 同样失败）。
+- 新增单测：实体截断 2 条、api_base 1 条、force 重投 1 条、旁挂 +23 条。
+- 仍未做（明确边界）：U11（115 转存客户端）——不是整改项，是下一阶段的新功能。
