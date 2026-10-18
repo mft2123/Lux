@@ -151,31 +151,67 @@
 
 ## 7. 性能
 
-- 稳定窗口默认 5 秒（可按环境变量调整）。
-- 轮询间隔由 `LUX_ARCHIVE_POLL_SECONDS` 控制（0/未设 = 关闭，测试环境用 10）。
+- 稳定窗口默认 5 秒（可在设置文件或环境变量中调整）。
+- 轮询间隔由 `poll_seconds`（设置文件）或 `LUX_ARCHIVE_POLL_SECONDS` 控制（0/未设 = 关闭，测试环境用 10）。
 - TMDB 查询 8 路并发；移动为同文件系统 rename，毫秒级。
 - 空跑（无待处理条目）单次 run 约 50 ms。
 
 ## 8. 配置项
 
+可调参数和凭证优先来自**设置文件**（`LUX_ARCHIVE_SETTINGS`，默认
+`/config/archive-settings.json`，权限 0600，不在 git 仓库内）。文件里缺失的键回退到环境变量，
+再缺才用下表默认值。改完下一次 run 即生效，无需重启（轮询间隔在下一轮生效）。
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LUX_ARCHIVE_ROOT` | `/vol5/1000/docker/lux-test` | 归档根目录 |
+| `LUX_ARCHIVE_SETTINGS` | `/config/archive-settings.json` | 设置文件路径（文件内的键覆盖下面同名的环境变量） |
+| `LUX_ARCHIVE_ROOT` | `/vol5/1000/docker/lux-test` | 归档根目录（只由环境变量控制） |
 | `LUX_TMDB_API_KEY` | 无 | TMDB v3 API Key（必需） |
-| `LUX_TMDB_LANGUAGE` | `zh-CN` | 详情显示语言（搜索同时查 en-US） |
-| `LUX_ARCHIVE_POLL_SECONDS` | 0（关闭） | 自动轮询间隔秒数 |
+| `LUX_TMDB_LANGUAGE` | `zh-CN` | 详情显示语言（搜索同时查 en-US；只由环境变量控制） |
+| `LUX_ARCHIVE_POLL_SECONDS` | 0（关闭） | 自动轮询间隔秒数（0–3600） |
 | `LUX_ARCHIVE_SETTLE_SECONDS` | 5 | 稳定等待秒数（上限 3600） |
-| `LUX_ARCHIVE_WATCH_DIRS` | 空 | 逗号分隔的 115 监听目录（新条目自动搬入 `转存目录/`） |
+| `LUX_ARCHIVE_WATCH_DIRS` | 空 | 逗号分隔的监听目录（新条目自动搬入 `转存目录/`） |
 | `LUX_ARCHIVE_MIRROR_ROOT` | `/vol5/1000/docker/lux-library` | 本地镜像库根（媒体服务器扫描） |
 | `LUX_ARCHIVE_CD2_PREFIX` | 空 | 归档根在 CD2 挂载中的相对路径（如 `测试库`） |
 | `LUX_ARCHIVE_CD2_MOUNT` | `/media/cloud` | CD2 在媒体服务器容器内的挂载点 |
 | `LUX_ARCHIVE_WASH_ENABLED` | 1 | 是否启用洗版 |
 | `LUX_ARCHIVE_WASH_TOLERANCE` | 0.02 | 体积容差比例（0–1） |
 
+设置文件结构（`telegram` 段由通知与 Telethon 旁挂共用，凭证读写时打码）：
+
+```json
+{
+  "tmdb_api_key": "…",
+  "watch_dirs": ["/testlib/外部上传"],
+  "mirror_root": "/library",
+  "cd2_prefix": "测试库",
+  "cd2_mount": "/media/cloud",
+  "poll_seconds": 10,
+  "settle_seconds": 3,
+  "wash_enabled": true,
+  "wash_tolerance_ratio": 0.02,
+  "telegram": {
+    "bot_token": "…",
+    "chat_id": "…",
+    "api_id": "…",
+    "api_hash": "…",
+    "phone": "…",
+    "notify": ["入库", "整理", "失败"],
+    "listen_mode": "上新",
+    "listen_channels": ["@channel"],
+    "follow_list": ["繁花"]
+  }
+}
+```
+
 ## 9. 管理接口
 
 - `GET /api/v1/admin/archive/status` — 根目录、各角色目录、TMDB 是否配置、洗版与稳定参数。
 - `POST /api/v1/admin/archive/run?dry_run=1|0` — 预演/执行一次；返回 `archived_to_pending`、`organized`（含 tmdb_id）、`duplicates`、`washed`、`failed`、`skipped` 清单。
+- `POST /api/v1/admin/archive/metadata?dry_run=1|0&overwrite=0|1` — 为历史条目补生成镜像元数据。
+- `GET /api/v1/admin/archive/settings` — 返回设置文件内容，凭证打码（前 6 位 + 长度）。
+- `PUT /api/v1/admin/archive/settings` — 整体写入设置文件（0600）。缺省的键保留现值；凭证留空表示不修改；
+  校验失败返回 400：容差 0–1、轮询/稳定等待 0–3600、镜像库与监听目录必须存在、CD2 挂载点必须是绝对路径。
 
 ## 10. 已知限制
 
