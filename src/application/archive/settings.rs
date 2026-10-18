@@ -84,6 +84,9 @@ pub(crate) struct TelegramSettings {
     pub(crate) api_hash: String,
     /// Phone number the userbot logs in with.
     pub(crate) phone: String,
+    /// Shared admin API key the sidecar uses for `X-Lux-Api-Key`. Stored here so
+    /// the Telegram sidecar has one place to read it from.
+    pub(crate) api_key: String,
     /// Notification categories: array of keys/labels, an object of per-category
     /// switches, or `null` for "everything on". Owned by the notify module.
     pub(crate) notify: Value,
@@ -138,6 +141,7 @@ impl Default for TelegramSettings {
             api_id: String::new(),
             api_hash: String::new(),
             phone: String::new(),
+            api_key: String::new(),
             notify: Value::Null,
             listen_mode: DEFAULT_LISTEN_MODE.to_owned(),
             listen_channels: Vec::new(),
@@ -234,10 +238,72 @@ impl ArchiveSettings {
     }
 
     pub(crate) fn save_to(&self, path: &Path) -> Result<(), String> {
-        let mut document = serde_json::to_string_pretty(self)
-            .map_err(|error| format!("无法序列化归档设置: {error}"))?;
-        document.push('\n');
+        self.save_to_with_base(path, &Self::from_env())
+    }
+
+    /// Save against an explicit environment base. The tests use this so they do
+    /// not have to mutate process-wide `LUX_ARCHIVE_*` values.
+    pub(crate) fn save_to_with_base(&self, path: &Path, base: &Self) -> Result<(), String> {
+        let existing = read_document(path).ok().flatten();
+        let document = self.document_for_save(existing.as_ref(), base)?;
         write_private(path, &document)
+    }
+
+    /// The document to persist. Only keys that already live in the file, or whose
+    /// value differs from the environment base, are written: a save must never
+    /// pin `LUX_ARCHIVE_*` values into the file (they would then shadow later
+    /// environment changes), and keys this module does not know are preserved
+    /// from the existing file instead of being dropped.
+    fn document_for_save(&self, existing: Option<&Value>, base: &Self) -> Result<String, String> {
+        let env = serde_json::to_value(base)
+            .map_err(|error| format!("无法序列化环境配置: {error}"))?;
+        let current = serde_json::to_value(self)
+            .map_err(|error| format!("无法序列化归档设置: {error}"))?;
+        let existing_object = existing
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let current_object = current.as_object().cloned().unwrap_or_default();
+        let env_object = env.as_object().cloned().unwrap_or_default();
+        // Start from what the file already holds so keys this module does not
+        // know survive the rewrite.
+        let mut document = existing_object.clone();
+        for (key, value) in &current_object {
+            if key == "telegram" {
+                continue;
+            }
+            if key_is_owned(&existing_object, &env_object, key, value) {
+                document.insert(key.clone(), value.clone());
+            }
+        }
+        let current_telegram = current_object
+            .get("telegram")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let env_telegram = env_object
+            .get("telegram")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // Start from what the file already holds so unknown keys survive.
+        let mut telegram = existing_object
+            .get("telegram")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in &current_telegram {
+            if key_is_owned(&telegram, &env_telegram, key, value) {
+                telegram.insert(key.clone(), value.clone());
+            }
+        }
+        if !telegram.is_empty() {
+            document.insert("telegram".to_owned(), Value::Object(telegram));
+        }
+        let mut text = serde_json::to_string_pretty(&Value::Object(document))
+            .map_err(|error| format!("无法序列化归档设置: {error}"))?;
+        text.push('\n');
+        Ok(text)
     }
 
     /// A copy safe to return over the API: secrets keep only a short prefix and
@@ -249,6 +315,10 @@ impl ArchiveSettings {
         masked.telegram.chat_id = mask_secret(&self.telegram.chat_id);
         masked.telegram.api_hash = mask_secret(&self.telegram.api_hash);
         masked.telegram.phone = mask_secret(&self.telegram.phone);
+        masked.telegram.api_key = mask_secret(&self.telegram.api_key);
+        if let Some(api_base) = masked.telegram.api_base.as_mut() {
+            *api_base = mask_api_base(api_base);
+        }
         masked
     }
 
@@ -259,14 +329,70 @@ impl ArchiveSettings {
         let Value::Object(mut document) = update.clone() else {
             return Err("设置内容必须是 JSON 对象".to_owned());
         };
+        // A value of the wrong type is an error, not a silent no-op: otherwise a
+        // typo in the UI looks like it was saved when nothing changed.
+        reject_unparsable_values(&document)?;
         keep_stored_secret(&mut document, "tmdb_api_key", &self.tmdb_api_key);
         if let Some(Value::Object(telegram)) = document.get_mut("telegram") {
             keep_stored_secret(telegram, "bot_token", &self.telegram.bot_token);
             keep_stored_secret(telegram, "chat_id", &self.telegram.chat_id);
             keep_stored_secret(telegram, "api_hash", &self.telegram.api_hash);
             keep_stored_secret(telegram, "phone", &self.telegram.phone);
+            keep_stored_secret(telegram, "api_key", &self.telegram.api_key);
         }
-        *self = Self::from_document(self, &Value::Object(document)).sanitized();
+        let merged = Self::from_document(self, &Value::Object(document));
+        // Validate the values this update actually sets: an invalid directory in
+        // the environment must not make every save fail. Validation runs before
+        // the update is committed, so a rejected update leaves the struct as it
+        // was.
+        merged.validate_changed(update)?;
+        *self = merged;
+        Ok(())
+    }
+
+    /// Reject out-of-range or unusable values for the fields this update sets.
+    fn validate_changed(&self, update: &Value) -> Result<(), String> {
+        let Some(document) = update.as_object() else {
+            return Ok(());
+        };
+        if document.contains_key("wash_tolerance_ratio")
+            && (!self.wash_tolerance_ratio.is_finite()
+                || !(0.0..=1.0).contains(&self.wash_tolerance_ratio))
+        {
+            return Err("洗版容差必须是 0 到 1 之间的数字".to_owned());
+        }
+        if document.contains_key("poll_seconds") && self.poll_seconds > MAX_POLL_SECONDS {
+            return Err(format!("轮询间隔必须在 0 到 {MAX_POLL_SECONDS} 秒之间"));
+        }
+        if document.contains_key("settle_seconds") && self.settle_seconds > MAX_SETTLE_SECONDS {
+            return Err(format!("稳定等待必须在 0 到 {MAX_SETTLE_SECONDS} 秒之间"));
+        }
+        if document.contains_key("mirror_root") {
+            validate_directory("本地镜像库", &self.mirror_root)?;
+        }
+        if document.contains_key("cd2_mount") {
+            let mount = self.cd2_mount.trim();
+            if mount.is_empty() {
+                return Err("CD2 挂载点不能为空".to_owned());
+            }
+            if !mount.starts_with('/') {
+                return Err(format!("CD2 挂载点必须是绝对路径: {mount}"));
+            }
+        }
+        if document.contains_key("watch_dirs") {
+            for directory in &self.watch_dirs {
+                validate_directory("监听目录", directory)?;
+            }
+        }
+        if let Some(Value::Object(telegram)) = document.get("telegram")
+            && telegram.contains_key("listen_mode")
+            && !is_listen_mode(&self.telegram.listen_mode)
+        {
+            return Err(format!(
+                "监听模式必须是 {} 之一",
+                LISTEN_MODES.join(" / ")
+            ));
+        }
         Ok(())
     }
 
@@ -385,6 +511,9 @@ impl TelegramSettings {
         if let Some(value) = string_or_number_field(document, "phone") {
             settings.phone = value;
         }
+        if let Some(value) = string_field(document, "api_key") {
+            settings.api_key = value;
+        }
         if let Some(value) = document.get("notify") {
             settings.notify = value.clone();
         }
@@ -422,6 +551,103 @@ impl TelegramSettings {
             settings.timezone_offset_hours = value;
         }
         settings
+    }
+}
+
+/// `true` when a value must be persisted: it is already in the file, or it
+/// differs from the value the environment would provide.
+fn key_is_owned(existing: &Map<String, Value>, env: &Map<String, Value>, key: &str, value: &Value) -> bool {
+    existing.contains_key(key)
+        || env.get(key).map(|environment| environment != value).unwrap_or(true)
+}
+
+/// `https://user:pass@host/path?token=x` -> `https://host`. The notify status
+/// endpoint uses the same shape so both report one consistent value.
+fn mask_api_base(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return "***".to_owned();
+    };
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = rest.rsplit('@').next().unwrap_or_default();
+    if host.is_empty() {
+        return format!("{scheme}://***");
+    }
+    format!("{scheme}://{host}")
+}
+
+/// A value of the wrong type must be reported, not ignored: silently keeping the
+/// old value makes a typo look like a successful save.
+fn reject_unparsable_values(document: &Map<String, Value>) -> Result<(), String> {
+    for (key, label) in [
+        ("poll_seconds", "轮询间隔"),
+        ("settle_seconds", "稳定等待"),
+    ] {
+        if document.contains_key(key) && !number_field_ok(document, key, true) {
+            return Err(format!("{label}必须是整数"));
+        }
+    }
+    if document.contains_key("wash_tolerance_ratio")
+        && !number_field_ok(document, "wash_tolerance_ratio", false)
+    {
+        return Err("洗版容差必须是数字".to_owned());
+    }
+    if document.contains_key("wash_enabled") && !bool_field_ok(document, "wash_enabled") {
+        return Err("洗版开关必须是 true 或 false".to_owned());
+    }
+    if let Some(Value::Object(telegram)) = document.get("telegram") {
+        for (key, label) in [
+            ("min_interval_ms", "通知最小间隔"),
+            ("max_per_minute", "每分钟上限"),
+        ] {
+            if telegram.contains_key(key) && !number_field_ok(telegram, key, true) {
+                return Err(format!("{label}必须是整数"));
+            }
+        }
+        for (key, label) in [
+            ("message_thread_id", "话题 id"),
+            ("dedupe_seconds", "去重窗口"),
+            ("timezone_offset_hours", "时区偏移"),
+        ] {
+            if telegram.contains_key(key) && !number_field_ok(telegram, key, false) {
+                return Err(format!("{label}必须是整数"));
+            }
+        }
+        for (key, label) in [("enabled", "通知开关"), ("silent", "静默开关")] {
+            if telegram.contains_key(key) && !bool_field_ok(telegram, key) {
+                return Err(format!("{label}必须是 true 或 false"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn number_field_ok(document: &Map<String, Value>, key: &str, unsigned: bool) -> bool {
+    match document.get(key) {
+        None | Some(Value::Null) => true,
+        Some(Value::Number(number)) => {
+            if unsigned {
+                number.as_u64().is_some()
+            } else {
+                number.as_i64().is_some() || number.as_f64().is_some()
+            }
+        }
+        Some(Value::String(text)) => {
+            if unsigned {
+                text.trim().parse::<u64>().is_ok()
+            } else {
+                text.trim().parse::<f64>().is_ok()
+            }
+        }
+        Some(_) => false,
+    }
+}
+
+fn bool_field_ok(document: &Map<String, Value>, key: &str) -> bool {
+    match document.get(key) {
+        None | Some(Value::Null) | Some(Value::Bool(_)) => true,
+        Some(Value::String(text)) => bool_from_str(text).is_some(),
+        Some(_) => false,
     }
 }
 
@@ -538,6 +764,9 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
+        // Set the mode on the temporary file so the rename cannot leave a
+        // world-readable settings file behind.
+        set_private(&temp)?;
         fs::rename(&temp, path)?;
         set_private(path)
     })();
@@ -548,14 +777,27 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 fn write_in_place(path: &Path, contents: &str) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
+    // Not atomic by nature: keep the previous contents so a failed write (or a
+    // crash between truncate and write) cannot leave the operator without any
+    // settings at all. The backup is private, like the file itself.
+    let backup = path.with_extension("json.bak");
+    if path.exists() {
+        fs::copy(path, &backup)?;
+        set_private(&backup)?;
+    }
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })();
+    if result.is_err() && backup.exists() {
+        let _ = fs::copy(&backup, path);
+    }
+    result?;
     set_private(path)
 }
 
@@ -933,6 +1175,112 @@ mod tests {
             .collect();
         assert_eq!(entries, vec!["archive-settings.json".to_owned()]);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn env_values_are_not_pinned_into_the_file() {
+        let directory = temporary_directory("provenance");
+        let path = directory.join("archive-settings.json");
+        let base = ArchiveSettings {
+            watch_dirs: vec![directory.display().to_string()],
+            ..ArchiveSettings::default()
+        };
+        let settings = ArchiveSettings::from_document(&base, &json!({ "poll_seconds": 30 }));
+        settings
+            .save_to_with_base(&path, &base)
+            .expect("saved with provenance");
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        // The value the admin changed is persisted ...
+        assert_eq!(written["poll_seconds"], 30);
+        // ... but the environment-provided watch directory is not frozen.
+        assert!(
+            written.get("watch_dirs").is_none(),
+            "environment value was pinned: {written}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_save_preserves_keys_this_module_does_not_know() {
+        let directory = temporary_directory("unknown-keys");
+        let path = directory.join("archive-settings.json");
+        fs::write(
+            &path,
+            r#"{"telegram":{"api_key":"sidecar-key"},"future_key":{"a":1}}"#,
+        )
+        .expect("seed");
+        let mut settings = ArchiveSettings::load_from_with_base(&path, &ArchiveSettings::default());
+        settings
+            .apply_update(&json!({ "poll_seconds": 5 }))
+            .expect("update");
+        settings
+            .save_to_with_base(&path, &ArchiveSettings::default())
+            .expect("saved");
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(written["poll_seconds"], 5);
+        assert_eq!(written["telegram"]["api_key"], "sidecar-key");
+        assert_eq!(written["future_key"]["a"], 1);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_sidecar_api_key_is_masked_and_kept() {
+        let mut settings = ArchiveSettings::default();
+        settings
+            .apply_update(&json!({ "telegram": { "api_key": "abcd1234efgh" } }))
+            .expect("update");
+        assert_eq!(settings.telegram.api_key, "abcd1234efgh");
+        let masked = settings.masked();
+        assert_eq!(masked.telegram.api_key, "abcd12…(12)");
+        assert!(!serde_json::to_string(&masked)
+            .expect("json")
+            .contains("abcd1234efgh"));
+        // Echoing the mask back keeps the stored key instead of clearing it.
+        settings
+            .apply_update(&json!({ "telegram": { "api_key": mask_secret("abcd1234efgh") } }))
+            .expect("update");
+        assert_eq!(settings.telegram.api_key, "abcd1234efgh");
+    }
+
+    #[test]
+    fn an_update_rejects_out_of_range_and_unparsable_values() {
+        let mut settings = ArchiveSettings::default();
+        assert!(settings
+            .apply_update(&json!({ "poll_seconds": 7_200 }))
+            .expect_err("poll")
+            .contains("轮询"));
+        assert!(settings
+            .apply_update(&json!({ "wash_tolerance_ratio": 4.0 }))
+            .expect_err("tolerance")
+            .contains("容差"));
+        assert!(settings
+            .apply_update(&json!({ "poll_seconds": "later" }))
+            .expect_err("type")
+            .contains("整数"));
+        assert!(settings
+            .apply_update(&json!({ "telegram": { "min_interval_ms": "soon" } }))
+            .is_err());
+        // Nothing was written into the in-memory settings by the rejected updates.
+        assert_eq!(settings.poll_seconds, 0);
+        assert_eq!(settings.wash_tolerance_ratio, DEFAULT_WASH_TOLERANCE_RATIO);
+    }
+
+    #[test]
+    fn an_update_only_validates_the_paths_it_sets() {
+        // A broken directory in the environment must not block an unrelated save.
+        let mut settings = ArchiveSettings {
+            watch_dirs: vec!["/definitely/not/here".to_owned()],
+            ..ArchiveSettings::default()
+        };
+        settings
+            .apply_update(&json!({ "poll_seconds": 5 }))
+            .expect("unrelated update passes");
+        let mut bad = ArchiveSettings::default();
+        assert!(bad
+            .apply_update(&json!({ "watch_dirs": ["/definitely/not/here"] }))
+            .is_err());
     }
 
     #[test]
