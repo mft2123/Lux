@@ -29,6 +29,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_get_library_cover_job),
         )
         .route(
+            "/api/v1/admin/libraries/{library_id}/re-enrich",
+            post(admin_re_enrich_library),
+        )
+        .route(
             "/api/v1/admin/libraries/{library_id}/roots",
             post(admin_add_library_root),
         )
@@ -890,6 +894,111 @@ pub(crate) async fn admin_delete_library(
     )
     .await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Queue a fresh local-NFO pass for every root of the library. The background
+/// worker re-reads the NFO sidecars and re-persists what is missing, which is
+/// how a stale/invalidated actor relation gets its credits back. Idempotent and
+/// cheap when everything is already current.
+pub(crate) async fn admin_re_enrich_library(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(libraries) = state.libraries.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let views = match libraries.list_libraries().await {
+        Ok(views) => views,
+        Err(error) => return library_error(&headers, error),
+    };
+    let Some(view) = views.into_iter().find(|view| view.library.id == library_id) else {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在",
+        )
+        .into_response();
+    };
+    let root_ids = view
+        .roots
+        .iter()
+        .map(|root| root.id.to_string())
+        .collect::<Vec<_>>();
+    let root_count = root_ids.len();
+    let mut restarted = 0_usize;
+    let mut failed = 0_usize;
+    for root_id in &root_ids {
+        // Keep the legacy backfill queue in sync too, so a scan picks it up as
+        // well; the direct refresh below is what actually runs now.
+        match database
+            .restart_scan_local_metadata_backfill_root(root_id)
+            .await
+        {
+            Ok(true) => restarted += 1,
+            Ok(false) => {}
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    library_id = %library_id,
+                    root_id = %root_id,
+                    %error,
+                    "local metadata backfill could not be rescheduled"
+                );
+            }
+        }
+    }
+    if let Some(scan_jobs) = state.scan_jobs.clone() {
+        let roots = root_ids.clone();
+        tokio::spawn(async move {
+            scan_jobs.re_enrich_library_roots(roots).await;
+        });
+    }
+    tracing::info!(
+        library_id = %library_id,
+        roots = view.roots.len(),
+        restarted,
+        failed,
+        "library re-enrichment queued"
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": failed == 0,
+            "rootCount": root_count,
+            "restarted": restarted,
+            "failed": failed,
+        })),
+    )
+        .into_response()
 }
 
 pub(crate) async fn admin_add_library_root(

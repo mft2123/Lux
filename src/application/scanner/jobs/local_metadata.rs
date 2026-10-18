@@ -1322,6 +1322,79 @@ async fn run_local_metadata_job_worker(context: LocalMetadataJobWorkerContext) {
 }
 
 impl ScanJobService {
+    /// Re-read the local NFO of every media entry under these roots and
+    /// re-persist whatever is missing (actor credits included). Used by the
+    /// admin re-enrichment action; runs in the background.
+    ///
+    /// This deliberately does not go through the image/backfill pipeline: those
+    /// only look at entries that still need work, so an item whose credits were
+    /// lost while its relation snapshot is stale would never be revisited.
+    pub(crate) async fn re_enrich_library_roots(&self, library_root_ids: Vec<String>) {
+        let entry_ids = match self
+            .database
+            .list_local_metadata_entry_ids_for_roots(&library_root_ids)
+            .await
+        {
+            Ok(entry_ids) => entry_ids,
+            Err(error) => {
+                tracing::warn!(%error, "library re-enrichment could not list its entries");
+                return;
+            }
+        };
+        let mut enricher = MetadataEnricher::new(self.database.clone())
+            .with_resource_metrics(self.resources.clone());
+        if let Some(local_nfo) = self.local_nfo.clone() {
+            enricher = enricher.with_nfo_store(local_nfo);
+        }
+        if let Some(people) = self.people.clone() {
+            enricher = enricher.with_people(people);
+        }
+        tracing::info!(
+            roots = library_root_ids.len(),
+            entries = entry_ids.len(),
+            "library re-enrichment started"
+        );
+        let mut failed = 0_usize;
+        for chunk in entry_ids.chunks(64) {
+            let sources = match self
+                .database
+                .list_scan_local_metadata_sources(chunk)
+                .await
+            {
+                Ok(sources) => sources,
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(%error, "library re-enrichment could not read its sources");
+                    continue;
+                }
+            };
+            if sources.is_empty() {
+                continue;
+            }
+            match enricher
+                .enrich_scan_local_metadata_batch_nfo(sources, &[])
+                .await
+            {
+                Ok(batch) => {
+                    failed += batch.report.failed_item_ids.len();
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(%error, "library re-enrichment batch failed");
+                }
+            }
+        }
+        if let Some(home) = self.home.as_ref() {
+            home.invalidate();
+        }
+        self.user_events.publish_home_coalesced().await;
+        tracing::info!(
+            roots = library_root_ids.len(),
+            failed,
+            "library re-enrichment finished"
+        );
+    }
+
     pub(in crate::application::scanner) async fn run_local_metadata_refresh(
         &self,
         entry_ids: Vec<String>,

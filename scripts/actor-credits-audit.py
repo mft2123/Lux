@@ -35,12 +35,15 @@ Usage
   # invalidate the affected relations
   python3 actor-credits-audit.py --config-dir /config --fix
 
-After `--fix`, the credits come back the next time the item is enriched. Note
-that the current build does NOT re-enrich unchanged items on a normal scan or
-reconcile (verified on the test instance: touching or editing the NFO and
-re-scanning left the item alone). To actually restore them, force a full
-re-enrichment, e.g. rebuild the library (delete it and add the same root back);
-that was verified to restore every credit.
+After `--fix`, ask Lux to re-enrich the library:
+
+  curl -X POST -b cookies.txt -H "X-CSRF-Token: …" \
+       http://127.0.0.1:8097/api/v1/admin/libraries/<library-id>/re-enrich
+
+That queues a local-NFO pass over every root of the library; the background
+worker re-reads the NFO sidecars and re-persists the missing credits (a plain
+scan does not re-enrich unchanged items). `--prune-stale` also removes the
+metadata directories of relations whose item no longer exists.
 
 Exit code: 0 when every relation is consistent (or everything was repaired),
 1 when problems remain, 2 on a usage/IO error.
@@ -51,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -78,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         "--fix",
         action="store_true",
         help="delete the people.json of inconsistent items so the next NFO scan re-persists their credits",
+    )
+    parser.add_argument(
+        "--prune-stale",
+        action="store_true",
+        help="delete the metadata dir of stale relations (item no longer exists in the database)",
     )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     return parser.parse_args()
@@ -170,6 +179,16 @@ def main() -> int:
         if item_id not in seen_items:
             orphan.append(item_id)
 
+    pruned: list[str] = []
+    if args.prune_stale:
+        for stale_relation in stale:
+            directory = Path(stale_relation["path"]).parent
+            try:
+                shutil.rmtree(directory)
+                pruned.append(stale_relation["item_id"])
+            except OSError as error:
+                print(f"error: cannot prune {directory}: {error}", file=sys.stderr)
+
     repaired: list[str] = []
     if args.fix:
         for finding in findings:
@@ -193,6 +212,7 @@ def main() -> int:
                     "stale_relations": stale,
                     "orphan_credits": orphan,
                     "repaired": repaired,
+                    "pruned": pruned,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -216,10 +236,18 @@ def main() -> int:
                 )
         if orphan:
             print(f"note       : {len(orphan)} item(s) have credits but no relation snapshot (rewritten by the next scan)")
+        if args.prune_stale:
+            print(f"pruned     : {len(pruned)} stale relation directory(ies) removed")
         if args.fix:
-            print(f"repaired   : {len(repaired)} relation(s) invalidated — run a library scan to re-persist their credits")
+            print(
+                f"repaired   : {len(repaired)} relation(s) invalidated — call "
+                "POST /api/v1/admin/libraries/<library-id>/re-enrich"
+            )
         elif findings:
-            print("next step  : re-run with --fix, then force a full re-enrichment (a plain scan does not re-enrich unchanged items; rebuilding the library does)")
+            print(
+                "next step  : re-run with --fix, then call "
+                "POST /api/v1/admin/libraries/<library-id>/re-enrich"
+            )
 
     connection.close()
     if findings and not repaired:

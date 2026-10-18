@@ -26,6 +26,49 @@ fn is_extrafanart_image_relative_path(relative_path: &str) -> bool {
 }
 
 impl Database {
+    /// Every media entry of the given roots (one id per media source). Used by
+    /// the admin re-enrichment to walk a library without waiting for a scan.
+    pub(crate) async fn list_local_metadata_entry_ids_for_roots(
+        &self,
+        library_root_ids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        let mut entry_ids = Vec::new();
+        for chunk in library_root_ids.chunks(SCAN_DML_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT DISTINCT entry.id
+                 FROM filesystem_entries entry
+                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
+                 JOIN media_items item ON item.id = source.item_id
+                 WHERE entry.library_root_id IN ({placeholders})
+                   AND entry.entry_kind = 'FILE'
+                   AND entry.is_missing = 0
+                   AND item.removed_at IS NULL
+                 ORDER BY entry.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for root_id in chunk {
+                statement = statement.bind(root_id);
+            }
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                entry_ids.push(row.get::<String, _>("id"));
+            }
+        }
+        Ok(entry_ids)
+    }
+
     pub(crate) async fn list_scan_local_metadata_sources(
         &self,
         filesystem_entry_ids: &[String],

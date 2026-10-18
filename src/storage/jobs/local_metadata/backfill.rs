@@ -59,6 +59,41 @@ impl Database {
         })
     }
 
+    /// Schedule a fresh local-NFO pass for one library root. Used by the admin
+    /// "re-enrich" action after cached actor relations were invalidated: the
+    /// background worker walks the root again and re-persists what is missing.
+    pub(crate) async fn restart_scan_local_metadata_backfill_root(
+        &self,
+        library_root_id: &str,
+    ) -> Result<bool, StorageError> {
+        if library_root_id.trim().is_empty() {
+            return Err(StorageError::Conflict(
+                "scan metadata backfill root id is empty".into(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        self.query(
+            "INSERT INTO scan_local_metadata_backfills
+                 (library_root_id, status, cursor_entry_id, attempts, next_attempt_at, error, updated_at)
+             VALUES (?, 'PENDING', NULL, 0, NULL, NULL, unixepoch())
+             ON CONFLICT(library_root_id) DO UPDATE SET
+                 status = 'PENDING',
+                 cursor_entry_id = NULL,
+                 attempts = 0,
+                 next_attempt_at = NULL,
+                 error = NULL,
+                 updated_at = unixepoch()",
+        )
+        .bind(library_root_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() > 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn claim_next_scan_local_metadata_backfill_page(
         &self,
         page_size: usize,

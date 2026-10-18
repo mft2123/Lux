@@ -184,9 +184,12 @@
 - 只读模式列出 `MISSING_CREDITS` / `COUNT_MISMATCH` / `UNREADABLE`，以及没有关系快照的孤儿 credit；
   有问题退出码 1，干净退出 0，方便接监控。
 - `--fix` 只删掉问题条目的 `people.json`（关系快照是缓存，不碰媒体与数据库行）。
-- **注意**：当前构建下普通 scan / reconcile **不会**重新富化未变化的条目——实测 touch 或修改 NFO 后重扫都无济于事；
-  要让 `--fix` 生效必须触发一次完整重富化（实测：删库重建同一个根，5 个条目 92 条 credit 全部恢复）。
-  这是下一步值得补的运维接口（`POST …/libraries/{id}/re-enrich`）。
+- 修复由新接口完成：`POST /api/v1/admin/libraries/{id}/re-enrich`（admin + CSRF，202）。
+  它给该库每个根排一次本地 NFO 重读，并**直接**用 `list_scan_local_metadata_sources` + 带 `people` 的 enricher
+  重跑一遍（不走 image/backfill 流水线——那些只处理「还需要处理」的条目，正是丢 credit 的条目会被漏掉）。
+  后台执行，幂等，跑完日志有 `library re-enrichment started/finished`。
+- 普通 scan / reconcile 仍然不会重新富化未变化的条目（实测 touch 或改 NFO 后重扫都无效），所以修复走 re-enrich。
 
-实测（测试实例，电影库 16 条目）：模拟 bug（删掉一个条目 20 条 credit）→ 审计报 `MISSING_CREDITS actors=20 credits=0`、exit 1；
-`--fix` 删掉该关系；重建媒体库重扫 → credit 恢复，审计回到 OK / exit 0。
+实测（测试实例，电影库 5 个有演员的条目 / 92 条 credit）：模拟 bug（删掉一个条目 20 条 credit）→ 审计报
+`MISSING_CREDITS actors=20 credits=0`、exit 1；`--fix` 删关系；`POST …/re-enrich` → 20 条 credit 恢复，
+审计回到 `OK / exit 0`；`--prune-stale` 把 4 个已删库遗留的关系目录清掉后，审计显示 `5 checked, 0 stale`。
