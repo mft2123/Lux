@@ -111,6 +111,7 @@ impl<'a> MetadataWriter<'a> {
                 .push(format!("{}: 创建镜像目录失败: {error}", mirror.display()));
             return;
         }
+        relax_permissions(mirror, true);
         match matched.kind {
             MediaKind::Movie => self.write_movie(pack, mirror, &details, report).await,
             MediaKind::Series => self.write_series(pack, mirror, &details, parsed, report).await,
@@ -245,6 +246,7 @@ impl<'a> MetadataWriter<'a> {
         }
         match std::fs::write(path, content) {
             Ok(()) => {
+                relax_permissions(path, false);
                 report.created.push(path.display().to_string());
                 true
             }
@@ -277,7 +279,10 @@ impl<'a> MetadataWriter<'a> {
         let url = format!("{IMAGE_BASE}/{size}{image_path}");
         match self.service.download_bytes(&url).await {
             Ok(bytes) => match std::fs::write(target, bytes) {
-                Ok(()) => report.created.push(target.display().to_string()),
+                Ok(()) => {
+                    relax_permissions(target, false);
+                    report.created.push(target.display().to_string());
+                }
                 Err(error) => report
                     .failed
                     .push(format!("{}: {error}", target.display())),
@@ -287,6 +292,20 @@ impl<'a> MetadataWriter<'a> {
                 .push(format!("{}: 图片下载失败: {error}", target.display())),
         }
     }
+}
+
+/// The mirror is read by the media server, which usually runs as another user
+/// than the archive writer (a root container here). World-readable is the
+/// simplest reliable contract.
+fn relax_permissions(path: &Path, directory: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if directory { 0o755 } else { 0o644 };
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, directory);
 }
 
 fn video_files(directory: &Path) -> Vec<PathBuf> {
