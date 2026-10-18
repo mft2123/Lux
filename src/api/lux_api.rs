@@ -21,6 +21,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(lux_list_library_items),
         )
         .route(
+            "/api/v1/libraries/{library_id}/folders",
+            get(lux_list_library_folders),
+        )
+        .route(
             "/api/v1/libraries/{library_id}/latest",
             get(lux_list_library_latest),
         )

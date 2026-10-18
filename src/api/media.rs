@@ -12,6 +12,9 @@ pub(super) struct LuxPageQuery {
     page_size: Option<i64>,
     #[serde(rename = "itemType", default)]
     item_type: Option<String>,
+    /// Restrict the page to one first-level folder of the library (e.g. 综艺).
+    #[serde(default)]
+    folder: Option<String>,
     #[serde(rename = "parentId", default)]
     parent_id: Option<String>,
     #[serde(default)]
@@ -921,6 +924,12 @@ pub(super) async fn lux_list_library_items(
         query.sort_order.as_deref(),
         metadata_pending,
     );
+    filter.folder = query
+        .folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|folder| !folder.is_empty() && !folder.contains('/'))
+        .map(ToOwned::to_owned);
     let parent_scope = match query.parent_id.as_deref() {
         None => None,
         Some(parent_id) if parent_id.eq_ignore_ascii_case("root") => {
@@ -989,6 +998,72 @@ pub(super) async fn lux_list_library_items(
             "数据库暂时不可用",
         )
         .into_response(),
+    }
+}
+
+pub(super) async fn lux_list_library_folders(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let library_id = match library_id.parse::<crate::domain::ids::LibraryId>() {
+        Ok(id) => id.to_string(),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "媒体库 ID 无效",
+            )
+            .into_response();
+        }
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    // Reuse the items access path so unknown or unauthorized libraries are
+    // rejected exactly like the page endpoint.
+    match catalog.list_library_items(principal, &library_id, 0, 1).await {
+        Ok(_) => {}
+        Err(CatalogError::LibraryNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response();
+        }
+        Err(CatalogError::AccessDenied) => {
+            return api_error(
+                &headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "没有媒体库访问权限",
+            )
+            .into_response();
+        }
+        Err(CatalogError::Storage(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    match database.list_library_folder_prefixes(&library_id).await {
+        Ok(folders) => Json(json!({ "folders": folders })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 

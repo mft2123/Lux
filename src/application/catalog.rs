@@ -32,6 +32,9 @@ pub struct CatalogFilter {
     pub person_id: Option<String>,
     pub media_source_ids: Option<Vec<String>>,
     pub provider_id_equals: Option<Vec<(String, String)>>,
+    /// Restrict to items whose first path segment under the library root
+    /// equals this folder name (e.g. `综艺`).
+    pub folder: Option<String>,
     pub years: Vec<i64>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
@@ -890,6 +893,7 @@ impl CatalogService {
             item_ids: filter.item_ids.as_deref(),
             person_id: filter.person_id.as_deref(),
             media_source_ids: filter.media_source_ids.as_deref(),
+            folder_prefix: filter.folder.as_deref(),
             provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
             is_played: filter.is_played,
@@ -941,6 +945,7 @@ impl CatalogService {
             item_ids: filter.item_ids.as_deref(),
             person_id: filter.person_id.as_deref(),
             media_source_ids: filter.media_source_ids.as_deref(),
+            folder_prefix: filter.folder.as_deref(),
             provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
             is_played: filter.is_played,

@@ -149,6 +149,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const isHomeVideos = library?.kind === "HOMEVIDEOS";
   const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
   const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
+  const folderFilter = !isGlobalCollectionLibrary && !isHomeVideos
+    ? searchParams.get("folder")?.trim() ?? ""
+    : "";
+  const folderOptions = useQuery({
+    queryKey: ["library-folders", libraryId],
+    queryFn: () => api.libraryFolders(libraryId),
+    enabled: Boolean(libraryId) && !isGlobalCollectionLibrary && !isHomeVideos,
+  });
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
   const itemTypes = isGlobalCollectionLibrary ? "BOX_SET" : libraryItemTypeFilter(library?.kind);
   const confirmMetadata = useMutation({
@@ -186,7 +194,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     setSelectionMode(false);
     setMergeOpen(false);
     setMergePrimaryId(undefined);
-  }, [libraryId, metadataStatus, parentId, sortBy, sortOrder]);
+  }, [libraryId, metadataStatus, parentId, sortBy, sortOrder, folderFilter]);
 
   useEffect(() => {
     if (mergeOpen) mergeCloseButtonRef.current?.focus();
@@ -204,7 +212,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     };
   }, [library?.name, serverName]);
 
-  const libraryQueryKey = queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all");
+  const libraryQueryKey = [...queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all"), folderFilter];
   const pages = useInfiniteQuery({
     queryKey: parentId ? [...libraryQueryKey, parentId] : libraryQueryKey,
     queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, {
@@ -212,6 +220,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       sortOrder,
       ...(metadataStatus ? { metadataStatus } : {}),
       ...(parentId ? { parentId } : {}),
+      ...(folderFilter ? { folder: folderFilter } : {}),
     }),
     initialPageParam: 1,
     enabled: Boolean(libraryId && library),
@@ -257,6 +266,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     { value: "ALL", label: "全部内容" },
     { value: "PENDING", label: "待确认" },
   ] as const;
+  const folderFilterOptions = [
+    { value: "ALL", label: "全部目录" },
+    ...(folderOptions.data?.folders ?? []).map((folder) => ({ value: folder, label: folder })),
+  ];
   const selectedItems = loadedItems.filter((item) => selectedIds.has(item.id));
   const canMergeSelectedItems = selectedItems.length >= 2 && selectedItems.length === selectedIds.size;
   const allSelectedPending = selectedIds.size > 0
@@ -282,6 +295,13 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     const next = new URLSearchParams(searchParams);
     if (value === "PENDING") next.set("metadataStatus", "pending");
     else next.delete("metadataStatus");
+    setSearchParams(next);
+  }
+
+  function changeFolderFilter(value: string) {
+    const next = new URLSearchParams(searchParams);
+    if (value === "ALL") next.delete("folder");
+    else next.set("folder", value);
     setSearchParams(next);
   }
 
@@ -331,6 +351,9 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       </div> : null}
       {!isGlobalCollectionLibrary ? <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
         <div className="lux-library-sort-control"><span>元数据</span><LuxSelect value={metadataStatus ?? "ALL"} options={metadataOptions} onChange={changeMetadataStatus} aria-label="元数据状态" /></div>
+        {folderFilterOptions.length > 1 && (
+          <div className="lux-library-sort-control"><span>目录</span><LuxSelect value={folderFilter || "ALL"} options={folderFilterOptions} onChange={changeFolderFilter} aria-label="目录筛选" /></div>
+        )}
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div> : null}

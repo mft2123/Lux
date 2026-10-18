@@ -90,6 +90,8 @@ export type LibraryItemsOptions = {
   metadataStatus?: "PENDING";
   pageSize?: number;
   parentId?: string;
+  /** Restrict to one first-level folder of the library (e.g. 综艺). */
+  folder?: string;
 };
 
 function withHomeRequestTimeout<T>(
@@ -447,8 +449,15 @@ export class LuxApiClient {
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
     if (options.parentId) params.set("parentId", options.parentId);
+    if (options.folder) params.set("folder", options.folder);
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
+    );
+  }
+
+  libraryFolders(libraryId: string) {
+    return this.request<{ folders: string[] }>(
+      `/api/v1/libraries/${encodeURIComponent(libraryId)}/folders`,
     );
   }
 

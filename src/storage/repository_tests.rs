@@ -8738,6 +8738,112 @@ async fn availability_rollup_recomputes_series_and_season_flags() {
 }
 
 #[tokio::test]
+async fn library_folder_filter_and_listing_use_the_first_path_segment() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await
+        .expect("library");
+    let media_root = temp_dir.path().join("media");
+    std::fs::create_dir_all(media_root.join("综艺")).expect("variety dir");
+    std::fs::create_dir_all(media_root.join("电影")).expect("movie dir");
+    let root = LibraryService::new(database.clone())
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 media root").expect("root path"),
+        )
+        .await
+        .expect("root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+
+    for (entry_id, item_id, relative_path) in [
+        ("folder-entry-variety", "folder-item-variety", "综艺/节目/a.strm"),
+        ("folder-entry-movie", "folder-item-movie", "电影/b.strm"),
+        ("folder-entry-root", "folder-item-root", "top.strm"),
+    ] {
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES (?, ?, ?, 'FILE', 1, 1, 'generation', 0)",
+        )
+        .bind(entry_id)
+        .bind(&root_id)
+        .bind(relative_path)
+        .execute(database.pool())
+        .await
+        .expect("filesystem entry");
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+             VALUES (?, ?, 'STRM_URL', ?)",
+        )
+        .bind(format!("{item_id}-source"))
+        .bind(item_id)
+        .bind(entry_id)
+        .execute(database.pool())
+        .await
+        .expect("media source");
+    }
+
+    let folders = database
+        .list_library_folder_prefixes(&library_id)
+        .await
+        .expect("folder prefixes");
+    assert_eq!(folders, vec!["电影".to_owned(), "综艺".to_owned()]);
+
+    let library_ids = vec![library_id.clone()];
+    let item_types = vec!["MOVIE".to_owned()];
+    let filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "folder-filter-user",
+        item_types: &item_types,
+        excluded_item_types: &[],
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        folder_prefix: Some("综艺"),
+        years: &[],
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        sort_by: CatalogSort::DateCreated,
+        descending: true,
+        offset: 0,
+        limit: 10,
+    };
+    let (rows, total) = database
+        .list_filtered_catalog_rows(&filter)
+        .await
+        .expect("filtered rows");
+    assert_eq!(total, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item_id, "folder-item-variety");
+}
+
+#[tokio::test]
 async fn recent_catalog_rows_include_visible_unavailable_series() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -9825,6 +9931,7 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         person_id: None,
         media_source_ids: None,
         provider_id_equals: None,
+        folder_prefix: None,
         years: &empty_years,
         is_played: None,
         is_favorite: Some(true),
@@ -11484,6 +11591,7 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             person_id: None,
             media_source_ids: None,
             provider_id_equals: None,
+            folder_prefix: None,
             years: &empty_years,
             is_played: None,
             is_favorite: None,
@@ -11553,6 +11661,7 @@ async fn catalog_filter_parent_scope_applies_before_pagination() {
         person_id: None,
         media_source_ids: None,
         provider_id_equals: None,
+        folder_prefix: None,
         years: &empty_years,
         is_played: None,
         is_favorite: None,
@@ -11718,6 +11827,7 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             person_id: None,
             media_source_ids: None,
             provider_id_equals: None,
+            folder_prefix: None,
             years: &empty_years,
             is_played: None,
             is_favorite: None,

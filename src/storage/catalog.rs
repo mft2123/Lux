@@ -1334,6 +1334,48 @@ impl Database {
         Ok(rows)
     }
 
+    /// Distinct first path segments (folder names) of one library's entries.
+    /// Used by the library page folder filter to offer the same split the
+    /// directory tree has, without creating one library per folder.
+    pub(crate) async fn list_library_folder_prefixes(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let folder_expression = match self.backend {
+            DatabaseBackend::Sqlite => {
+                "substr(fe.relative_path, 1, instr(fe.relative_path, '/') - 1)"
+            }
+            DatabaseBackend::Postgres => {
+                "substr(fe.relative_path, 1, position('/' in fe.relative_path) - 1)"
+            }
+        };
+        let has_separator = match self.backend {
+            DatabaseBackend::Sqlite => "instr(fe.relative_path, '/') > 1",
+            DatabaseBackend::Postgres => "position('/' in fe.relative_path) > 1",
+        };
+        let query = format!(
+            "SELECT DISTINCT {folder_expression} AS folder
+             FROM filesystem_entries fe
+             JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             JOIN media_items mi ON mi.id = ms.item_id
+             WHERE mi.library_id = ? AND mi.removed_at IS NULL AND {has_separator}
+             ORDER BY folder"
+        );
+        let rows = self
+            .query(sqlx::AssertSqlSafe(query))
+            .bind(library_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("folder").ok())
+            .collect())
+    }
+
     pub(crate) async fn list_recommended_catalog_rows(
         &self,
         user_id: &str,
