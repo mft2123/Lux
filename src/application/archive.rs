@@ -21,11 +21,19 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+mod nfo;
+
 pub(crate) const ARCHIVE_ROOT_ENV: &str = "LUX_ARCHIVE_ROOT";
 pub(crate) const ARCHIVE_TMDB_KEY_ENV: &str = "LUX_TMDB_API_KEY";
 pub(crate) const ARCHIVE_TMDB_LANGUAGE_ENV: &str = "LUX_TMDB_LANGUAGE";
 pub(crate) const DEFAULT_ARCHIVE_ROOT: &str = "/vol5/1000/docker/lux-test";
+const DEFAULT_MIRROR_ROOT: &str = "/vol5/1000/docker/lux-library";
+
+const DEFAULT_CD2_CONTAINER_MOUNT: &str = "/media/cloud";
 pub(crate) const ARCHIVE_POLL_SECONDS_ENV: &str = "LUX_ARCHIVE_POLL_SECONDS";
+pub(crate) const ARCHIVE_MIRROR_ROOT_ENV: &str = "LUX_ARCHIVE_MIRROR_ROOT";
+pub(crate) const ARCHIVE_CD2_PREFIX_ENV: &str = "LUX_ARCHIVE_CD2_PREFIX";
+pub(crate) const ARCHIVE_CD2_MOUNT_ENV: &str = "LUX_ARCHIVE_CD2_MOUNT";
 pub(crate) const ARCHIVE_WASH_ENABLED_ENV: &str = "LUX_ARCHIVE_WASH_ENABLED";
 pub(crate) const ARCHIVE_WASH_TOLERANCE_ENV: &str = "LUX_ARCHIVE_WASH_TOLERANCE";
 /// Files modified more recently than this are still being written and are left
@@ -54,6 +62,13 @@ pub(crate) struct ArchiveConfig {
     pub(crate) root: PathBuf,
     pub(crate) tmdb_api_key: Option<String>,
     pub(crate) tmdb_language: String,
+    /// Local mirror that the media server scans: strm + NFO + images only.
+    pub(crate) mirror_root: PathBuf,
+    /// Path of the archive root inside the CloudDrive2 mount (for example
+    /// `测试库`); the strm URL is built from it.
+    pub(crate) cd2_prefix: String,
+    /// Where the CD2 mount is visible inside the media server container.
+    pub(crate) cd2_container_mount: String,
     /// How long a freshly written entry waits before it is claimed.
     pub(crate) settle_seconds: u64,
     /// Replace an existing entry when the incoming pack is larger than it.
@@ -80,6 +95,21 @@ impl ArchiveConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "zh-CN".to_owned());
+        let mirror_root = std::env::var(ARCHIVE_MIRROR_ROOT_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MIRROR_ROOT));
+        let cd2_prefix = std::env::var(ARCHIVE_CD2_PREFIX_ENV)
+            .ok()
+            .map(|value| value.trim().trim_matches('/').to_string())
+            .unwrap_or_default();
+        let cd2_container_mount = std::env::var(ARCHIVE_CD2_MOUNT_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_CD2_CONTAINER_MOUNT.to_owned());
         let settle_seconds = std::env::var(ARCHIVE_SETTLE_SECONDS_ENV)
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
@@ -99,6 +129,9 @@ impl ArchiveConfig {
             root,
             tmdb_api_key,
             tmdb_language,
+            mirror_root,
+            cd2_prefix,
+            cd2_container_mount,
             settle_seconds,
             wash_enabled,
             wash_tolerance_ratio,
@@ -198,8 +231,9 @@ impl ParsedName {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum MediaKind {
+    #[default]
     Movie,
     Series,
 }
@@ -284,6 +318,20 @@ impl fmt::Debug for ArchiveService {
 }
 
 impl ArchiveService {
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(config: ArchiveConfig) -> Self {
+        Self::new(config)
+    }
+
+    /// Local mirror directory for a media path under the archive root. The
+    /// media directory level is dropped so the mirror root is itself a clean
+    /// media-server library root (`<mirror>/<board>/<year>/<title>`).
+    pub(crate) fn mirror_dir_for(&self, media_path: &Path) -> Option<PathBuf> {
+        let relative = media_path.strip_prefix(&self.config.root).ok()?;
+        let relative = relative.strip_prefix(MEDIA_DIR).unwrap_or(relative);
+        Some(self.config.mirror_root.join(relative))
+    }
+
     pub(crate) fn new(config: ArchiveConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -304,6 +352,8 @@ impl ArchiveService {
             self.config
                 .ensure_directories()
                 .map_err(|error| format!("无法创建归档目录: {error}"))?;
+            std::fs::create_dir_all(&self.config.mirror_root)
+                .map_err(|error| format!("无法创建本地镜像目录: {error}"))?;
         }
         let mut report = ArchiveReport {
             dry_run,
@@ -543,15 +593,34 @@ impl ArchiveService {
                 continue;
             }
             match move_entry(&entry, &target) {
-                Ok(()) => report.organized.push(OrganizedItem {
-                    source: name.clone(),
-                    tmdb_id: matched.tmdb_id,
-                    target: target.display().to_string(),
-                    kind: matched.category_label().to_owned(),
-                    region: region.to_owned(),
-                    year,
-                    title: matched.title.clone(),
-                }),
+                Ok(()) => {
+                    report.organized.push(OrganizedItem {
+                        source: name.clone(),
+                        tmdb_id: matched.tmdb_id,
+                        target: target.display().to_string(),
+                        kind: matched.category_label().to_owned(),
+                        region: region.to_owned(),
+                        year,
+                        title: matched.title.clone(),
+                    });
+                    // Sidecars go into the LOCAL mirror (strm + NFO + images);
+                    // the 115 pack keeps only media files. Best effort: a
+                    // metadata problem must never undo a correct move.
+                    let mut metadata_report = nfo::MetadataReport::default();
+                    if let Some(mirror) = self.mirror_dir_for(&target) {
+                        let writer = nfo::MetadataWriter::new(self, false);
+                        writer
+                            .write_entry(&target, &mirror, &parsed, &matched, &mut metadata_report)
+                            .await;
+                    }
+                    if !metadata_report.failed.is_empty() {
+                        tracing::warn!(
+                            target = %target.display(),
+                            failed = ?metadata_report.failed,
+                            "metadata sidecar generation had failures"
+                        );
+                    }
+                }
                 Err(error) => {
                     self.fail_entry(report, &entry, &format!("移动失败: {error}"))?;
                 }
@@ -875,6 +944,95 @@ impl ArchiveService {
             return Err(format!("TMDB 详情 HTTP {status}"));
         }
         Ok(body)
+    }
+
+    /// Walk the media directory and write NFO/poster sidecars for entries that
+    /// do not have them yet. Idempotent; `overwrite` regenerates existing ones.
+    pub(crate) async fn backfill_metadata(
+        &self,
+        dry_run: bool,
+        overwrite: bool,
+    ) -> Result<nfo::MetadataReport, String> {
+        let mut report = nfo::MetadataReport::default();
+        let media = self.config.media_dir();
+        for board in read_dir_entries(&media)? {
+            if !board.is_dir() {
+                continue;
+            }
+            let board_name = board
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let series_board = board_name.contains("电视剧")
+                || board_name.contains("综艺")
+                || board_name.contains("动画");
+            let movie_board = board_name.contains("电影");
+            if !series_board && !movie_board {
+                continue;
+            }
+            for year_dir in read_dir_entries(&board)? {
+                if !year_dir.is_dir() {
+                    continue;
+                }
+                for title_dir in read_dir_entries(&year_dir)? {
+                    if !title_dir.is_dir() {
+                        continue;
+                    }
+                    let Some(mirror_dir) = self.mirror_dir_for(&title_dir) else {
+                        report
+                            .failed
+                            .push(format!("{}: 无法映射镜像路径", title_dir.display()));
+                        continue;
+                    };
+                    let already_done = mirror_dir.join("tvshow.nfo").exists()
+                        || (!series_board && dir_has_nfo(&mirror_dir));
+                    if !overwrite && already_done {
+                        report.skipped.push(title_dir.display().to_string());
+                        continue;
+                    }
+                    let title_name = title_dir
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let Some(parsed) = parse_media_name(&title_name) else {
+                        report
+                            .failed
+                            .push(format!("{}: 无法从目录名解析", title_dir.display()));
+                        continue;
+                    };
+                    let matched = match self.lookup_tmdb(&parsed, series_board).await {
+                        Ok(Some(matched)) => matched,
+                        Ok(None) => {
+                            report
+                                .failed
+                                .push(format!("{}: TMDB 未找到匹配", title_dir.display()));
+                            continue;
+                        }
+                        Err(error) => {
+                            report.failed.push(format!(
+                                "{}: TMDB 查询失败: {error}",
+                                title_dir.display()
+                            ));
+                            continue;
+                        }
+                    };
+                    if dry_run {
+                        report.created.push(format!(
+                            "(dry) {} -> {} ({})",
+                            title_dir.display(),
+                            matched.title,
+                            matched.tmdb_id
+                        ));
+                        continue;
+                    }
+                    let writer = nfo::MetadataWriter::new(self, overwrite);
+                    writer
+                        .write_entry(&title_dir, &mirror_dir, &parsed, &matched, &mut report)
+                        .await;
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub(crate) fn status(&self) -> ArchiveStatus {
@@ -1255,6 +1413,18 @@ fn dir_signals_series(directory: &Path, parsed: &ParsedName) -> bool {
         }
     }
     false
+}
+
+fn dir_has_nfo(directory: &Path) -> bool {
+    let Ok(reader) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    reader.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("nfo"))
+    })
 }
 
 fn read_dir_entries(directory: &Path) -> Result<Vec<PathBuf>, String> {
