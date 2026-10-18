@@ -243,7 +243,7 @@ impl NotifyEnv {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct NotifyConfig {
     pub enabled: bool,
     pub bot_token: Option<String>,
@@ -256,6 +256,28 @@ pub(crate) struct NotifyConfig {
     pub max_per_minute: u32,
     pub dedupe_window: Duration,
     pub timezone_offset_hours: i64,
+}
+
+/// Manual `Debug` so a future `{:?}` never prints the bot token or a full chat id.
+impl std::fmt::Debug for NotifyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NotifyConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "bot_token",
+                &self.bot_token.as_deref().map(crate::application::archive::mask_secret),
+            )
+            .field("chat_id", &self.masked_chat_id())
+            .field("api_base", &self.masked_api_base())
+            .field("thread_id", &self.thread_id)
+            .field("silent", &self.silent)
+            .field("min_interval", &self.min_interval)
+            .field("max_per_minute", &self.max_per_minute)
+            .field("dedupe_window", &self.dedupe_window)
+            .field("timezone_offset_hours", &self.timezone_offset_hours)
+            .finish()
+    }
 }
 
 impl Default for NotifyConfig {
