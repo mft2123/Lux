@@ -2058,24 +2058,10 @@ impl ArchiveService {
     }
 
     /// Wash-mode support: how big is the copy we already have? Name-based and
-    /// metadata-only (no content is read): the biggest directory under
-    /// `媒体目录/` whose name looks like the requested title wins.
+    /// metadata-only (no content is read): the biggest *title* directory under
+    /// `媒体目录/` whose name matches the requested title wins.
     pub(crate) fn lookup_library_size(&self, title: &str) -> LibraryLookup {
-        let mut lookup = LibraryLookup {
-            title: title.trim().to_owned(),
-            ..LibraryLookup::default()
-        };
-        let query = normalize_title_key(&lookup.title);
-        if query.is_empty() {
-            return lookup;
-        }
-        let mut best: Option<(String, u64)> = None;
-        collect_library_entries(&self.config.media_dir(), 0, &query, &mut best);
-        if let Some((name, size)) = best {
-            lookup.matched = Some(name);
-            lookup.size_bytes = Some(size);
-        }
-        lookup
+        lookup_library_size_in(&self.config.media_dir(), title)
     }
 
     pub(crate) fn status(&self) -> ArchiveStatus {
@@ -3311,43 +3297,132 @@ fn normalize_title_key(value: &str) -> String {
         .collect()
 }
 
-/// Heuristic title match between a requested title and a library directory
-/// name. Exact containment wins; otherwise a long enough common prefix counts,
-/// because a Telegram title usually carries extra tags (`4K`, `HDR`, …) that
-/// the library directory does not.
-fn library_title_matches(query: &str, entry: &str) -> bool {
-    if query.is_empty() || entry.is_empty() {
-        return false;
-    }
-    if entry.contains(query) || query.contains(entry) {
-        return true;
-    }
-    let common = query
-        .chars()
-        .zip(entry.chars())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let shorter = query.chars().count().min(entry.chars().count());
-    shorter >= 4 && common * 5 >= shorter * 3
+/// Deepest level walked by the library lookup. A title is a child of a year
+/// directory (depth 3 in the normal chain, depth 2 for 晚会), so nothing deeper
+/// than the title directory is ever read.
+const LIBRARY_LOOKUP_MAX_DEPTH: usize = 3;
+
+/// A title query for the library lookup: the parsed title key plus the year the
+/// query carries (when it has one).
+struct LibraryQuery {
+    key: String,
+    year: Option<i64>,
 }
 
-/// Walk `媒体目录/` (four levels: type / region / year / title, and the shorter
-/// 晚会 chain) collecting the biggest directory whose name matches `query`.
+impl LibraryQuery {
+    fn new(title: &str) -> Option<Self> {
+        let (key, year) = title_match_key(title);
+        (!key.is_empty()).then_some(Self { key, year })
+    }
+}
+
+/// Match key of one title: parse the release name, keep the title without the
+/// year / season / episode / quality tags, and keep the year separately.
+fn title_match_key(value: &str) -> (String, Option<i64>) {
+    match parse_media_name(value) {
+        Some(parsed) => (normalize_title_key(&parsed.title), parsed.year),
+        None => (normalize_title_key(value), None),
+    }
+}
+
+/// `2024` / `未知年份` are the year level of the library tree, never a title.
+fn is_library_year_segment(name: &str) -> bool {
+    let name = name.trim();
+    (name.chars().count() == 4 && name.chars().all(|character| character.is_ascii_digit()))
+        || name == "未知年份"
+}
+
+/// Does the library title `entry_name` denote the same work as `query`?
+///
+/// Deliberately conservative, because a wrong size makes the wash mode treat a
+/// real upgrade as a duplicate:
+///
+/// - only the title layer is compared (the caller guarantees it), never the
+///   board / region / year directory names;
+/// - a year on both sides must agree (`某剧 2019` never matches `某剧 (2024)`);
+/// - titles of three characters or less must match exactly (`繁花` is not
+///   `繁花似锦`);
+/// - a longer title may only extend the shorter one with release tags, never
+///   with a sequel number (`流浪地球` is not `流浪地球2`).
+fn library_title_matches(query: &LibraryQuery, entry_name: &str) -> bool {
+    let (entry_key, entry_year) = title_match_key(entry_name);
+    if query.key.is_empty() || entry_key.is_empty() {
+        return false;
+    }
+    if let (Some(query_year), Some(entry_year)) = (query.year, entry_year) {
+        if query_year != entry_year {
+            return false;
+        }
+    }
+    if query.key == entry_key {
+        return true;
+    }
+    let shorter = query.key.chars().count().min(entry_key.chars().count());
+    if shorter <= 3 {
+        return false;
+    }
+    let (longer, short) = if entry_key.chars().count() > query.key.chars().count() {
+        (entry_key.as_str(), query.key.as_str())
+    } else {
+        (query.key.as_str(), entry_key.as_str())
+    };
+    let Some(remainder) = longer.strip_prefix(short) else {
+        return false;
+    };
+    // A bare number after the title is a sequel marker, not a release tag.
+    !remainder
+        .chars()
+        .all(|character| character.is_ascii_digit())
+}
+
+/// One library lookup against `media_dir` (see `ArchiveService::lookup_library_size`).
+fn lookup_library_size_in(media_dir: &Path, title: &str) -> LibraryLookup {
+    let mut lookup = LibraryLookup {
+        title: title.trim().to_owned(),
+        ..LibraryLookup::default()
+    };
+    let Some(query) = LibraryQuery::new(&lookup.title) else {
+        return lookup;
+    };
+    let mut best: Option<(String, u64)> = None;
+    collect_library_entries(media_dir, 0, &query, &mut best);
+    if let Some((name, size)) = best {
+        lookup.matched = Some(name);
+        lookup.size_bytes = Some(size);
+    }
+    lookup
+}
+
+/// Walk `媒体目录/` (type / region / year / title, and the shorter 晚会 chain)
+/// collecting the biggest **title** directory that matches `query`.
+///
+/// A title is only ever a child of a year directory, so the year / region /
+/// board names are never matched: a query like `2024` used to return the whole
+/// year. Symlinks are inspected with `symlink_metadata` and never followed, so
+/// a self-referential link cannot recurse and cannot smuggle in a size.
 fn collect_library_entries(
     directory: &Path,
     depth: usize,
-    query: &str,
+    query: &LibraryQuery,
     best: &mut Option<(String, u64)>,
 ) {
-    if depth > 4 {
+    if depth > LIBRARY_LOOKUP_MAX_DEPTH {
         return;
     }
+    let parent_is_year = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_library_year_segment);
     let Ok(reader) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in reader.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // `is_dir` on the symlink metadata is false for a link itself.
+        if !metadata.file_type().is_dir() {
             continue;
         }
         let Some(name) = path
@@ -3356,7 +3431,7 @@ fn collect_library_entries(
         else {
             continue;
         };
-        if library_title_matches(query, &normalize_title_key(&name)) {
+        if parent_is_year && library_title_matches(query, &name) {
             let size = path_size(&path);
             if best.as_ref().is_none_or(|(_, current)| size > *current) {
                 *best = Some((name.clone(), size));
@@ -4081,6 +4156,115 @@ mod tests {
         );
         assert_eq!(mode_of(&done), 0o600, "已处理/ keeps the mode");
         assert_eq!(mode_of(&service.config.link_state_file()), 0o600, "状态.jsonl");
+    }
+
+    /// The part number belongs to the title: asking for part two must not return
+    /// the size of part one.
+    #[test]
+    fn lookup_does_not_confuse_a_sequel_with_its_predecessor() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电影")
+            .join("国内")
+            .join("2019")
+            .join("流浪地球 (2019)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("movie.mkv"), vec![0u8; 2048]).unwrap();
+
+        assert_eq!(
+            service.lookup_library_size("流浪地球2 4K").size_bytes,
+            None,
+            "流浪地球2 must not match 流浪地球"
+        );
+        let found = service.lookup_library_size("流浪地球 4K HDR");
+        assert_eq!(found.matched.as_deref(), Some("流浪地球 (2019)"));
+        assert_eq!(found.size_bytes, Some(2048));
+    }
+
+    /// A year in the query must agree with the year in the library name; a
+    /// query without a year still matches (Telegram titles rarely carry one).
+    #[test]
+    fn lookup_requires_the_year_to_agree() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("某剧 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+
+        assert_eq!(
+            service.lookup_library_size("某剧 2019 4K").size_bytes,
+            None,
+            "2019 is not the 2024 copy"
+        );
+        assert_eq!(
+            service
+                .lookup_library_size("某剧 2024 4K")
+                .matched
+                .as_deref(),
+            Some("某剧 (2024)")
+        );
+        assert_eq!(
+            service.lookup_library_size("某剧 4K").matched.as_deref(),
+            Some("某剧 (2024)")
+        );
+    }
+
+    /// A two- or three-character title is too short for a prefix heuristic:
+    /// `繁花` must not match `繁花似锦`.
+    #[test]
+    fn lookup_requires_exact_match_for_short_titles() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2023")
+            .join("繁花似锦 (2023)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 512]).unwrap();
+
+        assert_eq!(
+            service.lookup_library_size("繁花").size_bytes,
+            None,
+            "繁花 is not 繁花似锦"
+        );
+        assert_eq!(
+            service.lookup_library_size("繁花似锦").size_bytes,
+            Some(512)
+        );
+    }
+
+    /// Only the title layer is matched: a year directory can never answer a
+    /// lookup, otherwise a query like `2024` returns a whole year of files.
+    #[test]
+    fn lookup_never_matches_a_year_directory() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let year_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024");
+        let title_dir = year_dir.join("某剧 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+        std::fs::write(year_dir.join("loose.mkv"), vec![0u8; 4096]).unwrap();
+
+        assert_eq!(service.lookup_library_size("2024").size_bytes, None);
+        assert_eq!(service.lookup_library_size("国内").size_bytes, None);
+        assert_eq!(service.lookup_library_size("电视剧").size_bytes, None);
     }
 
     #[test]
