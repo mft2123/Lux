@@ -1697,7 +1697,7 @@ impl ArchiveService {
         })?;
         if let Some(existing) = self.find_existing_link_job(&job.url) {
             tracing::info!(
-                url = %job.url,
+                url = %mask_link_for_log(&job.url),
                 job_id = %existing.job_id,
                 file = %existing.file,
                 "link job already queued or already consumed; not queued again"
@@ -1726,7 +1726,7 @@ impl ArchiveService {
         })?;
         tracing::info!(
             job_id = %job.job_id,
-            url = %job.url,
+            url = %mask_link_for_log(&job.url),
             title = job.title.as_deref().unwrap_or(""),
             mode = job.mode.as_deref().unwrap_or(""),
             file = %target.display(),
@@ -2006,7 +2006,7 @@ impl ArchiveService {
             }
             tracing::warn!(
                 job_id = %job.job_id,
-                url = %job.url,
+                url = %mask_link_for_log(&job.url),
                 title = job.title.as_deref().unwrap_or(""),
                 mode = job.mode.as_deref().unwrap_or(""),
                 "link job needs the 115 transfer client (not implemented): recorded, nothing downloaded"
@@ -3115,6 +3115,48 @@ pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
     Ok(url.to_owned())
 }
 
+/// Log-safe rendering of a share link: only `scheme://host`, and for a magnet
+/// only `magnet:?xt=urn:btih:<前8位>…`.
+///
+/// A share link may carry `?password=`, a per-recipient token or the full file
+/// name, so the raw URL must never reach a log line (review D7).
+pub(crate) fn mask_link_for_log(raw: &str) -> String {
+    let url = raw.trim();
+    if url.is_empty() {
+        return String::new();
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("magnet:") {
+        // The infohash identifies the torrent; eight characters are enough to
+        // correlate two log lines and useless to anyone else.
+        let hash = lower
+            .find("urn:btih:")
+            .map(|index| &url[index + "urn:btih:".len()..])
+            .unwrap_or_default();
+        let head: String = hash.chars().take(8).collect();
+        if head.is_empty() {
+            return "magnet:?xt=…".to_owned();
+        }
+        return format!("magnet:?xt=urn:btih:{head}…");
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "…".to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // `ed2k://|file|name|size|hash|/` has no host and the "authority" is the
+    // file name plus the hash: keep the scheme only.
+    if authority.contains('|') {
+        return format!("{scheme}://…");
+    }
+    // Drop `user:password@` if a producer ever sends credentials.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return format!("{scheme}://…");
+    }
+    format!("{scheme}://{host}")
+}
+
 /// Human-readable, file-name-safe job slug: alphanumerics and CJK kept,
 /// everything else collapsed to `-`, capped at 40 characters.
 fn link_slug(title: Option<&str>, url: &str) -> String {
@@ -3708,6 +3750,37 @@ mod tests {
         assert!(validate_link_url("https://115.com/s/a b").is_err());
         let long = format!("https://115.com/s/{}", "a".repeat(3000));
         assert!(validate_link_url(&long).is_err());
+    }
+
+    /// Logs must never contain the share link: only scheme + host survives, and
+    /// a magnet keeps the first eight characters of its infohash.
+    #[test]
+    fn masks_share_links_in_logs() {
+        assert_eq!(
+            mask_link_for_log("https://115.com/s/abc123?password=9999&uid=1"),
+            "https://115.com"
+        );
+        assert_eq!(
+            mask_link_for_log("  HTTP://115.com:8080/x/y  "),
+            "HTTP://115.com:8080"
+        );
+        assert_eq!(
+            mask_link_for_log("https://user:pass@115.com/s/abc?password=1"),
+            "https://115.com"
+        );
+        assert_eq!(
+            mask_link_for_log("magnet:?xt=urn:btih:abcdef0123456789&dn=secret.mkv"),
+            "magnet:?xt=urn:btih:abcdef01…"
+        );
+        assert_eq!(
+            mask_link_for_log("ed2k://|file|private.mkv|1|HASH|/"),
+            "ed2k://…"
+        );
+        assert_eq!(mask_link_for_log("https://"), "https://…");
+        assert_eq!(mask_link_for_log(""), "");
+        let masked = mask_link_for_log("https://115.com/s/abc?password=9999");
+        assert!(!masked.contains("password"));
+        assert!(!masked.contains("115.com/s/abc"));
     }
 
     #[test]
