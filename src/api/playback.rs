@@ -1794,10 +1794,6 @@ pub(super) fn playback_resumed(previous: Option<&StoredPlaybackSession>, state_n
     state_name == "PLAYING" && previous.is_some_and(|session| session.state == "PAUSED")
 }
 
-fn event_type_is_stopped(event_type: WebhookEventType) -> bool {
-    event_type == WebhookEventType::PlaybackStopped
-}
-
 #[derive(Clone, Debug, Default)]
 struct PlaybackNotificationContext {
     item_title: Option<String>,

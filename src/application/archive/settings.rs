@@ -396,8 +396,10 @@ impl ArchiveSettings {
         Ok(())
     }
 
-    /// Reject values that would make the pipeline misbehave, before they reach
-    /// the file: the API reports the problem instead of clamping silently.
+    /// Reject values that would make the pipeline misbehave. Runtime code
+    /// validates the fields an update actually sets (see `validate_changed`);
+    /// this full-document check is used by the tests.
+    #[cfg(test)]
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !self.wash_tolerance_ratio.is_finite()
             || !(0.0..=1.0).contains(&self.wash_tolerance_ratio)
