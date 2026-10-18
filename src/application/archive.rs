@@ -15,8 +15,8 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -2079,6 +2079,37 @@ impl ArchiveService {
         lookup_library_size_in(&self.config.media_dir(), title)
     }
 
+    /// Blocking-pool variant of [`Self::lookup_library_size`] for async callers.
+    ///
+    /// The scan walks the media tree, so it must not run on a tokio worker: on
+    /// a library of 180k entries that would park one worker per concurrent
+    /// lookup.
+    ///
+    /// TODO(I6): `src/api/admin/admin_jobs.rs` (owned by the settings change)
+    /// still calls the synchronous variant; switching
+    /// `Json(service.lookup_library_size(title))` to
+    /// `Json(service.lookup_library_size_isolated(title).await)` completes the
+    /// isolation. The tree walk itself is already bounded (title layer only,
+    /// depth cap, `symlink_metadata`) and cached, so the synchronous path stays
+    /// cheap until then.
+    #[allow(dead_code)] // wired by the admin_jobs.rs change that owns that file
+    pub(crate) async fn lookup_library_size_isolated(&self, title: &str) -> LibraryLookup {
+        let media_dir = self.config.media_dir();
+        let requested = title.trim().to_owned();
+        let uncached = requested.clone();
+        match tokio::task::spawn_blocking(move || lookup_library_size_in(&media_dir, &requested)).await
+        {
+            Ok(lookup) => lookup,
+            Err(error) => {
+                tracing::warn!(%error, title = %uncached, "library lookup task failed");
+                LibraryLookup {
+                    title: uncached,
+                    ..LibraryLookup::default()
+                }
+            }
+        }
+    }
+
     pub(crate) fn status(&self) -> ArchiveStatus {
         ArchiveStatus {
             root: self.config.root.display().to_string(),
@@ -2543,12 +2574,32 @@ fn organized_item(
     }
 }
 
+/// Deepest level the wash-size sum follows. A library title is at most
+/// `<board>/<region>/<year>/<title>/Season NN/`, so twelve levels are generous;
+/// the cap only exists so a pathological tree cannot stall a run.
+const PATH_SIZE_MAX_DEPTH: usize = 12;
+
 /// Total size of a file or directory tree (metadata only, no data read).
+///
+/// Symlinks are never followed (`symlink_metadata`): a link pointing back into
+/// the tree would otherwise make the walk unbounded, and a link must not
+/// contribute a size the archive does not own.
 fn path_size(path: &Path) -> u64 {
-    let Ok(metadata) = std::fs::metadata(path) else {
+    path_size_at(path, 0)
+}
+
+fn path_size_at(path: &Path, depth: usize) -> u64 {
+    if depth > PATH_SIZE_MAX_DEPTH {
+        return 0;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return 0;
     };
-    if !metadata.is_dir() {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return 0;
+    }
+    if !file_type.is_dir() {
         return metadata.len();
     }
     let Ok(reader) = std::fs::read_dir(path) else {
@@ -2556,7 +2607,7 @@ fn path_size(path: &Path) -> u64 {
     };
     reader
         .flatten()
-        .map(|entry| path_size(&entry.path()))
+        .map(|entry| path_size_at(&entry.path(), depth + 1))
         .sum()
 }
 
@@ -3406,6 +3457,49 @@ fn library_title_matches(query: &LibraryQuery, entry_name: &str) -> bool {
         .all(|character| character.is_ascii_digit())
 }
 
+/// How long one lookup answer is reused. The sidecar asks once per link and the
+/// tree only changes when an archive run finishes, so a minute is cheap and
+/// safe; the lookup stays correct, just a minute stale at worst.
+const LIBRARY_LOOKUP_CACHE_SECONDS: u64 = 60;
+/// A hand-edited library plus scripts can ask for many titles; cap the cache so
+/// it cannot grow forever.
+const LIBRARY_LOOKUP_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Cached answers keyed by `<media dir>\0<title key>\0<year>`. The cached value
+/// is only the match and the size: `LibraryLookup` also carries the caller's
+/// title, which differs between equivalent queries.
+static LIBRARY_LOOKUP_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<String>, Option<u64>)>>> =
+    OnceLock::new();
+
+type LibraryLookupCache = Mutex<HashMap<String, (Instant, Option<String>, Option<u64>)>>;
+
+fn library_lookup_cache() -> &'static LibraryLookupCache {
+    LIBRARY_LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_library_lookup(key: &str) -> Option<(Option<String>, Option<u64>)> {
+    let cache = library_lookup_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .get(key)
+        .filter(|(stored, _, _)| stored.elapsed() < Duration::from_secs(LIBRARY_LOOKUP_CACHE_SECONDS))
+        .map(|(_, matched, size)| (matched.clone(), *size))
+}
+
+fn store_library_lookup(key: String, lookup: &LibraryLookup) {
+    let mut cache = library_lookup_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= LIBRARY_LOOKUP_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        (Instant::now(), lookup.matched.clone(), lookup.size_bytes),
+    );
+}
+
 /// One library lookup against `media_dir` (see `ArchiveService::lookup_library_size`).
 fn lookup_library_size_in(media_dir: &Path, title: &str) -> LibraryLookup {
     let mut lookup = LibraryLookup {
@@ -3415,12 +3509,24 @@ fn lookup_library_size_in(media_dir: &Path, title: &str) -> LibraryLookup {
     let Some(query) = LibraryQuery::new(&lookup.title) else {
         return lookup;
     };
+    let cache_key = format!(
+        "{}\u{0}{}\u{0}{:?}",
+        media_dir.display(),
+        query.key,
+        query.year
+    );
+    if let Some((matched, size)) = cached_library_lookup(&cache_key) {
+        lookup.matched = matched;
+        lookup.size_bytes = size;
+        return lookup;
+    }
     let mut best: Option<(String, u64)> = None;
     collect_library_entries(media_dir, 0, &query, &mut best);
     if let Some((name, size)) = best {
         lookup.matched = Some(name);
         lookup.size_bytes = Some(size);
     }
+    store_library_lookup(cache_key, &lookup);
     lookup
 }
 
@@ -4347,6 +4453,105 @@ mod tests {
         assert_eq!(service.lookup_library_size("2024").size_bytes, None);
         assert_eq!(service.lookup_library_size("国内").size_bytes, None);
         assert_eq!(service.lookup_library_size("电视剧").size_bytes, None);
+    }
+
+    /// The walk is cached for `LIBRARY_LOOKUP_CACHE_SECONDS`: a second ask for
+    /// the same title inside the TTL does not rescan the tree.
+    #[test]
+    fn lookup_results_are_cached_briefly() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("缓存测试剧 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 700]).unwrap();
+
+        assert_eq!(service.lookup_library_size("缓存测试剧").size_bytes, Some(700));
+        // The library grows after the first answer; the cached one is reused.
+        std::fs::write(title_dir.join("S01E02.mkv"), vec![0u8; 700]).unwrap();
+        assert_eq!(
+            service.lookup_library_size("缓存测试剧").size_bytes,
+            Some(700),
+            "the second answer comes from the cache"
+        );
+        // A query with another key is not answered from that entry.
+        assert_eq!(service.lookup_library_size("另一个剧").size_bytes, None);
+    }
+
+    /// Symlinks are never followed: not for matching a title and not for the
+    /// size walk (a self-referential link used to recurse forever).
+    #[cfg(unix)]
+    #[test]
+    fn lookup_ignores_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let media = tmp.path().join(MEDIA_DIR);
+        let real = media
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("真实剧 (2024)");
+        std::fs::create_dir_all(&real).expect("title dir");
+        std::fs::write(real.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+        // A link inside the title points back at the title itself.
+        symlink(&real, real.join("loop")).expect("self link");
+
+        assert_eq!(
+            service.lookup_library_size("真实剧").size_bytes,
+            Some(1024),
+            "the self link is skipped, not followed"
+        );
+
+        // A symlinked title is not a library entry, even with a perfect name.
+        let linked = media.join("电视剧").join("国内").join("2025");
+        std::fs::create_dir_all(&linked).expect("year dir");
+        symlink(&real, linked.join("链接剧 (2025)")).expect("title link");
+        assert_eq!(service.lookup_library_size("链接剧").size_bytes, None);
+    }
+
+    /// Manual scale check:
+    /// `cargo test --locked --lib archive lookup_stays_fast -- --ignored --nocapture`.
+    /// A lookup only descends to the title layer, and the second answer is
+    /// served from the cache.
+    #[test]
+    #[ignore = "manual benchmark: run with --ignored --nocapture"]
+    fn lookup_stays_fast_on_a_large_library() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let media = tmp.path().join(MEDIA_DIR);
+        let mut entry_count = 0usize;
+        for board in ["电影", "电视剧", "动画", "综艺"] {
+            for region in ["国内", "国外"] {
+                for year in 2000..2025 {
+                    let year_dir = media.join(board).join(region).join(year.to_string());
+                    for index in 0..180 {
+                        let dir = year_dir.join(format!("剧{index:03} ({year})"));
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("S01E01.mkv"), vec![0u8; 8]).unwrap();
+                        entry_count += 2;
+                    }
+                }
+            }
+        }
+
+        let started = Instant::now();
+        let lookup = service.lookup_library_size("剧042 4K");
+        let uncached = started.elapsed();
+        let started = Instant::now();
+        let cached = service.lookup_library_size("剧042 4K");
+        let cached_time = started.elapsed();
+        eprintln!(
+            "library lookup over {entry_count} entries: first {uncached:?}, cached {cached_time:?}"
+        );
+        assert_eq!(lookup.matched, cached.matched);
+        assert!(lookup.size_bytes.is_some());
     }
 
     #[test]
