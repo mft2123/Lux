@@ -1280,9 +1280,30 @@ pub(crate) fn strm_probe_error(headers: &HeaderMap, error: StrmProbeError) -> Re
 }
 
 
+/// Query-flag deserializer: `true|false` as usual, but `1|0` (and `yes|no`)
+/// work too, so scripts that follow the docs do not hit a 400.
+fn boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(flag)) => Some(flag),
+        Some(serde_json::Value::Number(number)) => number.as_i64().map(|value| value != 0),
+        Some(serde_json::Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        Some(_) => None,
+    })
+}
+
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct ArchiveRunQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "boolish")]
     dry_run: Option<bool>,
 }
 
@@ -1396,9 +1417,9 @@ pub(crate) async fn admin_archive_run(
 
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct ArchiveMetadataQuery {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "boolish")]
     dry_run: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "boolish")]
     overwrite: Option<bool>,
 }
 
