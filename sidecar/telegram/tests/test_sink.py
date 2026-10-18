@@ -179,8 +179,38 @@ class HttpSinkTest(unittest.TestCase):
             raise urllib.error.URLError("refused")
 
         with patch.object(urllib.request, "urlopen", boom):
-            with self.assertRaises(sink_mod.SinkError):
+            with self.assertRaises(sink_mod.SinkError) as ctx:
                 asyncio.run(sink.send(sample_item()))
+        # 网络错误可重试
+        self.assertFalse(ctx.exception.permanent)
+
+    def test_400_and_403_are_permanent(self):
+        """review SC4：Lux 的 400/403 重试无意义，必须标成永久失败。"""
+        for code in (400, 403):
+            sink = sink_mod.HttpSink(url="http://lux:8097/ingest", api_key="k")
+
+            def boom(*args, _code=code, **kwargs):
+                raise urllib.error.HTTPError(
+                    "http://lux:8097/ingest", _code, "denied", {}, io.BytesIO(b'{"error":"x"}')
+                )
+
+            with patch.object(urllib.request, "urlopen", boom):
+                with self.assertRaises(sink_mod.SinkError) as ctx:
+                    asyncio.run(sink.send(sample_item()))
+            self.assertTrue(ctx.exception.permanent, f"{code} 应当是永久失败")
+            self.assertIn(str(code), str(ctx.exception))
+            self.assertIn("永久", str(ctx.exception))
+
+    def test_5xx_is_retryable(self):
+        sink = sink_mod.HttpSink(url="http://lux:8097/ingest", api_key="k")
+
+        def boom(*args, **kwargs):
+            raise urllib.error.HTTPError("http://lux:8097/ingest", 503, "down", {}, io.BytesIO(b""))
+
+        with patch.object(urllib.request, "urlopen", boom):
+            with self.assertRaises(sink_mod.SinkError) as ctx:
+                asyncio.run(sink.send(sample_item()))
+        self.assertFalse(ctx.exception.permanent)
 
     def test_success_posts_url_title_mode_with_api_key_header(self):
         captured = {}

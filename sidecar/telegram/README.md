@@ -137,6 +137,27 @@ Lux 校验后返回 202 `{ok, jobId, file, status, duplicate, note}`，并把任
 `{"title","matched","size_bytes"}`。`size_bytes=null` 表示库中无同名版本（按新增投递）；
 请求失败则条目 `held`。
 
+### 死信与重试
+
+投递失败的条目按错误性质分流（`tgwatch/runner.py`）：
+
+| 上游返回 | 处理 |
+| --- | --- |
+| 400（链接被 Lux 判非法）、403（管理员接口无权限） | **永久失败**：只尝试一次，立刻置 `dead`，不再自动重试 |
+| 401（API key 无效） | 可重试：等运维修 `telegram.api_key` 后下一轮继续 |
+| 5xx / 网络错误 / 磁盘错误 | 可重试：最多 `20` 次，重试间隔从 `LUX_TG_RETRY_SECONDS` 起指数退避（封顶 1 小时） |
+| 试满 20 次 | 置 `dead`，原因写成 `max_attempts(20): …` |
+
+死信不参与自动重试，`main.py status` 能看到计数与原因：
+
+```bash
+docker exec -u 10001 lux-telegram python main.py status
+# 状态库: {"messages":…,"by_status":{…,"dead":2},"dead":2,"dead_reasons":{"Lux 永久拒绝（400，不再重试）…":2}}
+# 死信: 2 条（原因 {…}；`main.py replay --id <id>` 可人工再试）
+
+docker exec -u 10001 lux-telegram python main.py replay --id 42   # 看清原因后人工放行一条死信
+```
+
 ### inbox（可选，诊断用）
 
 `LUX_TG_SINK=inbox` 时写 `/watch-inbox/<ts>-<slug>.txt`，首行链接、其余 `#` 注释、`0644`。

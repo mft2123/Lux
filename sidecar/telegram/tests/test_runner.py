@@ -5,6 +5,8 @@ import os
 import sqlite3
 import stat
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -235,6 +237,123 @@ class ProcessTest(unittest.TestCase):
         flaky.fail = False
         asyncio.run(watcher.retry_once())
         self.assertEqual(store.stats()["by_status"].get(store_mod.STATUS_DELIVERED), 1)
+
+
+class DeadLetterTest(unittest.TestCase):
+    """review SC4：400/403 只尝试一次就落死信；其余错误重试到上限后落死信。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+        self.config = make_config(self.tmp)
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def build(self, sink):
+        store = store_mod.Store(self.config.state_db)
+        self.addCleanup(store.close)
+        return runner.Watcher(self.config, store, sink, FakeLookup()), store
+
+    def _deliver_with_http_status(self, code):
+        """用真的 HttpSink + 假的 urlopen 造 400/403：验证「不再重试」的整条链路。"""
+
+        def boom(*args, **kwargs):
+            raise urllib.error.HTTPError(
+                "http://lux:8097/api/v1/admin/archive/ingest",
+                code,
+                "denied",
+                {},
+                io.BytesIO('{"error":"no"}'.encode("utf-8")),
+            )
+
+        watcher, store = self.build(
+            sink_mod.HttpSink(url="http://lux:8097/api/v1/admin/archive/ingest", api_key="k")
+        )
+        with patch.object(urllib.request, "urlopen", boom):
+            asyncio.run(watcher.process(message(entities=HIDDEN), self.config.channels[0]))
+            dead = store.items_by_status((store_mod.STATUS_DEAD,))
+            self.assertEqual(len(dead), 1, "400/403 应当直接落死信")
+            self.assertEqual(dead[0]["attempts"], 1, "永久失败只允许尝试一次")
+            self.assertIn("永久", dead[0]["reason"])
+            self.assertIn(str(code), dead[0]["reason"])
+            self.assertEqual(store.items_by_status((store_mod.STATUS_FAILED,)), [])
+            # 死信不参与自动重试
+            self.assertEqual(asyncio.run(watcher.retry_once()), (0, 0))
+            self.assertEqual(watcher.counts["dead"], 1)
+        stats = store.stats()
+        self.assertEqual(stats["dead"], 1)
+        self.assertTrue(any("永久" in reason for reason in stats["dead_reasons"]))
+
+    def test_400_is_dead_after_one_attempt(self):
+        self._deliver_with_http_status(400)
+
+    def test_403_is_dead_after_one_attempt(self):
+        self._deliver_with_http_status(403)
+
+    def test_retryable_error_dies_after_max_attempts(self):
+        flaky = FakeSink()
+        flaky.fail = True
+        watcher, store = self.build(flaky)
+        asyncio.run(watcher.process(message(entities=HIDDEN), self.config.channels[0]))
+        self.assertEqual(store.items_by_status((store_mod.STATUS_FAILED,))[0]["attempts"], 1)
+
+        for _ in range(runner.MAX_DELIVERY_ATTEMPTS - 1):
+            asyncio.run(watcher.retry_once())
+
+        dead = store.items_by_status((store_mod.STATUS_DEAD,))
+        self.assertEqual(len(dead), 1)
+        self.assertEqual(dead[0]["attempts"], runner.MAX_DELIVERY_ATTEMPTS)
+        self.assertIn("max_attempts", dead[0]["reason"])
+        # 死信计数与原因能在 status/stats 里查到
+        stats = store.stats()
+        self.assertEqual(stats["dead"], 1)
+        self.assertTrue(any("max_attempts" in reason for reason in stats["dead_reasons"]))
+        # 到上限后不再被 retry_once 捞起来
+        self.assertEqual(asyncio.run(watcher.retry_once()), (0, 0))
+
+    def test_backoff_grows_and_caps(self):
+        self.assertEqual(runner.backoff_seconds(300, 0), 300)
+        self.assertEqual(runner.backoff_seconds(300, 1), 600)
+        self.assertEqual(runner.backoff_seconds(300, 2), 1200)
+        self.assertEqual(runner.backoff_seconds(300, 99), runner.MAX_BACKOFF_SECONDS)
+        self.assertEqual(runner.backoff_seconds(0, 1), 2)
+
+    def test_retry_loop_uses_exponential_backoff(self):
+        watcher, _ = self.build(FakeSink())
+        delays = []
+
+        async def fake_wait(seconds):
+            delays.append(seconds)
+            return len(delays) >= 3  # 第三次「等到 stop」，结束循环
+
+        async def always_fail(limit=50):
+            return 1, 1
+
+        watcher._wait = fake_wait
+        watcher.retry_once = always_fail
+        asyncio.run(watcher.retry_loop())
+        base = watcher.retry_interval()
+        self.assertEqual(delays, [base, base * 2, base * 4])
+
+    def test_retry_loop_resets_after_a_clean_round(self):
+        watcher, _ = self.build(FakeSink())
+        delays = []
+
+        async def fake_wait(seconds):
+            delays.append(seconds)
+            return len(delays) >= 3
+
+        rounds = [(1, 0), (1, 1), (1, 1)]
+
+        async def flaky(limit=50):
+            return rounds.pop(0)
+
+        watcher._wait = fake_wait
+        watcher.retry_once = flaky
+        asyncio.run(watcher.retry_loop())
+        base = watcher.retry_interval()
+        # 第一轮全成功 → 回到 base；之后连续失败 → 翻倍
+        self.assertEqual(delays, [base, base, base * 2])
 
 
 class BackfillTest(unittest.TestCase):

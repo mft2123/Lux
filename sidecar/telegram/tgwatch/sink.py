@@ -30,7 +30,15 @@ log = logging.getLogger("tgwatch.sink")
 
 
 class SinkError(RuntimeError):
-    """投递失败；runner 会把条目置 failed 并进重试队列。"""
+    """投递失败。
+
+    `permanent=True` 表示重试也不会成功（Lux 400 链接非法 / 403 无权限），
+    runner 直接把它落死信（review SC4）；其余错误进重试队列。
+    """
+
+    def __init__(self, message: str, *, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
 
 
 def payload(item: dict) -> dict:
@@ -92,8 +100,11 @@ class HttpSink:
                 error.close()
             if error.code == 401:
                 raise SinkError("Lux 拒绝：X-Lux-Api-Key 无效（检查 telegram.api_key）") from error
-            if error.code == 400:
-                raise SinkError(f"Lux 认为链接不合法（400）：{detail[:200]}") from error
+            if error.code in (400, 403):
+                # 400 链接被判非法、403 管理员接口无权限：重试多少次结果都一样（review SC4）
+                raise SinkError(
+                    f"Lux 永久拒绝（{error.code}，不再重试）：{detail[:200]}", permanent=True
+                ) from error
             raise SinkError(f"HTTP {error.code}: {detail[:200]}") from error
         except urllib.error.URLError as error:
             raise SinkError(f"连接 Lux 失败: {error.reason}") from error
