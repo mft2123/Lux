@@ -43,7 +43,9 @@ ALL_KINDS = (
     KIND_OTHER,
 )
 
-# 默认只放行真正的资源链接：频道自己互相引用的 t.me 链接默认丢弃
+# 默认只放行真正的资源链接（网盘/磁力）：
+# - 频道自己引用的 t.me 链接默认丢弃（KIND_TELEGRAM 不在默认集合里）；
+# - 新闻/网页等 `other` 也默认丢弃，要收必须显式 `LUX_TG_ALLOW_OTHER=1`（review SC5）。
 DEFAULT_ALLOWED_KINDS = (
     KIND_115,
     KIND_MAGNET,
@@ -51,7 +53,6 @@ DEFAULT_ALLOWED_KINDS = (
     KIND_ALIYUN,
     KIND_QUARK,
     KIND_BAIDU,
-    KIND_OTHER,
 )
 
 _HOST_KINDS = (

@@ -46,6 +46,21 @@ sidecar/telegram/
 逐频道覆盖：`listen_channels` 的字符串沿用全局 `listen_mode`，对象可写
 `{"channel": "@b", "mode": "追更", "follow_list": ["某剧", "/S0[12]E/"]}`。
 
+## 收哪些链接
+
+`kind` 由 `links.classify()` 按域名判定：`115` / `aliyun` / `quark` / `baidu` / `magnet` /
+`ed2k` / `telegram` / `other`。
+
+- 默认只收**已知网盘与磁力**：`115,magnet,ed2k,aliyun,quark,baidu`；
+- `telegram`（`t.me` / `telegram.me` / `telegram.dog` 的频道互引）默认丢弃，这是既有行为；
+- `other`（任意 http 网页、新闻链接）默认**丢弃**；要收必须显式 `LUX_TG_ALLOW_OTHER=1`
+  （之后 payload 里的 `kind=other` 让 Lux 侧可过滤统计）；
+- 自定义白名单用 `LUX_TG_ALLOWED_KINDS=115,quark`；在白名单里直接写 `other` 等价于打开
+  `LUX_TG_ALLOW_OTHER`，不需要再给开关。
+
+被丢弃的消息照常入库，`status=skipped`、`reason=no_allowed_link`（提取到链接但类型不收）
+或 `no_link`（正文里没有链接），`main.py status` 的 `by_status` 里能看到。
+
 ## 配置
 
 读 Lux 的设置文件（**只读**），默认 `/config/archive-settings.json`：
@@ -76,7 +91,8 @@ sidecar/telegram/
 | `TG_2FA_PASSWORD` | 空 | 二步验证密码，一次性 |
 | `LUX_TG_API_KEY` | 取设置文件 `telegram.api_key` | Lux 管理 API key |
 | `LUX_TG_MODE` / `LUX_TG_CHANNELS` / `LUX_TG_FOLLOW` | 取设置文件 | 模式与频道 |
-| `LUX_TG_ALLOWED_KINDS` | `115,magnet,ed2k,aliyun,quark,baidu,other` | 只投递这些类型 |
+| `LUX_TG_ALLOWED_KINDS` | `115,magnet,ed2k,aliyun,quark,baidu` | 只投递这些类型（`telegram`/`other` 不在默认里） |
+| `LUX_TG_ALLOW_OTHER` | `0` | 设为 `1` 才收 `kind=other`（任意 http 网页） |
 | `LUX_TG_WASH_TOLERANCE` | 取设置文件 `wash_tolerance_ratio`（0.02） | 洗版容差 |
 | `LUX_TG_LUX_BASE` | `http://lux:8097` | Lux 地址，派生 ingest/lookup URL |
 | `LUX_TG_INGEST_URL` / `LUX_ARCHIVE_LOOKUP_URL` | 由 base 派生 | 单独覆盖 |

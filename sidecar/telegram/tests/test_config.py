@@ -148,6 +148,32 @@ class LoadTest(unittest.TestCase):
         with self.assertRaises(config_mod.ConfigError):
             self.load(env={"LUX_TG_ALLOWED_KINDS": "115,网盘"})
 
+    def test_other_is_not_allowed_by_default(self):
+        """review SC5：默认白名单里没有 other。"""
+        cfg = self.load()
+        self.assertNotIn("other", cfg.allowed_kinds)
+        self.assertIn("115", cfg.allowed_kinds)
+        self.assertIn("magnet", cfg.allowed_kinds)
+
+    def test_allow_other_switch_adds_other(self):
+        cfg = self.load(env={"LUX_TG_ALLOW_OTHER": "1"})
+        self.assertIn("other", cfg.allowed_kinds)
+        # 显式开关只加 other，不影响其余默认项
+        self.assertIn("115", cfg.allowed_kinds)
+        self.assertNotIn("telegram", cfg.allowed_kinds)
+
+    def test_allow_other_off_keeps_other_out(self):
+        cfg = self.load(env={"LUX_TG_ALLOW_OTHER": "0"})
+        self.assertNotIn("other", cfg.allowed_kinds)
+
+    def test_explicit_whitelist_with_other(self):
+        cfg = self.load(env={"LUX_TG_ALLOWED_KINDS": "115,other"})
+        self.assertEqual(cfg.allowed_kinds, ("115", "other"))
+
+    def test_bad_allow_other_value_raises(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load(env={"LUX_TG_ALLOW_OTHER": "maybe"})
+
     def test_bad_bool_raises(self):
         with self.assertRaises(config_mod.ConfigError):
             self.load(env={"LUX_TG_DRY_RUN": "maybe"})

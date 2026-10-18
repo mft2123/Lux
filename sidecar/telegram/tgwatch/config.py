@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .filters import MODE_MANUAL, ModeError, normalize_mode
-from .links import ALL_KINDS, DEFAULT_ALLOWED_KINDS
+from .links import ALL_KINDS, DEFAULT_ALLOWED_KINDS, KIND_OTHER
 
 MODULE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -298,6 +298,10 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
     unknown_kinds = [kind for kind in allowed if kind not in ALL_KINDS]
     if unknown_kinds:
         raise ConfigError(f"未知链接类型 {unknown_kinds}，可用: {list(ALL_KINDS)}")
+    # 默认不放行 other（任意 http 网页）；只有显式开关才收（review SC5）
+    allow_other = _env_bool("LUX_TG_ALLOW_OTHER", False)
+    if allow_other and KIND_OTHER not in allowed:
+        allowed = (*allowed, KIND_OTHER)
 
     sink = _env("LUX_TG_SINK", SINK_HTTP).lower()
     if sink not in SINKS:

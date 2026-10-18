@@ -54,6 +54,21 @@ class ExtractTest(unittest.TestCase):
         kept = links.split_kinds(found, links.DEFAULT_ALLOWED_KINDS)
         self.assertEqual([link.kind for link in kept], [links.KIND_115])
 
+    def test_default_kinds_drop_other_and_telegram(self):
+        """review SC5：默认只放行已知网盘/磁力，other 要显式开关。"""
+        self.assertNotIn(links.KIND_OTHER, links.DEFAULT_ALLOWED_KINDS)
+        self.assertNotIn(links.KIND_TELEGRAM, links.DEFAULT_ALLOWED_KINDS)
+        for kind in (links.KIND_115, links.KIND_MAGNET, links.KIND_ED2K,
+                     links.KIND_ALIYUN, links.KIND_QUARK, links.KIND_BAIDU):
+            self.assertIn(kind, links.DEFAULT_ALLOWED_KINDS)
+
+    def test_news_link_is_other_and_dropped_by_default(self):
+        found = links.extract_links("新片资讯 https://example.com/news/2026/10 快看")
+        self.assertEqual([link.kind for link in found], [links.KIND_OTHER])
+        self.assertEqual(links.split_kinds(found, links.DEFAULT_ALLOWED_KINDS), [])
+        kept = links.split_kinds(found, (*links.DEFAULT_ALLOWED_KINDS, links.KIND_OTHER))
+        self.assertEqual([link.kind for link in kept], [links.KIND_OTHER])
+
 
 class ClassifyTest(unittest.TestCase):
     def test_host_boundary(self):

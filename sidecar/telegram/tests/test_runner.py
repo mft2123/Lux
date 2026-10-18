@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from tests import support
 from tgwatch import config as config_mod
-from tgwatch import filters, runner, sink as sink_mod, store as store_mod
+from tgwatch import filters, links as links_mod, runner, sink as sink_mod, store as store_mod
 
 
 class FakeLookup:
@@ -171,6 +171,29 @@ class ProcessTest(unittest.TestCase):
         watcher, _ = self.build(config, sink=sink)
         asyncio.run(watcher.process(message(text="见 https://t.me/other/1"), config.channels[0]))
         self.assertEqual(sink.sent, [])
+
+    def test_news_link_is_not_delivered_by_default(self):
+        """review SC5：other（新闻/网页）默认不投递，但消息留痕（skipped/no_allowed_link）。"""
+        config = make_config(self.tmp)
+        sink = FakeSink()
+        watcher, store = self.build(config, sink=sink)
+        asyncio.run(watcher.process(message(text="新片资讯 https://example.com/news/1"), config.channels[0]))
+        self.assertEqual(sink.sent, [])
+        self.assertEqual(store.stats()["items"], 0)
+        stats = store.stats()
+        self.assertEqual(stats["messages"], 1)
+        self.assertEqual(stats["by_status"], {})  # 消息级记录，没有条目
+        self.assertEqual(watcher.counts["skipped"], 1)
+
+    def test_news_link_is_delivered_when_other_is_allowed(self):
+        config = make_config(
+            self.tmp, allowed_kinds=(*links_mod.DEFAULT_ALLOWED_KINDS, links_mod.KIND_OTHER)
+        )
+        sink = FakeSink()
+        watcher, _ = self.build(config, sink=sink)
+        asyncio.run(watcher.process(message(text="新片资讯 https://example.com/news/1"), config.channels[0]))
+        self.assertEqual(len(sink.sent), 1)
+        self.assertEqual(sink.sent[0]["kind"], links_mod.KIND_OTHER)
 
     def test_cursor_advances_with_every_recorded_message(self):
         config = make_config(self.tmp)
