@@ -1673,11 +1673,7 @@ pub(super) async fn handle_emby_playback_event(
                     &user.display_name,
                     AccessPrincipal::new(user.id, user.is_admin),
                     request.play_method.as_deref(),
-                    if event_type_is_stopped(event_type) {
-                        activity_remote_ip
-                    } else {
-                        None
-                    },
+                    activity_remote_ip,
                     resumed,
                 )
                 .await;
@@ -3963,11 +3959,7 @@ pub(super) async fn lux_web_playback_event(
                 &user.display_name,
                 AccessPrincipal::new(user.id, user.is_admin),
                 web_playback_notification_method(&session),
-                if event_type_is_stopped(event_type) {
-                    activity_remote_ip
-                } else {
-                    None
-                },
+                activity_remote_ip,
                 resumed,
             )
             .await;
@@ -4195,11 +4187,7 @@ pub(super) async fn lux_post_progress(
                     &user.display_name,
                     AccessPrincipal::new(user.id, user.is_admin),
                     request.play_method.as_deref(),
-                    if event_type_is_stopped(event_type) {
-                        activity_remote_ip
-                    } else {
-                        None
-                    },
+                    activity_remote_ip,
                     resumed,
                 )
                 .await;

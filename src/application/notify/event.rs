@@ -210,7 +210,8 @@ pub(crate) fn archive_events(report: &ArchiveReport) -> Vec<NotifyEvent> {
         events.push(
             NotifyEvent::new(NotifyCategory::Transfer, format!("已转存 {name}"))
                 .field("📦 条目", name.as_str())
-                .field("➡️ 下一步", "等待整理"),
+                .field("➡️ 下一步", "等待整理")
+                .dedupe_key(format!("transfer:{name}")),
         );
     }
     for item in report.organized.iter().take(MAX_ITEM_EVENTS_PER_RUN) {
@@ -226,7 +227,10 @@ pub(crate) fn archive_events(report: &ArchiveReport) -> Vec<NotifyEvent> {
         events.push(
             NotifyEvent::new(NotifyCategory::Failure, "归档失败")
                 .field("📦 条目", item.source.as_str())
-                .field("📝 原因", item.reason.as_str()),
+                .field("📝 原因", item.reason.as_str())
+                // The same broken entry fails again on every poll: one
+                // notification per entry and reason per dedupe window is enough.
+                .dedupe_key(format!("failure:{}:{}", item.source, item.reason)),
         );
     }
 
@@ -247,6 +251,7 @@ fn organized_event(item: &OrganizedItem) -> NotifyEvent {
     .field("🌏 地区", item.region.as_str())
     .field("📁 库位", item.target.as_str())
     .field("📦 来源", item.source.as_str())
+    .dedupe_key(format!("organize:{}", item.target))
 }
 
 fn washed_event(item: &WashedItem) -> NotifyEvent {
@@ -268,6 +273,7 @@ fn washed_event(item: &WashedItem) -> NotifyEvent {
             format!("{} ({})", item.source, format_bytes(item.kept_size)),
         )
         .field("📈 变化", delta)
+        .dedupe_key(format!("wash:{}:{}", item.source, item.replaced_size))
 }
 
 fn duplicate_event(item: &DuplicateItem) -> NotifyEvent {
@@ -275,9 +281,11 @@ fn duplicate_event(item: &DuplicateItem) -> NotifyEvent {
         .field("📦 条目", item.source.as_str())
         .field("📁 已存在", item.existing.as_str())
         .field("⏭️ 处理", "跳过，未重复转存")
+        .dedupe_key(format!("duplicate:{}:{}", item.source, item.existing))
 }
 
-fn summary_event(report: &ArchiveReport, truncated: bool) -> NotifyEvent {    let mut event = NotifyEvent::new(NotifyCategory::Task, "归档任务完成")
+fn summary_event(report: &ArchiveReport, truncated: bool) -> NotifyEvent {
+    let mut event = NotifyEvent::new(NotifyCategory::Task, "归档任务完成")
         .field("📥 转存", report.archived_to_pending.len().to_string())
         .field("🗂️ 整理", report.organized.len().to_string())
         .field("🔁 洗版", report.washed.len().to_string())

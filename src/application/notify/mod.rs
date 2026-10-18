@@ -128,6 +128,24 @@ pub(crate) fn is_configured() -> bool {
     NotifyConfig::load().configured()
 }
 
+/// The category list the settings page renders. The server owns it so a new
+/// category never needs a frontend change (and a save never drops one the page
+/// did not know about).
+pub(crate) fn known_categories() -> serde_json::Value {
+    serde_json::Value::Array(
+        NotifyCategory::ALL
+            .iter()
+            .map(|category| {
+                serde_json::json!({
+                    "key": category.key(),
+                    "label": category.label(),
+                    "emoji": category.emoji(),
+                })
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn status() -> NotifyStatus {
     let config = NotifyConfig::load();
     NotifyStatus {
@@ -172,13 +190,16 @@ async fn deliver(
         );
         return skipped("该通知类别未启用");
     }
+    // Check the dedupe window before sending, but only remember the key once the
+    // message actually went out: a failed send must not suppress the retry.
+    let dedupe_key = event
+        .dedupe_key
+        .as_ref()
+        .map(|key| format!("{}:{key}", event.category.key()));
+    let dedupe_now = now_unix();
     if respect_dedupe
-        && let Some(key) = event.dedupe_key.as_deref()
-        && !dedupe_allows(
-            &format!("{}:{key}", event.category.key()),
-            now_unix(),
-            config.dedupe_window.as_secs() as i64,
-        )
+        && let Some(key) = dedupe_key.as_deref()
+        && dedupe_seen(key, dedupe_now, config.dedupe_window.as_secs() as i64)
     {
         stats().skipped();
         tracing::debug!(
@@ -197,6 +218,9 @@ async fn deliver(
     match sender.send(&text, silent).await {
         Ok(message_id) => {
             stats().sent();
+            if respect_dedupe && let Some(key) = dedupe_key.as_deref() {
+                dedupe_remember(key, dedupe_now);
+            }
             tracing::info!(
                 category = event.category.key(),
                 "telegram notification delivered"
@@ -238,23 +262,32 @@ fn now_unix() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
 }
 
-fn dedupe_allows(key: &str, now: i64, window_seconds: i64) -> bool {
+/// `true` when a notification with this key already went out inside the window.
+/// The key is only remembered by [`dedupe_remember`], after a successful send.
+fn dedupe_seen(key: &str, now: i64, window_seconds: i64) -> bool {
     if window_seconds <= 0 {
-        return true;
+        return false;
     }
     let mut state = dedupe_state().lock().unwrap_or_else(|error| error.into_inner());
+    prune_dedupe(&mut state, now, window_seconds);
+    state
+        .entries
+        .get(key)
+        .map(|seen_at| now.saturating_sub(*seen_at) < window_seconds)
+        .unwrap_or(false)
+}
+
+fn dedupe_remember(key: &str, now: i64) {
+    let mut state = dedupe_state().lock().unwrap_or_else(|error| error.into_inner());
+    state.entries.insert(key.to_owned(), now);
+}
+
+fn prune_dedupe(state: &mut DedupeState, now: i64, window_seconds: i64) {
     if state.entries.len() > 512 || now.saturating_sub(state.pruned_at) > 300 {
         let cutoff = now.saturating_sub(window_seconds.max(300));
         state.entries.retain(|_, seen_at| *seen_at >= cutoff);
         state.pruned_at = now;
     }
-    if let Some(seen_at) = state.entries.get(key)
-        && now.saturating_sub(*seen_at) < window_seconds
-    {
-        return false;
-    }
-    state.entries.insert(key.to_owned(), now);
-    true
 }
 
 fn dedupe_state() -> &'static StdMutex<DedupeState> {
@@ -322,16 +355,27 @@ mod tests {
     #[test]
     fn dedupe_suppresses_repeats_inside_the_window_and_expires_afterwards() {
         let key = format!("test:{}", uuid::Uuid::now_v7());
-        assert!(dedupe_allows(&key, 1_000, 60));
-        assert!(!dedupe_allows(&key, 1_030, 60));
-        assert!(dedupe_allows(&key, 1_061, 60));
+        // Only a successful send remembers the key, so the test remembers it too.
+        assert!(!dedupe_seen(&key, 1_000, 60));
+        dedupe_remember(&key, 1_000);
+        assert!(dedupe_seen(&key, 1_030, 60));
+        assert!(!dedupe_seen(&key, 1_061, 60));
+    }
+
+    #[test]
+    fn a_failed_send_does_not_suppress_the_next_attempt() {
+        let key = format!("test:{}", uuid::Uuid::now_v7());
+        // A send that failed never remembered the key ...
+        assert!(!dedupe_seen(&key, 1_000, 60));
+        // ... so the retry a moment later is allowed.
+        assert!(!dedupe_seen(&key, 1_005, 60));
     }
 
     #[test]
     fn dedupe_is_disabled_for_zero_window() {
         let key = format!("test:{}", uuid::Uuid::now_v7());
-        assert!(dedupe_allows(&key, 1_000, 0));
-        assert!(dedupe_allows(&key, 1_000, 0));
+        assert!(!dedupe_seen(&key, 1_000, 0));
+        assert!(!dedupe_seen(&key, 1_000, 0));
     }
 
     #[test]
