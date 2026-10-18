@@ -2059,7 +2059,7 @@ fn database_pool_max_connections_uses_backend_defaults() {
     assert_eq!(
         resolve_database_pool_max_connections(DatabaseBackend::Sqlite, None)
             .expect("SQLite default pool size"),
-        8
+        24
     );
     assert_eq!(
         resolve_database_pool_max_connections(DatabaseBackend::Postgres, None)
@@ -2073,7 +2073,7 @@ fn database_pool_max_connections_accepts_a_bounded_override() {
     assert_eq!(
         resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some(""))
             .expect("empty pool override uses the default"),
-        8
+        24
     );
     assert_eq!(
         resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some("12"))

@@ -304,7 +304,7 @@ const SCAN_DML_CHUNK_SIZE: usize = 200;
 const SCAN_MANIFEST_DELTA_BATCH_SIZE: usize = 100;
 const RECOMMENDATION_RATING_CACHE_TTL_SECONDS: i64 = 30 * 86_400;
 const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
-const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
+const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 24;
 const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 20;
 const MIN_DATABASE_POOL_MAX_CONNECTIONS: u32 = 1;
 const MAX_DATABASE_POOL_MAX_CONNECTIONS: u32 = 100;
@@ -334,6 +334,30 @@ fn resolve_database_pool_max_connections(
         )));
     }
     Ok(value)
+}
+
+/// WAL files grow while readers hold snapshots; without a periodic checkpoint
+/// they are never truncated (2.1 GB observed after one full scan). A low-rate
+/// timer truncates when the database is idle and is a no-op when it is busy.
+const SQLITE_WAL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn spawn_sqlite_wal_maintenance(pool: sqlx::AnyPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SQLITE_WAL_CHECKPOINT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately; skip it so startup is untouched.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            // A busy database makes this a no-op, so a failed run needs no retry.
+            if let Err(error) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_optional(&pool)
+                .await
+            {
+                tracing::debug!(%error, "sqlite wal checkpoint failed");
+            }
+        }
+    });
 }
 
 fn database_flag(value: bool) -> i64 {
@@ -520,6 +544,10 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
+
+        if backend == DatabaseBackend::Sqlite {
+            spawn_sqlite_wal_maintenance(pool.clone());
+        }
 
         Ok(Self {
             pool,
@@ -2817,6 +2845,7 @@ fn catalog_filter_where_clause<'a>(
     filter: &CatalogFilterQuery<'a>,
 ) -> (String, Vec<CatalogBind<'a>>) {
     let library_ids = filter.library_ids;
+    let folder_prefix = filter.folder_prefix;
     let user_id = filter.user_id;
     let item_types = filter.item_types;
     let item_ids = filter.item_ids;
@@ -2900,6 +2929,30 @@ fn catalog_filter_where_clause<'a>(
                 .iter()
                 .map(|media_source_id| CatalogBind::Text(media_source_id.as_str())),
         );
+    }
+    // Folder filter: the item's first path segment under the library root must
+    // equal the requested folder. substr comparisons keep this dialect-neutral
+    // (except for the folders listing query, which picks instr/position).
+    if let Some(folder_prefix) = folder_prefix {
+        let folder_chars = folder_prefix.chars().count();
+        if folder_chars == 0 {
+            where_clause.push_str(" AND 1 = 0");
+        } else {
+            where_clause.push_str(
+                " AND EXISTS (
+                     SELECT 1 FROM media_sources ms_folder
+                     JOIN filesystem_entries fe_folder
+                       ON fe_folder.id = ms_folder.filesystem_entry_id
+                     WHERE ms_folder.item_id = mi.id
+                       AND substr(fe_folder.relative_path, 1, ?) = ?
+                       AND substr(fe_folder.relative_path, ?, 1) = '/'
+                 )",
+            );
+            let folder_chars = i64::try_from(folder_chars).unwrap_or(i64::MAX);
+            binds.push(CatalogBind::Integer(folder_chars));
+            binds.push(CatalogBind::Text(folder_prefix));
+            binds.push(CatalogBind::Integer(folder_chars.saturating_add(1)));
+        }
     }
     if item_ids.is_some() || media_source_ids.is_some() {
         if id_predicates.is_empty() {
@@ -3234,6 +3287,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) parent_id_scope: Option<Option<&'a str>>,
+    pub(crate) folder_prefix: Option<&'a str>,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,
