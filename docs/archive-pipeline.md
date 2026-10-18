@@ -103,6 +103,25 @@
 - 体积比较只读元数据（不读数据），目录包为递归文件大小之和。
 - 单次 run 内，前一个条目的目标路径会登记为"已规划"，同名后续条目按同一规则与它比较（dry-run 也这样模拟）。
 
+## 5.5 本地镜像库（strm + NFO + 海报）
+
+115 侧（`媒体目录/`）只放媒体文件；媒体服务器扫描的是**本地镜像库**（`LUX_ARCHIVE_MIRROR_ROOT`，
+默认 `/vol5/1000/docker/lux-library`）。镜像与 115 的板块/年份/片名结构一致，但去掉 `媒体目录/` 这一层，
+所以镜像根本身就是可用的媒体库根：
+
+```
+<镜像根>/<国内|国外><类型>/<年份>/<片名 (年份)>/
+  <媒体文件名>.strm          # 内容 = CD2 挂载路径（LUX_ARCHIVE_CD2_MOUNT + LUX_ARCHIVE_CD2_PREFIX + 相对路径）
+  <媒体文件名>.nfo           # 电影；剧集为 tvshow.nfo + 每集 <集文件名>.nfo
+  poster.jpg / fanart.jpg    # TMDB 海报与背景图
+```
+
+- strm 不含任何凭据、不做 302；媒体服务器按 CD2 挂载路径直接读取。
+- 写完后目录 0755、文件 0644，保证非 root 的媒体服务器可读。
+- 全部幂等：已存在的文件默认不覆盖（回填接口加 `overwrite=1` 才重写）。
+- `POST /api/v1/admin/archive/metadata?dry_run=1|0&overwrite=0|1` 为历史条目补生成。
+- 失败只记录、不回滚移动（元数据问题不能影响已完成的归档）。
+
 ## 6. 失败处理
 
 失败原因（写入 `失败目录/<时间戳>/原因.txt` 与日志 WARN，字段含条目名与原因）：
@@ -131,6 +150,9 @@
 | `LUX_TMDB_LANGUAGE` | `zh-CN` | 详情显示语言（搜索同时查 en-US） |
 | `LUX_ARCHIVE_POLL_SECONDS` | 0（关闭） | 自动轮询间隔秒数 |
 | `LUX_ARCHIVE_SETTLE_SECONDS` | 5 | 稳定等待秒数（上限 3600） |
+| `LUX_ARCHIVE_MIRROR_ROOT` | `/vol5/1000/docker/lux-library` | 本地镜像库根（媒体服务器扫描） |
+| `LUX_ARCHIVE_CD2_PREFIX` | 空 | 归档根在 CD2 挂载中的相对路径（如 `测试库`） |
+| `LUX_ARCHIVE_CD2_MOUNT` | `/media/cloud` | CD2 在媒体服务器容器内的挂载点 |
 | `LUX_ARCHIVE_WASH_ENABLED` | 1 | 是否启用洗版 |
 | `LUX_ARCHIVE_WASH_TOLERANCE` | 0.02 | 体积容差比例（0–1） |
 
