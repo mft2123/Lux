@@ -2859,6 +2859,54 @@ impl Database {
         Ok((ids, removed_ids))
     }
 
+    /// Recompute the availability rollup for every series and season of one
+    /// library from its episodes. Idempotent: only rows whose derived value
+    /// differs are written, so a repeated scan costs one read pass and no
+    /// writes. Used after a scan (and its local metadata backfill) completes
+    /// so flags that went stale while media roots were unavailable recover
+    /// without manual database surgery.
+    pub(crate) async fn recompute_library_availability_rollup(
+        &self,
+        library_id: &str,
+    ) -> Result<u64, StorageError> {
+        let result = self
+            .query(
+                "WITH desired AS (
+                     SELECT parent.id,
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM media_items child
+                                WHERE child.item_type = 'EPISODE'
+                                  AND child.removed_at IS NULL
+                                  AND child.has_available_source = 1
+                                  AND (child.series_id = parent.id OR child.parent_id = parent.id)
+                            ) THEN 1 ELSE 0 END AS want
+                     FROM media_items parent
+                     WHERE parent.item_type IN ('SERIES', 'SEASON')
+                       AND parent.library_id = ?
+                       AND parent.removed_at IS NULL
+                 ),
+                 changed AS (
+                     SELECT desired.id, desired.want
+                     FROM desired
+                     JOIN media_items current ON current.id = desired.id
+                     WHERE desired.want <> current.has_available_source
+                 )
+                 UPDATE media_items
+                 SET has_available_source = (
+                     SELECT changed.want FROM changed WHERE changed.id = media_items.id
+                 )
+                 WHERE id IN (SELECT id FROM changed)",
+            )
+            .bind(library_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+
     async fn insert_hierarchy_rows_in_transaction<'a, I>(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,

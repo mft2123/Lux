@@ -452,6 +452,7 @@ impl ScanJobService {
             )
             .await;
         self.run_auto_library_cover_after_scan(job_id).await?;
+        self.recompute_availability_rollup_after_scan(completed_job).await;
         self.flush_home_after_scan_terminal().await;
         self.publish_media_added_event(completed_job, created_items)
             .await;
@@ -459,6 +460,31 @@ impl ScanJobService {
             self.database.clear_scan_job_paths(job_id).await?;
         }
         Ok(())
+    }
+
+    async fn recompute_availability_rollup_after_scan(&self, job: &StoredScanJob) {
+        match self
+            .database
+            .recompute_library_availability_rollup(&job.library_id)
+            .await
+        {
+            Ok(changed) if changed > 0 => {
+                tracing::info!(
+                    job_id = %job.id,
+                    library_id = %job.library_id,
+                    changed,
+                    "availability rollup recomputed after scan"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job.id,
+                    %error,
+                    "availability rollup recomputation failed"
+                );
+            }
+        }
     }
 
     async fn schedule_incremental_completion_followups(
@@ -1503,6 +1529,7 @@ impl ScanJobService {
             self.schedule_online_metadata_after_scan(job_id, metadata)
                 .await;
         }
+        self.recompute_availability_rollup_after_scan(completed_job).await;
         self.flush_home_after_scan_terminal().await;
         self.publish_media_added_event(completed_job, created_items)
             .await;

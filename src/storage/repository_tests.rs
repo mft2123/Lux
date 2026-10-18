@@ -8649,6 +8649,95 @@ async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
 }
 
 #[tokio::test]
+async fn availability_rollup_recomputes_series_and_season_flags() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Series", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+
+    let insert = |item_id: &'static str, item_type: &'static str, parent: Option<&'static str>, series: Option<&'static str>, available: i64| {
+        let database = database.clone();
+        let library_id = library_id.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, title, sort_title,
+                     identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+            )
+            .bind(item_id)
+            .bind(library_id)
+            .bind(item_type)
+            .bind(parent)
+            .bind(series)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(available)
+            .execute(database.pool())
+            .await
+            .expect("media item");
+        }
+    };
+
+    // Series A: season with one available episode -> both flags should rise.
+    insert("rollup-series", "SERIES", None, None, 0).await;
+    insert("rollup-season", "SEASON", Some("rollup-series"), Some("rollup-series"), 0).await;
+    insert("rollup-episode-ok", "EPISODE", Some("rollup-season"), Some("rollup-series"), 1).await;
+    insert("rollup-episode-gone", "EPISODE", Some("rollup-season"), Some("rollup-series"), 0).await;
+
+    let changed = database
+        .recompute_library_availability_rollup(&library_id)
+        .await
+        .expect("rollup");
+    assert_eq!(changed, 2);
+    let flags: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, has_available_source FROM media_items
+         WHERE id IN ('rollup-series', 'rollup-season') ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("flags");
+    assert_eq!(
+        flags,
+        vec![
+            ("rollup-season".to_owned(), 1),
+            ("rollup-series".to_owned(), 1)
+        ]
+    );
+
+    // Idempotent: a second pass writes nothing.
+    let changed = database
+        .recompute_library_availability_rollup(&library_id)
+        .await
+        .expect("rollup");
+    assert_eq!(changed, 0);
+
+    // Series B: every episode unavailable -> flags must fall back to 0.
+    insert("rollup-series-b", "SERIES", None, None, 1).await;
+    insert("rollup-season-b", "SEASON", Some("rollup-series-b"), Some("rollup-series-b"), 1).await;
+    insert("rollup-episode-b", "EPISODE", Some("rollup-season-b"), Some("rollup-series-b"), 0).await;
+    let changed = database
+        .recompute_library_availability_rollup(&library_id)
+        .await
+        .expect("rollup");
+    assert_eq!(changed, 2);
+    let season_b: i64 = sqlx::query_scalar(
+        "SELECT has_available_source FROM media_items WHERE id = 'rollup-season-b'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("season b flag");
+    assert_eq!(season_b, 0);
+}
+
+#[tokio::test]
 async fn recent_catalog_rows_include_visible_unavailable_series() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
