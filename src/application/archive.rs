@@ -371,9 +371,9 @@ impl ArchiveService {
                     continue;
                 }
             };
-            let year = matched
+            let year = parsed
                 .year
-                .or(parsed.year)
+                .or(matched.year)
                 .filter(|year| (1888..=2100).contains(year));
             let region = if matched.is_domestic() { "国内" } else { "国外" };
             let board = format!("{region}{}", matched.category_label());
@@ -385,9 +385,6 @@ impl ArchiveService {
                 Some(year) => format!("{safe_title} ({year})"),
                 None => safe_title.clone(),
             };
-            // Directories are a release pack: move the whole pack and rename it
-            // to the library name. Files keep their own name.
-            let target_name = if is_dir { title_dir.clone() } else { name.clone() };
             let mut target_dir = self
                 .config
                 .media_dir()
@@ -398,7 +395,14 @@ impl ArchiveService {
                 let season = parsed.season.unwrap_or(1);
                 target_dir = target_dir.join(format!("Season {season:02}"));
             }
-            let target = target_dir.join(&target_name);
+            // Directories are a release pack: the pack itself becomes the
+            // title directory (base name); a single file keeps its own name
+            // inside the title directory.
+            let target = if is_dir {
+                target_dir.clone()
+            } else {
+                target_dir.join(&name)
+            };
             if target.exists() {
                 let incoming_size = path_size(&entry);
                 let existing_size = path_size(&target);
