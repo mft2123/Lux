@@ -111,7 +111,9 @@
 
 ## 模块：旁挂（worktree `lux-telegram-sidecar` / 分支 `feat/telegram-sidecar`）
 
-状态: CHANGES（F0 并发冲突已解除：`sidecar/` 已提交、只有一个写入者）
+状态: CHANGES（F0 并发冲突已解除：`sidecar/` 已在 `feat/telegram-sidecar` 提交、只有一个写入者。
+注意：主 checkout `/vol5/1000/build/lux` 里还有一份**未跟踪**的旧 `sidecar/` 副本，
+合并时以 `lux-telegram-sidecar` worktree 为准，不要把那份旧副本 `git add` 进去。）
 分支 / 提交: `feat/telegram-sidecar` @ 4ac4e1fa（3b8d2ec9 / f2ff9698 / 0fdcbf14 / 42529388 / 4ac4e1fa）
 逐条:
 - ✅ F1 投递链路（默认 http → `/archive/ingest`，spool 已删）
