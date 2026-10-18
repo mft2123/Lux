@@ -42,21 +42,30 @@
 
 ---
 
-## F1【严重】剧集包必须按季判定 — ✅ 已修（`42134498`）
+## F1【严重】剧集包必须按季判定 — ✅ 已修（`42134498` + `6413a8b0`）
 
 - 根因：入库判定以**整个目录包**为单位比体积。`聊斋 (1996) {tmdb-68678}` 包里有 Season 01+02，
   库里只有 Season 01，整包被判重复搬走 → 库里永远缺 Season 02。
 - 修法（`src/application/archive.rs`）：新增 `organize_series_pack` / `apply_season_plan` /
   `plan_season_pack` / `season_dirs`。剧集包按每个 `Season NN` 子目录独立判定：
   库里没有 → 并入；体积等效或更小 → 该季进 `重复目录/<原包名>/Season NN`；明显更大 → 洗版该季。
-  全部季都重复才退回整包判定；合并后重新生成该剧镜像（已有 sidecar 不覆盖）；包内零散文件并入片名目录。
+  全部季都重复才退回整包判定；合并后重新生成该剧镜像（已有 sidecar 不覆盖）；包内零散文件并入片名目录；
+  已处理/已失败的季目录不会被当成 leftover 二次搬动（`6413a8b0`）。
 - 单测：`cargo test --locked --lib archive` → **34 通过**（新增 3 个：两季包只并缺季 / 全重复包 / 季洗版）。
 - 测试库数据已修（审核组执行并核验）：
   - `重复目录/聊斋 (1996) {tmdb-68678}/Season 02`（40 个文件）已并入
     `媒体目录/电视剧/国内/1996/聊斋 (1996)/Season 02`；
   - 镜像 `聊斋 (1996)/Season 02` 的 80 个 sidecar 就位，逐条校验 strm 目标存在（bad=0）；
   - `重复目录/聊斋 (1996) {tmdb-68678}/` 现在只剩 Season 01。
+- **端到端实测**（新镜像 `lux:phase-a` = `2897000ddab9`，独立容器 + 独立配置副本，poll=0 手动触发）：
+  - 合成两季包 `刑事侦缉档案4 (1999) {tmdb-210560}`（Season 04 已在库、Season 05 为新季）放入 `待整理/`；
+  - `POST /api/v1/admin/archive/run?dry_run=false` → `organized=1 (Season 05)`、`duplicates=1 (Season 04)`、`failed=0`；
+  - 核验：库里出现 `Season 05`，`重复目录/…{tmdb-210560}/` 只有 `Season 04`，包目录已消失，
+    镜像 `Season 05/Test.S05E01.strm` 指向 `…/Season 05/Test.S05E01.mkv`；
+  - 对照：同一包在**旧镜像**上整包判重复（`lux-testlib` 日志 05:51:38 `duplicates:1`），即修复前的行为；
+  - 测试产物已清理，`lux-testlib` 已用新镜像重建并 healthy（8099）。
 - 规范：`docs/archive-pipeline.md` 新增 §5.1「剧集包按季判定」。
+- 顺带发现（归 ingest 组，见 I16）：文档写 `dry_run=1|0`，接口只接受 `true|false`，`?dry_run=1` 返回 400。
 
 ---
 
@@ -139,6 +148,8 @@
 - I5 [一般] lookup 名称启发式误匹配（`流浪地球2`↔`流浪地球`、短标题、跨年份；匹配还发生在类型/地区/年份层）
 - I6 [一般] lookup 每请求全树遍历 + 递归求和，无缓存；跟随符号链接；在 async handler 里同步阻塞
 其余: I7–I15，见 `fix-ingest-round2.md`
+新增: I16 [小项] `run` / `metadata` 的 `dry_run` 文档写 `1|0`，接口是 bool（`?dry_run=1` → 400
+`provided string was not true or false`）——改文档或兼容 `1/0/true/false`（审核组实测踩到）
 测试: `cargo test --locked --lib archive` 34 通过（含 F1 新增用例）
 
 ---

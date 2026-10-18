@@ -66,6 +66,9 @@
   202 返回 `queued`，文档写明默认关闭轮询时需手动 run。
 - I14 duplicate 响应里的 `file` 可能指向不存在的重命名文件 → 状态里存实际落盘相对路径。
 - I15 `Json(job)` 提取器在鉴权前执行，类型错误返回 axum 422 而非 `api_error` 400 → 先鉴权再解析。
+- I16 [小项] 文档写 `dry_run=1|0`，接口只接受 bool（`?dry_run=1` → 400 `provided string was not true or false`）。
+  `docs/archive-pipeline.md` §9 与 `POST …/run`、`…/metadata` 三处对齐：要么文档改成 `true|false`，
+  要么 query 解析兼容 `1/0/true/false`（审核组实测踩到，建议兼容，脚本更顺手）。
 
 ## 三、已核实无问题（不用重做）
 
