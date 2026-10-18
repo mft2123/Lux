@@ -31,11 +31,35 @@ def sample_item(**overrides):
 
 class PayloadTest(unittest.TestCase):
     def test_http_payload_is_documented_contract(self):
-        # Lux LinkJob：url + title + mode（brief 约定的三个字段）
+        # Lux LinkJob：url + title + mode + 溯源字段（review SC6）
         self.assertEqual(
             sink_mod.payload(sample_item()),
-            {"url": "https://115.com/s/abc", "title": "某剧 S01", "mode": "上新"},
+            {
+                "url": "https://115.com/s/abc",
+                "title": "某剧 S01",
+                "mode": "上新",
+                "source": "telegram",
+                "kind": "115",
+                "channel": "@chan",
+                "message_id": 42,
+                "size_bytes": 1024,
+                "captured_at": "2026-10-18T00:00:00+00:00",
+            },
         )
+
+    def test_traceability_fields_are_all_present(self):
+        body = sink_mod.payload(sample_item())
+        for key in ("source", "kind", "channel", "message_id", "size_bytes", "captured_at"):
+            self.assertIn(key, body)
+            self.assertNotIn(body[key], (None, ""), f"{key} 不能为空")
+
+    def test_unknown_size_is_null_and_message_id_is_int(self):
+        body = sink_mod.payload(sample_item(size_bytes=None, msg_id="77"))
+        self.assertIsNone(body["size_bytes"])
+        self.assertEqual(body["message_id"], 77)
+
+    def test_source_can_be_overridden_by_the_item(self):
+        self.assertEqual(sink_mod.payload(sample_item(source="replay"))["source"], "replay")
 
     def test_title_falls_back_to_anchor(self):
         self.assertEqual(sink_mod.payload(sample_item(title="", anchor="锚文本"))["title"], "锚文本")
@@ -212,7 +236,7 @@ class HttpSinkTest(unittest.TestCase):
                 asyncio.run(sink.send(sample_item()))
         self.assertFalse(ctx.exception.permanent)
 
-    def test_success_posts_url_title_mode_with_api_key_header(self):
+    def test_success_posts_full_body_with_api_key_header(self):
         captured = {}
 
         class Response:
@@ -238,9 +262,10 @@ class HttpSinkTest(unittest.TestCase):
             asyncio.run(sink.send(sample_item()))
         self.assertEqual(captured["url"], "http://lux:8097/api/v1/admin/archive/ingest")
         self.assertEqual(captured["api_key"], "test-key")
-        self.assertEqual(
-            captured["body"], {"url": "https://115.com/s/abc", "title": "某剧 S01", "mode": "上新"}
-        )
+        self.assertEqual(captured["body"], sink_mod.payload(sample_item()))
+        # 线上 body 必须带齐溯源字段（review SC6）
+        self.assertEqual(captured["body"]["channel"], "@chan")
+        self.assertEqual(captured["body"]["message_id"], 42)
 
 
 class LookupTest(unittest.TestCase):

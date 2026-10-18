@@ -137,11 +137,25 @@ docker exec -u 10001 lux-telegram python main.py replay --all
 
 ### ingest（默认）
 
-`POST /api/v1/admin/archive/ingest`，头 `X-Lux-Api-Key`，body：
+`POST /api/v1/admin/archive/ingest`，头 `X-Lux-Api-Key`，body（与 Lux 的 `LinkJob` 逐字段对齐）：
 
 ```json
-{"url": "https://115.com/s/xxxx", "title": "某剧 S01", "mode": "上新"}
+{
+  "url": "https://115.com/s/xxxx",
+  "title": "某剧 S01",
+  "mode": "上新",
+  "source": "telegram",
+  "kind": "115",
+  "channel": "@somechannel",
+  "message_id": 4321,
+  "size_bytes": 26843545600,
+  "captured_at": "2026-10-18T12:00:00+00:00"
+}
 ```
+
+`source` 固定为 `telegram`（Lux 用它区分投递来源）；`kind` 是链接类型；`channel` / `message_id` /
+`captured_at` 来自原始频道消息；`size_bytes` 从正文解析，读不出时为 `null`。这样
+`链接队列/状态.jsonl` 的每条记录都能回溯到频道与消息。
 
 Lux 校验后返回 202 `{ok, jobId, file, status, duplicate, note}`，并把任务写到
 `<archive_root>/链接队列/<ts>-<slug>.json`；流水线下一轮把它记进 `链接队列/状态.jsonl`

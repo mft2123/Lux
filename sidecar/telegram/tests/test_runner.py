@@ -246,6 +246,44 @@ class ProcessTest(unittest.TestCase):
         asyncio.run(watcher.process(message("某剧 大小 12G", HIDDEN), config.channels[0]))
         self.assertEqual(len(sink.sent), 1)
 
+    def test_http_body_carries_traceability_fields(self):
+        """review SC6：真正发出去的 body 要带 channel/message_id/captured_at 等溯源字段。"""
+        captured = {}
+
+        class Response:
+            status = 202
+
+            def read(self, size=None):
+                return b'{"ok":true,"jobId":"1-x","duplicate":false}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return Response()
+
+        config = make_config(self.tmp)
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        watcher = runner.Watcher(
+            config, store, sink_mod.HttpSink(url="http://lux:8097/ingest", api_key="k"), FakeLookup()
+        )
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            asyncio.run(watcher.process(message(entities=HIDDEN), config.channels[0]))
+
+        body = captured["body"]
+        self.assertEqual(body["url"], "https://115.com/s/abc")
+        self.assertEqual(body["source"], "telegram")
+        self.assertEqual(body["kind"], "115")
+        self.assertEqual(body["channel"], "@chan")
+        self.assertEqual(body["message_id"], 42)
+        self.assertEqual(body["captured_at"], "2026-10-18T00:00:00+00:00")
+        self.assertIsNone(body["size_bytes"])  # 正文里没写体积
+
     def test_sink_failure_marks_failed_and_retry_succeeds(self):
         config = make_config(self.tmp)
         store = store_mod.Store(config.state_db)
