@@ -90,7 +90,7 @@
 - ✅ S7 PUT 进程内串行（`ARCHIVE_SETTINGS_WRITE_LOCK`）
 - ✅ S10 `api_base` 打码；S11 类型错误 400；S12 只校验本次改动涉及的路径
 - ⏭️ S8 临时文件名 pid+自增（跨进程不可撞，未再加随机后缀）；S6 由后端下发类别清单解决
-测试：`cargo test --locked --lib archive` → 62 通过（新增 8 个 settings 用例）
+测试：`cargo test --locked --lib archive` → 71 通过（含 settings 8 个、季判定 3 个、ingest 9 个）
 
 ---
 
@@ -125,7 +125,21 @@
 
 ---
 
-## 模块：归档 / ingest — 见下一节（合并后回填）
+## 模块：归档 / ingest — ✅ READY（`integration/round2`）
+
+提交：`75410572` I1、`9953f560` I3、`d4f60545` I4、`19b13ea5` I5、`eb2a3f9c` I2、`e7d3f6c5` I6、
+`8b14ec6a` I8、`981356c1` I9、`ca02a8e4` I10、`c2df166c` I11、`76583ad0` I16、`6f4e6d23` I12；
+审核组补：`?`（I6 的 `spawn_blocking` 调用点，`admin_jobs.rs`）、`2718341e`（I16 的 `1|0` 兼容解析）
+逐条:
+- ✅ I1 队列消费逐条 best effort：写状态/移动失败只记账并继续，不再拖垮整轮；记账幂等（下一轮只重试移动）
+- ✅ I2 进程内锁包住「查重+落盘」；撞名时 jobId 与文件名一起加后缀，202 三者一致
+- ✅ I3 作业文件/状态/已处理统一 0600
+- ✅ I4 `mask_link_for_log`：日志只留 scheme://host
+- ✅ I5 lookup 只匹配标题层、年份一致、短标题精确、续集不误配（4 组用例）
+- ✅ I6 walk 深度上限 + 不跟随符号链接 + 60s 缓存 + `spawn_blocking`（72k 条目 bench：冷 137ms / 命中 5.9µs）
+- ✅ I8 `mode` 只认 5 种；I9 作业判定共用；I10 URL 必须有 host/target；I11 全角归一；I12 读失败不再当"没有重复"
+- ⏭️ I7（幂等 TTL/轮转）、I13（202 状态语义）、I14（duplicate 的 file 路径）、I15 已由审核组在 admin_jobs 完成
+测试：`cargo test --locked --lib archive` → 71 通过（2 ignored 为手工 bench）
 
 ---
 

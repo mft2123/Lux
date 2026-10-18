@@ -82,13 +82,13 @@
 - 通知：N1/N2（类别由后端下发、保存不改形态）、N3（播放通知 IP）、N4（逐条去重键）、N5（发送成功后再记账）、
   N12（Debug 打码）
 - 旁挂：SC1–SC6、SC8、SC11、SC14–SC18（模块方实现）+ 测试清理与 inbox 0644（审核组补）
-- 归档：F1 剧集按季判定（前一轮已合入 `fork/phase-a`）
+- 归档：F1 剧集按季判定（前一轮已合入 `fork/phase-a`）；ingest I1–I6/I8–I12（队列失败隔离、并发锁、
+  0600、日志脱敏、lookup 标题层/缓存/spawn_blocking、mode 校验、全角归一、读失败不再当无重复）
 
-测试：archive 62 / notify 41 / playback 97 / sidecar 184（3 skip）全绿；
+测试：archive 71 / notify 41 / playback 97 / sidecar 184 全绿；
 整库 `cargo test --lib` 仅剩一个**既有** metadata 用例不稳定（trunk 上同样失败，见总线「已知的 trunk 问题」）。
 
 待办：
-- ingest 分支 `feat/r2-ingest`（I1–I6/I8–I12）合并 + 全量回归
 - 重建 `lux:phase-a` 镜像，`lux-testlib` 重建，端到端验收（设置保存语义、通知类别、旁挂投递）
 - I7/I13/I14、N6/N7/N9–N11/N13、SC7/SC9/SC10/SC12/SC13 留待下一轮
 - U11（115 转存客户端）仍是功能链最后缺口
