@@ -44,6 +44,14 @@ class FakeSink:
         return {"sink": self.name}
 
 
+
+def _restore_mode(path, mode: int) -> None:
+    """Restore a permission bit for cleanup; the temporary tree may be gone."""
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+
 def make_config(tmp: Path, **overrides) -> config_mod.SidecarConfig:
     base = dict(
         api_id=1,
@@ -622,7 +630,7 @@ class SessionErrorClassificationTest(unittest.TestCase):
         directory = self.config.session_dir / "ro"
         directory.mkdir()
         os.chmod(directory, 0o500)
-        self.addCleanup(os.chmod, directory, 0o700)
+        self.addCleanup(_restore_mode, directory, 0o700)
         config = make_config(self.tmp, session_dir=directory)
         with self.assertRaises(runner.RunnerError) as ctx:
             with runner.session_errors(config):

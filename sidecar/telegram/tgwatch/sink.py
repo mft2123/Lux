@@ -173,6 +173,9 @@ class InboxSink:
             os.fsync(fd)
         finally:
             os.close(fd)
+        # The inbox is a cross-user handoff (Lux may run as another uid), so the
+        # mode is set explicitly instead of inheriting the hardened umask.
+        os.chmod(temp, 0o644)
         os.replace(temp, target)
         return target
 
