@@ -9,6 +9,7 @@
 //! half-finished run leaves no hidden state.
 
 use std::{
+    collections::HashMap,
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -314,6 +315,11 @@ impl ArchiveService {
     async fn organize_pending_entries(&self, report: &mut ArchiveReport) -> Result<(), String> {
         let pending = self.config.pending_dir();
         let mut candidates = read_dir_entries(&pending)?;
+        // Dry runs do not move anything, so the plan must remember which
+        // targets an earlier entry of the same batch would have created;
+        // otherwise two releases of one title both plan to the same path and
+        // the duplicate/wash decision never shows up.
+        let mut planned_targets: HashMap<PathBuf, u64> = HashMap::new();
         if report.dry_run {
             // A dry run does not move transfer entries, so plan them as if the
             // archive step had run; otherwise the report would claim nothing
@@ -403,19 +409,35 @@ impl ArchiveService {
             } else {
                 target_dir.join(&name)
             };
-            if target.exists() {
+            let existing_size = if target.exists() {
+                Some(path_size(&target))
+            } else {
+                planned_targets.get(&target).copied()
+            };
+            if let Some(existing_size) = existing_size {
                 let incoming_size = path_size(&entry);
-                let existing_size = path_size(&target);
-                if self.config.wash_enabled && incoming_size > 0 && existing_size > 0 {
-                    let delta = (incoming_size as f64 - existing_size as f64).abs();
-                    let tolerance = existing_size as f64 * self.config.wash_tolerance_ratio;
-                    if incoming_size > existing_size && delta > tolerance {
-                        self.wash_entry(report, &entry, &target, incoming_size, existing_size)?;
-                        continue;
+                let decision = decide_existing(
+                    incoming_size,
+                    existing_size,
+                    self.config.wash_enabled,
+                    self.config.wash_tolerance_ratio,
+                );
+                if decision == ExistingDecision::Wash {
+                    self.wash_entry(report, &entry, &target, incoming_size, existing_size)?;
+                    if report.dry_run {
+                        planned_targets.insert(target, incoming_size);
                     }
+                    continue;
                 }
                 self.duplicate_entry(report, &entry, &target)?;
+                if report.dry_run {
+                    // The planned library copy stays the one already recorded.
+                    planned_targets.entry(target).or_insert(existing_size);
+                }
                 continue;
+            }
+            if report.dry_run {
+                planned_targets.insert(target.clone(), path_size(&entry));
             }
             if report.dry_run {
                 report.organized.push(OrganizedItem {
@@ -850,6 +872,35 @@ fn pick_best_result<'a>(
         .iter()
         .filter(|result| score(result) > 0)
         .max_by_key(|result| score(result))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingDecision {
+    /// The library already holds the same version: keep it, park the newcomer.
+    Duplicate,
+    /// The newcomer is meaningfully bigger: retire the old pack and keep this one.
+    Wash,
+}
+
+/// Chill's `wash_by_equivalent_size` rule: a pack within the tolerance ratio of
+/// the library copy is the same version; a meaningfully larger pack replaces it;
+/// anything smaller keeps the library copy.
+fn decide_existing(
+    incoming_size: u64,
+    existing_size: u64,
+    wash_enabled: bool,
+    tolerance_ratio: f64,
+) -> ExistingDecision {
+    if !wash_enabled || incoming_size == 0 || existing_size == 0 {
+        return ExistingDecision::Duplicate;
+    }
+    let tolerance = existing_size as f64 * tolerance_ratio;
+    let delta = incoming_size as f64 - existing_size as f64;
+    if delta > tolerance {
+        ExistingDecision::Wash
+    } else {
+        ExistingDecision::Duplicate
+    }
 }
 
 /// Total size of a file or directory tree (metadata only, no data read).
@@ -1389,6 +1440,21 @@ mod tests {
             genres: vec!["综艺".to_owned()],
         };
         assert_eq!(variety.category_label(), "综艺");
+    }
+
+    #[test]
+    fn wash_vs_duplicate_follows_the_size_rule() {
+        // Same size (or within tolerance) -> duplicate, keep the library copy.
+        assert_eq!(decide_existing(1000, 1000, true, 0.02), ExistingDecision::Duplicate);
+        assert_eq!(decide_existing(1010, 1000, true, 0.02), ExistingDecision::Duplicate);
+        // Meaningfully bigger -> wash, the old pack is retired.
+        assert_eq!(decide_existing(1100, 1000, true, 0.02), ExistingDecision::Wash);
+        // Smaller -> duplicate, the bigger library copy stays.
+        assert_eq!(decide_existing(900, 1000, true, 0.02), ExistingDecision::Duplicate);
+        // Wash disabled -> always duplicate.
+        assert_eq!(decide_existing(5000, 1000, false, 0.02), ExistingDecision::Duplicate);
+        // Unknown sizes -> duplicate rather than replacing blindly.
+        assert_eq!(decide_existing(0, 1000, true, 0.02), ExistingDecision::Duplicate);
     }
 
     #[test]
