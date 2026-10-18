@@ -34,8 +34,8 @@
 
 待做（按顺序）：
 
-1. **module-settings**：设置文件 + `GET/PUT /api/v1/admin/archive/settings` + 前端设置页
-2. **module-notify**：Telegram bot 通知（入库/归档/失败/洗版）
+1. **module-settings**：设置文件 + `GET/PUT /api/v1/admin/archive/settings` + 前端设置页（已完成，`feat/settings`）
+2. **module-notify**：Telegram bot 通知（入库/归档/失败/洗版/播放/重复…）——已实现，验收整改在 `feat/notify-settings`
 3. **module-telethon**：Python 旁挂，Userbot 登录 + 频道监听 5 模式（手动/上新/追更/洗版/全量）
 4. 存量迁移 + chill 退役（用户要求先跑几天测试，暂缓）
 
@@ -43,8 +43,8 @@
 
 | 模块 | 文档 | 负责文件 | 状态 |
 | --- | --- | --- | --- |
-| 设置与 UI | module-settings.md | `src/application/archive/settings.rs`、`src/api/admin/admin_jobs.rs`、`web/src/features/settings/…` | 待开工 |
-| 通知 | module-notify.md | `src/application/archive/notify.rs`、admin 路由 | 待开工 |
+| 设置与 UI | module-settings.md | `src/application/archive/settings.rs`、`src/api/admin/admin_jobs.rs`、`web/src/features/settings/…` | 已完成（`feat/settings`） |
+| 通知 | module-notify.md | `src/application/notify/`、admin 路由 | 验收整改（`feat/notify-settings`） |
 | Telethon 旁挂 | module-telethon.md | 新目录 `sidecar/telegram/`（Python） | 待开工 |
 
 ## 审核规则（总控对话框用）
