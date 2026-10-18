@@ -128,7 +128,7 @@
 - ✅ SC10 依赖全钉（telethon/pyaes/rsa/pyasn1/python-socks）— `d68a1c86`
 - ✅ SC12 去重键统一 `channel:msg_id`（旧键不再命中，最坏重复一次，Lux URL 幂等兜底）— `4481cd34`
 - ✅ SC13 真 sqlite/client 损坏用例 + api_smoke 覆盖 catch_up/min_id — `35fd9219`
-测试：`python3 -m unittest discover -s tests -t .` → **184 OK**（3 条权限用例在 ZFS 上 skip）
+测试：`python3 -m unittest discover -s tests -t .` → **207 OK**（tgvenv 下 3 skip 为 ZFS 权限用例）
 
 ---
 

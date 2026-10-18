@@ -92,3 +92,22 @@
 - 重建 `lux:phase-a` 镜像，`lux-testlib` 重建，端到端验收（设置保存语义、通知类别、旁挂投递）
 - 第三轮收尾已完成：S8、N6–N13、SC7/SC9/SC10/SC12/SC13、I7/I13/I14
 - U11（115 转存客户端）仍是功能链最后缺口（新功能，不是整改项）
+
+## 端到端验收（第三轮，实跑）
+
+镜像 `lux:phase-a` = `256f26862787`，测试容器 `lux-testlib`（8099）重建后 healthy。
+
+- 设置（独立配置副本 + 全新容器）：
+  - `GET settings` → 11 个通知类别（含「重复」）+ `telegram.api_key` 字段；
+  - `PUT poll_seconds=7200` / `wash_tolerance_ratio=4.0` → **400**；
+  - `PUT poll_seconds=15 + api_key` → 落盘只剩 `poll_seconds` / `telegram.api_key`，env 的 `watch_dirs` 未被固化；
+  - 打码值回传后 key 仍在；`?dry_run=1` → 200。
+- 链接队列：
+  - 首次 ingest → `202 status=queued, duplicate=false`；
+  - 同 URL 再投 → `duplicate=true`，jobId 不变；
+  - `force:true` → 新 jobId 重新入队；
+  - `mode:"边看边下"` → **400**（提示五种合法取值）；
+  - `GET lookup?title=聊斋` → `matched=聊斋 (1996)`、体积正确。
+- 归档 F1（上一轮）：两季包 → 一季入库、一季进重复目录，镜像 strm 指向正确。
+
+未覆盖：旁挂的真 Telegram 登录与投递（没有测试账号凭据），已用离线 207 用例 + stub Lux 契约覆盖。
