@@ -41,6 +41,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/admin/notify/test", post(admin_notify_test))
         .route("/api/v1/admin/notify/send", post(admin_notify_send))
         .route(
+            "/api/v1/admin/archive/settings",
+            get(admin_archive_settings).put(admin_update_archive_settings),
+        )
+        .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
         )
@@ -1279,13 +1283,73 @@ pub(crate) async fn admin_archive_status(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    if let Err(response) = require_admin(&headers, &state, true).await {
+    if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
     let service = crate::application::archive::ArchiveService::new(
         crate::application::archive::ArchiveConfig::from_env(),
     );
     Json(service.status()).into_response()
+}
+
+/// Masked archive settings for the admin settings page. Secrets are reported as
+/// a short prefix plus their length; the full value never leaves the server.
+pub(crate) async fn admin_archive_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let settings = crate::application::archive::ArchiveSettings::load();
+    Json(settings.masked()).into_response()
+}
+
+/// Overwrite the editable settings file. The body is the settings document
+/// itself: keys it leaves out keep their effective value and a blank secret
+/// keeps the stored one, so the page can send back a masked secret untouched.
+/// Values that would break the pipeline are rejected instead of clamped.
+pub(crate) async fn admin_update_archive_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(update): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let mut settings = crate::application::archive::ArchiveSettings::load();
+    if let Err(message) = settings.apply_update(&update) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response();
+    }
+    if let Err(message) = settings.validate() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response();
+    }
+    if let Err(message) = settings.save() {
+        return api_error(
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            &message,
+        )
+        .into_response();
+    }
+    tracing::info!(
+        path = %crate::application::archive::ArchiveSettings::path().display(),
+        "archive settings updated"
+    );
+    Json(settings.masked()).into_response()
 }
 
 pub(crate) async fn admin_archive_run(
