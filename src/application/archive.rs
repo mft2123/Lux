@@ -134,6 +134,7 @@ pub(crate) struct FailedItem {
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedName {
     pub(crate) title: String,
+    pub(crate) tmdb_id: Option<i64>,
     pub(crate) year: Option<i64>,
     pub(crate) season: Option<u32>,
     pub(crate) episode: Option<u32>,
@@ -230,9 +231,11 @@ impl ArchiveService {
     /// Run the pipeline once. `dry_run` reports what would happen without moving
     /// anything, which is the default first-run mode for safety.
     pub(crate) async fn run_once(&self, dry_run: bool) -> Result<ArchiveReport, String> {
-        self.config
-            .ensure_directories()
-            .map_err(|error| format!("无法创建归档目录: {error}"))?;
+        if !dry_run {
+            self.config
+                .ensure_directories()
+                .map_err(|error| format!("无法创建归档目录: {error}"))?;
+        }
         let mut report = ArchiveReport {
             dry_run,
             ..ArchiveReport::default()
@@ -296,26 +299,34 @@ impl ArchiveService {
                 report.skipped.push(format!("{name} (仍在写入)"));
                 continue;
             }
-            if entry.is_dir() {
-                report
-                    .skipped
-                    .push(format!("{name} (目录，剧集包暂不处理)"));
-                continue;
-            }
-            if video_extension(&entry).is_none() {
+            let is_dir = entry.is_dir();
+            if is_dir {
+                if !dir_contains_video(&entry) {
+                    report
+                        .skipped
+                        .push(format!("{name} (目录内没有视频文件，留在待整理)"));
+                    continue;
+                }
+            } else if video_extension(&entry).is_none() {
                 report
                     .skipped
                     .push(format!("{name} (不是视频文件，留在待整理)"));
                 continue;
             }
-            let parsed = match parse_media_name(stem_of(&name)) {
+            let raw_name = if is_dir {
+                name.clone()
+            } else {
+                stem_of(&name).to_string()
+            };
+            let parsed = match parse_media_name(&raw_name) {
                 Some(parsed) => parsed,
                 None => {
                     self.fail_entry(report, &entry, "无法从文件名解析出片名")?;
                     continue;
                 }
             };
-            let matched = match self.lookup_tmdb(&parsed).await {
+            let series_hint = is_dir && dir_signals_series(&entry, &parsed);
+            let matched = match self.lookup_tmdb(&parsed, series_hint).await {
                 Ok(Some(matched)) => matched,
                 Ok(None) => {
                     self.fail_entry(report, &entry, "TMDB 未找到匹配")?;
@@ -340,6 +351,9 @@ impl ArchiveService {
                 Some(year) => format!("{safe_title} ({year})"),
                 None => safe_title.clone(),
             };
+            // Directories are a release pack: move the whole pack and rename it
+            // to the library name. Files keep their own name.
+            let target_name = if is_dir { title_dir.clone() } else { name.clone() };
             let mut target_dir = self
                 .config
                 .media_dir()
@@ -350,7 +364,7 @@ impl ArchiveService {
                 let season = parsed.season.unwrap_or(1);
                 target_dir = target_dir.join(format!("Season {season:02}"));
             }
-            let target = target_dir.join(&name);
+            let target = target_dir.join(&target_name);
             if target.exists() {
                 self.duplicate_entry(report, &entry, &target)?;
                 continue;
@@ -440,13 +454,31 @@ impl ArchiveService {
         Ok(())
     }
 
-    async fn lookup_tmdb(&self, parsed: &ParsedName) -> Result<Option<TmdbMatch>, String> {
+    async fn lookup_tmdb(
+        &self,
+        parsed: &ParsedName,
+        series_hint: bool,
+    ) -> Result<Option<TmdbMatch>, String> {
         let Some(api_key) = self.config.tmdb_api_key.as_deref() else {
             return Err(format!(
                 "未配置 TMDB API Key（设置环境变量 {ARCHIVE_TMDB_KEY_ENV}）"
             ));
         };
-        let attempts: [(MediaKind, &str); 2] = if parsed.is_episode() {
+        // A `{tmdb-NNN}` hint names the id directly; only the segment can be
+        // wrong, so try the likely one first and fall back to the other.
+        if let Some(tmdb_id) = parsed.tmdb_id {
+            let attempts: [(MediaKind, &str); 2] = if series_hint || parsed.is_episode() {
+                [(MediaKind::Series, "tv"), (MediaKind::Movie, "movie")]
+            } else {
+                [(MediaKind::Movie, "movie"), (MediaKind::Series, "tv")]
+            };
+            for (_kind, segment) in attempts {
+                if let Ok(details) = self.tmdb_details(api_key, segment, tmdb_id).await {
+                    return Ok(Some(tmdb_match_from(segment, tmdb_id, &details, &details)?));
+                }
+            }
+        }
+        let attempts: [(MediaKind, &str); 2] = if series_hint || parsed.is_episode() {
             [(MediaKind::Series, "tv"), (MediaKind::Movie, "movie")]
         } else {
             [(MediaKind::Movie, "movie"), (MediaKind::Series, "tv")]
@@ -721,10 +753,67 @@ fn pick_best_result<'a>(
         .max_by_key(|result| score(result))
 }
 
+/// A release pack counts as media when it holds a video file up to two levels
+/// deep (pack root or a season subdirectory).
+fn dir_contains_video(directory: &Path) -> bool {
+    let Ok(reader) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    for entry in reader.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_contains_video(&path) {
+                return true;
+            }
+            continue;
+        }
+        if video_extension(&path).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// A pack is treated as a series when it has a season directory or an
+/// episode-named file inside, or when the name itself carries SxxEyy/第N集.
+fn dir_signals_series(directory: &Path, parsed: &ParsedName) -> bool {
+    if parsed.is_episode() {
+        return true;
+    }
+    let Ok(reader) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    for entry in reader.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if name.starts_with("season") || name.starts_with('s') && name[1..].chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if stem.to_ascii_lowercase().contains('e') && parse_season_episode(stem).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 fn read_dir_entries(directory: &Path) -> Result<Vec<PathBuf>, String> {
     let mut entries = Vec::new();
-    let reader = std::fs::read_dir(directory)
-        .map_err(|error| format!("读取 {} 失败: {error}", directory.display()))?;
+    let reader = match std::fs::read_dir(directory) {
+        Ok(reader) => reader,
+        // A missing role directory means "nothing there yet"; a dry run must
+        // not create it just to list an empty directory.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+        Err(error) => return Err(format!("读取 {} 失败: {error}", directory.display())),
+    };
     for entry in reader.flatten() {
         entries.push(entry.path());
     }
@@ -846,6 +935,10 @@ pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
     if text.is_empty() {
         return None;
     }
+    // `{tmdb-285322}`-style hints name the TMDB id directly; the id is more
+    // reliable than title matching, and the token must not leak into the title.
+    let tmdb_id = extract_tmdb_id(&text);
+    text = strip_tmdb_tokens(&text);
     // Drop leading bracketed groups like [Group] or 【字幕组】.
     while let Some(rest) = strip_leading_group(&text) {
         text = rest;
@@ -863,8 +956,8 @@ pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
     let mut season = None;
     let mut episode = None;
     let mut year = None;
-    let mut title_parts = Vec::new();
-    for token in tokens {
+    let mut year_index = None;
+    for (index, token) in tokens.iter().enumerate() {
         if let Some((parsed_season, parsed_episode)) = parse_season_episode(token) {
             season = Some(parsed_season);
             episode = Some(parsed_episode);
@@ -877,23 +970,94 @@ pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
         }
         if let Some(parsed_year) = parse_year_token(token) {
             year = Some(parsed_year);
+            year_index = Some(index);
             continue;
         }
-        if is_noise_token(token) {
-            continue;
-        }
-        title_parts.push(token);
     }
-    let title = title_parts.join(" ").trim().to_string();
+    // Release names put the title before the year: `Title.Year.tags...`. Once
+    // a year is known, everything after it is release metadata, not the title.
+    let title_tokens = match year_index {
+        Some(index) => &tokens[..index],
+        None => &tokens[..],
+    };
+    let title = title_tokens
+        .iter()
+        .filter(|token| {
+            !is_noise_token(token)
+                && parse_season_episode(token).is_none()
+                && parse_chinese_episode(token).is_none()
+        })
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
     if title.is_empty() {
         return None;
     }
     Some(ParsedName {
         title,
+        tmdb_id,
         year,
         season,
         episode,
     })
+}
+
+/// Extract `tmdb-123456` / `tmdb=123456` / `tmdbid:123456` hints.
+fn extract_tmdb_id(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    for marker in ["tmdb-", "tmdb=", "tmdb:", "tmdbid-", "tmdbid=", "tmdbid:"] {
+        if let Some(start) = lower.find(marker) {
+            let digits = lower[start + marker.len()..]
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(id) = digits.parse::<i64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Remove `{tmdb-...}` / `[tmdb-...]` tokens from a name so they do not end up
+/// inside the title.
+fn strip_tmdb_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(position) = lower.find("tmdb") else {
+            out.push_str(rest);
+            break;
+        };
+        // Walk back to the opening bracket of the token, if any.
+        let prefix = &rest[..position];
+        let open = prefix
+            .rfind(['{', '['])
+            .filter(|index| prefix[*index + 1..].trim().is_empty());
+        match open {
+            Some(index) => {
+                out.push_str(&prefix[..index]);
+                // Skip to the matching closing bracket.
+                let tail = &rest[position..];
+                let Some(close) = tail.find(['}', ']']) else {
+                    out.push_str(tail);
+                    break;
+                };
+                rest = &tail[close + 1..];
+            }
+            None => {
+                out.push_str(prefix);
+                // Bare `tmdb-123` token: skip the token itself.
+                let tail = &rest[position..];
+                let end = tail
+                    .find(|character: char| character.is_whitespace())
+                    .unwrap_or(tail.len());
+                rest = &tail[end..];
+            }
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn strip_leading_group(text: &str) -> Option<String> {
@@ -1034,6 +1198,28 @@ mod tests {
         let parsed = parse_media_name("[FRDS] The.Matrix.1999.REPACK").expect("parsed");
         assert_eq!(parsed.title, "The Matrix");
         assert_eq!(parsed.year, Some(1999));
+    }
+
+    #[test]
+    fn parses_tmdb_id_hints() {
+        let parsed = parse_media_name("暗潮之下 (2026) {tmdb-285322}").expect("parsed");
+        assert_eq!(parsed.title, "暗潮之下");
+        assert_eq!(parsed.year, Some(2026));
+        assert_eq!(parsed.tmdb_id, Some(285322));
+    }
+
+    #[test]
+    fn strips_tmdb_tokens_from_titles() {
+        assert_eq!(strip_tmdb_tokens("Some Movie {tmdb-42}"), "Some Movie");
+        assert_eq!(strip_tmdb_tokens("Movie [tmdb=42]"), "Movie");
+    }
+
+    #[test]
+    fn parses_release_folder_names() {
+        let parsed = parse_media_name("300.2006.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT").expect("parsed");
+        assert_eq!(parsed.title, "300");
+        assert_eq!(parsed.year, Some(2006));
+        assert!(parsed.tmdb_id.is_none());
     }
 
     #[test]
