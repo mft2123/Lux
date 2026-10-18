@@ -41,7 +41,7 @@
 
 1. **module-settings**：设置文件 + `GET/PUT /api/v1/admin/archive/settings` + 前端设置页
 2. **module-notify**：Telegram bot 通知（入库/归档/失败/洗版）
-3. **module-telethon**：Python 旁挂，Userbot 登录 + 频道监听 5 模式（手动/上新/追更/洗版/全量）
+3. **module-telethon**：Python 旁挂，Userbot 登录 + 频道监听 5 模式（手动/上新/追更/洗版/全量）——侧车已按 review 整改（`feat/telegram-sidecar`），待复核
 4. 存量迁移 + chill 退役（用户要求先跑几天测试，暂缓）
 
 ## 模块分工
@@ -50,7 +50,7 @@
 | --- | --- | --- | --- |
 | 设置与 UI | module-settings.md | `src/application/archive/settings.rs`、`src/api/admin/admin_jobs.rs`、`web/src/features/settings/…` | 待开工 |
 | 通知 | module-notify.md | `src/application/archive/notify.rs`、admin 路由 | 待开工 |
-| Telethon 旁挂 | module-telethon.md | Lux 侧 `src/application/archive.rs` + admin 路由；Python 侧车在 `sidecar/telegram/` | Lux 侧交接已交付（`feat/telegram-ingest`）；侧车由用户对话框推进 |
+| Telethon 旁挂 | module-telethon.md | Lux 侧 `src/application/archive.rs` + admin 路由；Python 侧车在 `sidecar/telegram/` | Lux 侧已合并；侧车已按 review 整改，待复核（`feat/telegram-sidecar`） |
 
 ## 审核规则（总控对话框用）
 

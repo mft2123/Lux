@@ -54,3 +54,30 @@
 ## 完成后汇报
 
 分支名、每条修复的提交哈希、测试命令与结果、仍未解决的事项（例如 115 转存客户端）。
+
+## 完成情况（2026-10-18）
+
+分支 `feat/telegram-sidecar`（worktree `/vol5/1000/build/lux-telegram-sidecar`，基线 `fork/phase-a`）。
+
+| # | 项目 | 状态 |
+| --- | --- | --- |
+| 1 | 清除仓库中的真实凭证 | ✅ `f2ff9698` — 假 api_id `123456`、假号码 `+10000000000`；用真实值全仓 grep → 0 命中（文档里不引真实字面量） |
+| 2 | 投递链路 | ✅ 旁挂侧 `f2ff9698`（默认 `LUX_TG_SINK=http` → `POST /api/v1/admin/archive/ingest`，body `{url,title,mode}`，`X-Lux-Api-Key`）；Lux 侧已在 `fork/phase-a`（`feat/telegram-ingest`） |
+| 3 | Session 加固 | ✅ `0fdcbf14` + `42529388` — `umask 077`、目录 0700/文件 0600、镜像 `USER 10001`、compose 用 `LUX_TG_UID/GID` 对齐设置文件属主；容器内实测 `0o600`/`0o700`、`uid=1000` |
+| 4 | 全量回填取最新消息 | ✅ `0fdcbf14` — 去掉 `reverse=True`，取最新 N 条后按时间顺序处理；单测断言请求参数与顺序 |
+| 5 | 宕机期间消息不丢 | ✅ `0fdcbf14` — `catch_up()` + `channel_state` 游标 `min_id` 补拉，游标只前进 |
+| 6 | 损坏 session 规范化 | ✅ `0fdcbf14` — `sqlite3.Error` → `RunnerError`，exit 2，无 traceback |
+| 7 | 4K/8K 解析 | ✅ `3b8d2ec9` — 体积正则去掉裸 `K/M`；洗版体积未知 → `held` |
+| 8 | 洗版查询认证 | ✅ `3b8d2ec9` + `f2ff9698` — `GET /archive/lookup?title=` 带 `X-Lux-Api-Key`；失败/未知 → `held` |
+| 9 | 提交与文档 | ✅ `42529388` + 本提交 — `.dockerignore`、healthcheck 无 session 非零、inbox 0644、`PROGRESS.md`/`module-telethon.md` |
+
+验收命令与结果：
+
+```
+python3 -m unittest discover -s sidecar/telegram/tests -t sidecar/telegram   # 123 passed
+cargo test --locked --lib archive                                           # 24 passed
+docker build -f sidecar/telegram/Dockerfile -t lux-telegram:1 sidecar/telegram   # ok
+stub Lux 契约冒烟（ingest/lookup/鉴权头）                                      # 6/6
+```
+
+仍未解决：115 转存客户端（U11）；端到端（测试频道 → `链接队列/` 出现 json）需真实登录 + 已部署 Lux，留给总控合并后实测。

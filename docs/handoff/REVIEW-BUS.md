@@ -41,16 +41,43 @@
 
 ## 模块：旁挂（feat/telegram-sidecar，sidecar/telegram）
 
-状态: BLOCKED（并发写入冲突未清）
-分支 / 提交: 无（sidecar/ 仍是未跟踪状态；两个版本互相覆盖过）
+状态: READY
+分支 / 提交: `feat/telegram-sidecar`（worktree `lux-telegram-sidecar`，基线 `fork/phase-a` @ 43f152b1）
+  提交：`3b8d2ec9` `f2ff9698` `0fdcbf14` `42529388`
 逐条:
-- ⏳ F1 投递链路（Lux 侧 ingest 已就绪：feat/telegram-ingest）
-- ⏳ F2 session 0600/0700/非 root
-- ⏳ F3 **真实手机号仍残留**：`sidecar/telegram/tests/test_config.py:162`（提交前必须清）
-- ⏳ F4 全量回填最新优先；F5 catch_up；F6 损坏 session；F7 4K/8K；F8 洗版认证头
-新意见（审核方）:
-- F0 [阻塞] 目录只有一个写入者：请旁挂对话框全权负责 `sidecar/**`，先读 `fix-telegram-sidecar.md`，不要回退已评审版本 — 验收: `git status` 中 sidecar 版本唯一、F1–F8 均有提交
-- F3 [严重] 清除真实手机号后再提交 — 验收: 全仓 grep 真实号码/ api_id 为 0 命中
+- ✅ F0 唯一写入者 — `sidecar/**` 只存在于本分支；本 worktree `git status` 干净；
+  主 worktree 里残留的未跟踪副本未再改动（由总控合并时清理）— 证据: 本分支 `git ls-files sidecar | wc -l` = 26
+- ✅ F1 投递链路 — `f2ff9698`：默认 `LUX_TG_SINK=http`，POST `/api/v1/admin/archive/ingest`，
+  body `{url,title,mode}`，带 `X-Lux-Api-Key`（设置文件 `telegram.api_key`）；`inbox` 降级为诊断
+  — 证据: stub Lux 契约冒烟 6/6（路径/body/鉴权头/lookup 查询串与解析）
+- ✅ F2 session 0600/0700/非 root — `0fdcbf14` + `42529388`：`umask 077`、登录后 `chmod 0600`、
+  目录 `0700`、镜像 `USER 10001`、compose `LUX_TG_UID/GID` 对齐设置文件属主
+  — 证据: 容器内 `session 0o600 / dir 0o700 / uid=1000`
+- ✅ F3 真实手机号清除 — `f2ff9698`：假 api_id `123456`、假号码 `+10000000000`
+  — 证据: 用真实号码与 api_id 做全仓 grep → 0 命中（本文件故意不写这两个字面量，免得文档自己成为命中源）；
+    历史提交里也没有，因为首个提交就是假值
+- ✅ F4 全量回填最新优先 — `0fdcbf14`：`iter_messages(limit=N)` 取最新 N 条，`reversed()` 后按时间处理
+  — 证据: `tests/test_runner.py::BackfillTest`（断言无 `reverse`、按 1,2,3 处理）
+- ✅ F5 catch_up + 游标补拉 — `0fdcbf14`：`client.catch_up()` + `channel_state.last_message_id` 的 `min_id` 补拉
+  — 证据: `tests/test_runner.py::GapBackfillTest`、`tests/test_store.py` 游标用例
+- ✅ F6 损坏 session — `0fdcbf14`：`sqlite3.Error` → `RunnerError("session 文件损坏…")`，exit 2
+  — 证据: `tests/test_runner.py::SessionTest::test_corrupt_session_becomes_runner_error`
+- ✅ F7 4K/8K — `3b8d2ec9`：体积正则只认 GB/TB/MB/KB；`4K/8K/8M` 不产生体积，洗版未知 → `held`
+  — 证据: `tests/test_links.py`、`tests/test_filters.py::WashTest`
+- ✅ F8 洗版认证头 — `3b8d2ec9`（判定表）+ `f2ff9698`（`GET …/archive/lookup` 带 `X-Lux-Api-Key`）
+  — 证据: `tests/test_sink.py::LookupTest`（断言请求头与查询串）、`WashTest`
+- ✅ F9 打包 — `42529388`：`.dockerignore`、healthcheck 改 `check`（无 session → 非零）、inbox 0644
+  — 证据: `docker run … check` 无 session → exit 1；缺 api_key → exit 2
+测试:
+- `python3 -m unittest discover -s sidecar/telegram/tests -t sidecar/telegram` → 123 passed（+1 skip: POSIX-only）
+- `cargo test --locked --lib archive` → 24 passed
+- `docker build -f sidecar/telegram/Dockerfile -t lux-telegram:1 sidecar/telegram` → ok
+- stub Lux 契约冒烟 → 6/6
+遗留:
+- 115 转存客户端（U11）未实现，链接只入队并标 `needs_115_client`
+- 端到端验收（测试频道发链接 → `链接队列/` 出现 json）需真实 Telegram 登录 + 已部署含 ingest 的 Lux，
+  由总控合并后实测；旁挂侧已按契约验证
+  
 
 ---
 
