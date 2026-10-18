@@ -1,7 +1,7 @@
 # Lux 自建媒体库 — 项目交接与规划
 
 > 这份文档写给「下一个对话」。读完它 + `PROGRESS.md` + `REVIEW-BUS.md` 就能接手。
-> 最后更新：2026-10-18 20:55（CST），对应 trunk `7c4dffca`，镜像 `lux:phase-a` = `4813a0cb967b`。
+> 最后更新：2026-10-18 21:05（CST），trunk `f0b05e2e`（文档提交；代码状态 = `7c4dffca`），镜像 `lux:phase-a` = `4813a0cb967b`。
 
 ---
 
