@@ -37,6 +37,8 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/admin/archive/status", get(admin_archive_status))
         .route("/api/v1/admin/archive/run", post(admin_archive_run))
         .route("/api/v1/admin/archive/metadata", post(admin_archive_metadata))
+        .route("/api/v1/admin/archive/ingest", post(admin_archive_ingest))
+        .route("/api/v1/admin/archive/lookup", get(admin_archive_lookup))
         .route("/api/v1/admin/notify/status", get(admin_notify_status))
         .route("/api/v1/admin/notify/test", post(admin_notify_test))
         .route("/api/v1/admin/notify/send", post(admin_notify_send))
@@ -1344,6 +1346,86 @@ pub(crate) async fn admin_archive_metadata(
         )
         .into_response(),
     }
+}
+
+/// `POST /api/v1/admin/archive/ingest` — accept one link from a sidecar
+/// (today: the Telegram watcher) and write it into `<archive_root>/链接队列/`.
+///
+/// The 115 share-link transfer client (plan U11) is not implemented yet, so the
+/// endpoint only validates and queues the link: the pipeline records it with the
+/// `needs_115_client` status and downloads nothing.
+pub(crate) async fn admin_archive_ingest(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(job): Json<crate::application::archive::LinkJob>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let service = crate::application::archive::ArchiveService::new(
+        crate::application::archive::ArchiveConfig::from_env(),
+    );
+    match service.enqueue_link_job(job) {
+        Ok(queued) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "ok": true,
+                "jobId": queued.job_id,
+                "file": queued.file,
+                "status": queued.status,
+                "duplicate": queued.duplicate,
+                "note": crate::application::archive::LINK_JOB_NEEDS_115_REASON,
+            })),
+        )
+            .into_response(),
+        Err(crate::application::archive::LinkIngestError::Invalid(message)) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        Err(error) => api_error(
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            &error.to_string(),
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct ArchiveLookupQuery {
+    #[serde(default)]
+    pub(crate) title: String,
+}
+
+/// `GET /api/v1/admin/archive/lookup?title=` — how big is the library copy of
+/// this title? The wash mode of the Telegram sidecar uses it; a missing entry
+/// answers `{"size_bytes": null}` so the sidecar holds instead of guessing.
+pub(crate) async fn admin_archive_lookup(
+    headers: HeaderMap,
+    Query(query): Query<ArchiveLookupQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let title = query.title.trim();
+    if title.is_empty() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "title 不能为空",
+        )
+        .into_response();
+    }
+    let service = crate::application::archive::ArchiveService::new(
+        crate::application::archive::ArchiveConfig::from_env(),
+    );
+    Json(service.lookup_library_size(title)).into_response()
 }
 
 pub(crate) async fn admin_notify_status(

@@ -54,6 +54,26 @@ const FAILED_DIR: &str = "失败目录";
 const DUPLICATE_DIR: &str = "重复目录";
 const WASH_DIR: &str = "洗版目录";
 
+/// Link hand-off queue: every accepted link becomes one JSON job file here.
+/// Producers (today: the Telegram sidecar) only write; the pipeline consumes
+/// and moves each file into a sub-directory, so a failed consumer never loses
+/// the request.
+const LINK_QUEUE_DIR: &str = "链接队列";
+/// Append-only audit trail of every consumed link job, one JSON object per line.
+const LINK_QUEUE_STATE_FILE: &str = "状态.jsonl";
+const LINK_QUEUE_DONE_DIR: &str = "已处理";
+const LINK_QUEUE_INVALID_DIR: &str = "无效";
+/// `needs_115_client`: the link is valid and queued, but the 115 share-link
+/// transfer client (plan U11) does not exist yet, so nothing is downloaded.
+pub(crate) const LINK_JOB_STATUS_NEEDS_115: &str = "needs_115_client";
+pub(crate) const LINK_JOB_STATUS_INVALID: &str = "invalid";
+pub(crate) const LINK_JOB_NEEDS_115_REASON: &str =
+    "115 转存客户端未实现（U11）：链接已登记，未下载任何内容";
+/// Longest accepted link; share links are far shorter, the cap only stops
+/// junk from filling the queue.
+const LINK_JOB_MAX_URL_CHARS: usize = 2048;
+const LINK_JOB_MAX_TITLE_CHARS: usize = 200;
+
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "avi", "mov", "wmv", "flv", "ts", "m2ts", "webm", "rmvb", "rm", "mpg", "mpeg",
 ];
@@ -178,6 +198,23 @@ impl ArchiveConfig {
         self.root.join(WASH_DIR)
     }
 
+    /// Where producers drop link job files (`<archive_root>/链接队列/`).
+    pub(crate) fn link_queue_dir(&self) -> PathBuf {
+        self.root.join(LINK_QUEUE_DIR)
+    }
+
+    pub(crate) fn link_state_file(&self) -> PathBuf {
+        self.link_queue_dir().join(LINK_QUEUE_STATE_FILE)
+    }
+
+    pub(crate) fn link_done_dir(&self) -> PathBuf {
+        self.link_queue_dir().join(LINK_QUEUE_DONE_DIR)
+    }
+
+    pub(crate) fn link_invalid_dir(&self) -> PathBuf {
+        self.link_queue_dir().join(LINK_QUEUE_INVALID_DIR)
+    }
+
     /// Create every directory role. Idempotent.
     pub(crate) fn ensure_directories(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.transfer_dir())?;
@@ -186,6 +223,7 @@ impl ArchiveConfig {
         std::fs::create_dir_all(self.failed_dir())?;
         std::fs::create_dir_all(self.duplicate_dir())?;
         std::fs::create_dir_all(self.wash_dir())?;
+        std::fs::create_dir_all(self.link_queue_dir())?;
         Ok(())
     }
 }
@@ -230,6 +268,165 @@ pub(crate) struct WashedItem {
 pub(crate) struct FailedItem {
     pub(crate) source: String,
     pub(crate) reason: String,
+}
+
+/// One link handed to the archive pipeline. The same shape is accepted by
+/// `POST /api/v1/admin/archive/ingest` and stored as one `*.json` job file in
+/// `链接队列/`; `jobId` and `receivedAtUnix` are assigned by Lux, so a
+/// hand-written file only needs `url`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct LinkJob {
+    #[serde(default)]
+    pub(crate) job_id: String,
+    #[serde(default)]
+    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+    #[serde(default)]
+    pub(crate) source: Option<String>,
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+    #[serde(default)]
+    pub(crate) channel: Option<String>,
+    #[serde(default)]
+    pub(crate) message_id: Option<i64>,
+    #[serde(default)]
+    pub(crate) size_bytes: Option<i64>,
+    #[serde(default)]
+    pub(crate) captured_at: Option<String>,
+    #[serde(default)]
+    pub(crate) received_at_unix: i64,
+}
+
+impl LinkJob {
+    /// API path: validate the URL, clean the text fields and assign a fresh
+    /// job id (`<毫秒时间戳>-<标题 slug>`) plus receipt time. A producer-supplied
+    /// `jobId` is deliberately ignored so it can never walk out of the queue
+    /// directory.
+    fn normalized(mut self) -> Result<Self, String> {
+        self = self.cleaned()?;
+        self.job_id = format!(
+            "{}-{}",
+            unix_millis(),
+            link_slug(self.title.as_deref(), &self.url)
+        );
+        self.received_at_unix = unix_now();
+        Ok(self)
+    }
+
+    /// Queue path: validate and clean, but keep the id / receipt time the file
+    /// already carries, otherwise the state record and the file name disagree.
+    /// Only a hand-written job without those fields gets them filled in.
+    fn accept_queued(mut self) -> Result<Self, String> {
+        self = self.cleaned()?;
+        if self.job_id.trim().is_empty() {
+            self.job_id = format!(
+                "{}-{}",
+                unix_millis(),
+                link_slug(self.title.as_deref(), &self.url)
+            );
+        }
+        if self.received_at_unix <= 0 {
+            self.received_at_unix = unix_now();
+        }
+        Ok(self)
+    }
+
+    fn cleaned(mut self) -> Result<Self, String> {
+        self.url = validate_link_url(&self.url)?;
+        self.title = clean_optional_text(self.title, LINK_JOB_MAX_TITLE_CHARS);
+        self.mode = clean_optional_text(self.mode, 32);
+        self.source = clean_optional_text(self.source, 32);
+        self.kind = clean_optional_text(self.kind, 32);
+        self.channel = clean_optional_text(self.channel, 128);
+        self.captured_at = clean_optional_text(self.captured_at, 64);
+        Ok(self)
+    }
+}
+
+/// What the queue consumer did with one job file.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AcceptedLinkJob {
+    pub(crate) job_id: String,
+    pub(crate) url: String,
+    pub(crate) file: String,
+    pub(crate) status: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LinkQueueReport {
+    pub(crate) dry_run: bool,
+    pub(crate) examined: usize,
+    pub(crate) accepted: Vec<AcceptedLinkJob>,
+    pub(crate) invalid: Vec<FailedItem>,
+    pub(crate) skipped_incomplete: Vec<String>,
+}
+
+/// One line of `链接队列/状态.jsonl`.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct LinkJobStateRecord {
+    pub(crate) recorded_at_unix: i64,
+    pub(crate) status: &'static str,
+    pub(crate) job_id: String,
+    pub(crate) url: String,
+    pub(crate) title: String,
+    pub(crate) mode: String,
+    pub(crate) source: String,
+    pub(crate) reason: String,
+    pub(crate) job_file: String,
+}
+
+/// The subset of a state record needed to answer "is this URL already queued?".
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LinkStateLine {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    job_id: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    job_file: String,
+}
+
+/// A link job that was written to the queue (or found already queued).
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct QueuedLinkJob {
+    pub(crate) job_id: String,
+    pub(crate) file: String,
+    pub(crate) status: &'static str,
+    /// `true` when the same URL was already waiting or already consumed, in
+    /// which case nothing new was written (the ingest endpoint is idempotent
+    /// on the URL).
+    pub(crate) duplicate: bool,
+}
+
+/// Transport-agnostic ingest failure: `Invalid` is the caller's fault (400),
+/// `Storage` means the archive root could not be written (500).
+#[derive(Clone, Debug)]
+pub(crate) enum LinkIngestError {
+    Invalid(String),
+    Storage(String),
+}
+
+impl fmt::Display for LinkIngestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LinkIngestError::Invalid(message) | LinkIngestError::Storage(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+/// Result of the wash-mode "how big is our copy" query.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct LibraryLookup {
+    pub(crate) title: String,
+    pub(crate) matched: Option<String>,
+    pub(crate) size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -376,6 +573,17 @@ impl ArchiveService {
             ..ArchiveReport::default()
         };
 
+        let link_queue = self.ingest_link_queue(dry_run)?;
+        if link_queue.examined > 0 {
+            tracing::info!(
+                dry_run = link_queue.dry_run,
+                examined = link_queue.examined,
+                accepted = link_queue.accepted.len(),
+                invalid = link_queue.invalid.len(),
+                incomplete = link_queue.skipped_incomplete.len(),
+                "link queue consumed; accepted links wait for the 115 transfer client"
+            );
+        }
         let ingested = self.ingest_watch_dirs(dry_run).await?;
         if !ingested.is_empty() {
             tracing::info!(
@@ -1247,6 +1455,271 @@ impl ArchiveService {
         Ok(moved)
     }
 
+    /// Write one link job into `链接队列/` for the pipeline to pick up.
+    ///
+    /// The write is atomic (temp file + rename) so the consumer never reads a
+    /// half-written job; the URL is validated first so a job file always has a
+    /// fetchable share link. **Idempotent on the URL**: a link that is already
+    /// waiting in the queue, or was already consumed (recorded in
+    /// `状态.jsonl`), is not queued twice — the existing job is returned with
+    /// `duplicate: true`.
+    pub(crate) fn enqueue_link_job(&self, job: LinkJob) -> Result<QueuedLinkJob, LinkIngestError> {
+        let job = job.normalized().map_err(LinkIngestError::Invalid)?;
+        let queue = self.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).map_err(|error| {
+            LinkIngestError::Storage(format!("无法创建链接队列 {}: {error}", queue.display()))
+        })?;
+        if let Some(existing) = self.find_existing_link_job(&job.url) {
+            tracing::info!(
+                url = %job.url,
+                job_id = %existing.job_id,
+                file = %existing.file,
+                "link job already queued or already consumed; not queued again"
+            );
+            return Ok(QueuedLinkJob {
+                job_id: existing.job_id,
+                file: existing.file,
+                status: LINK_JOB_STATUS_NEEDS_115,
+                duplicate: true,
+            });
+        }
+        let name = format!("{}.json", job.job_id);
+        let target = unique_target(&queue, &name);
+        let body = serde_json::to_string_pretty(&job).map_err(|error| {
+            LinkIngestError::Storage(format!("序列化链接任务失败: {error}"))
+        })?;
+        let temp = queue.join(format!(".{}.tmp", job.job_id));
+        std::fs::write(&temp, body.as_bytes())
+            .map_err(|error| LinkIngestError::Storage(format!("写入 {} 失败: {error}", temp.display())))?;
+        std::fs::rename(&temp, &target).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            LinkIngestError::Storage(format!("提交 {} 失败: {error}", target.display()))
+        })?;
+        tracing::info!(
+            job_id = %job.job_id,
+            url = %job.url,
+            title = job.title.as_deref().unwrap_or(""),
+            mode = job.mode.as_deref().unwrap_or(""),
+            file = %target.display(),
+            "link job queued"
+        );
+        Ok(QueuedLinkJob {
+            job_id: job.job_id,
+            file: target.display().to_string(),
+            status: LINK_JOB_STATUS_NEEDS_115,
+            duplicate: false,
+        })
+    }
+
+    /// Find a job for `url` that is either still waiting in the queue or
+    /// already recorded in the state file. Used to make ingest idempotent.
+    fn find_existing_link_job(&self, url: &str) -> Option<QueuedLinkJob> {
+        for entry in read_dir_entries(&self.config.link_queue_dir()).ok()? {
+            if entry.extension().is_none_or(|extension| !extension.eq_ignore_ascii_case("json")) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry) else {
+                continue;
+            };
+            let Ok(job) = serde_json::from_str::<LinkJob>(&text) else {
+                continue;
+            };
+            if job.url == url {
+                return Some(QueuedLinkJob {
+                    job_id: job.job_id,
+                    file: entry.display().to_string(),
+                    status: LINK_JOB_STATUS_NEEDS_115,
+                    duplicate: true,
+                });
+            }
+        }
+        let Ok(text) = std::fs::read_to_string(self.config.link_state_file()) else {
+            return None;
+        };
+        // Newest record last: walk backwards so the most recent match wins.
+        for line in text.lines().rev() {
+            let Ok(record) = serde_json::from_str::<LinkStateLine>(line) else {
+                continue;
+            };
+            if record.url == url && record.status != LINK_JOB_STATUS_INVALID {
+                return Some(QueuedLinkJob {
+                    job_id: record.job_id,
+                    file: self
+                        .config
+                        .link_done_dir()
+                        .join(&record.job_file)
+                        .display()
+                        .to_string(),
+                    status: LINK_JOB_STATUS_NEEDS_115,
+                    duplicate: true,
+                });
+            }
+        }
+        None
+    }
+
+    /// Consume the JSON job files in `链接队列/`.
+    ///
+    /// The 115 share-link transfer client (plan U11) does not exist yet, so an
+    /// accepted job is **not** transferred or downloaded: it is recorded in
+    /// `链接队列/状态.jsonl` with the `needs_115_client` status, moved into
+    /// `链接队列/已处理/` and logged. Junk is quarantined in
+    /// `链接队列/无效/`. Nothing outside the archive root is touched.
+    pub(crate) fn ingest_link_queue(&self, dry_run: bool) -> Result<LinkQueueReport, String> {
+        let queue = self.config.link_queue_dir();
+        let entries = read_dir_entries(&queue)?;
+        let mut report = LinkQueueReport {
+            dry_run,
+            ..LinkQueueReport::default()
+        };
+        for entry in entries {
+            let name = entry
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // `状态.jsonl` shares the directory but is not a job file; the
+            // `已处理/` and `无效/` sub-directories are skipped below.
+            if name.starts_with('.') || !name.ends_with(".json") {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&entry) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            report.examined += 1;
+            let text = match std::fs::read_to_string(&entry) {
+                Ok(text) => text,
+                Err(error) => {
+                    // Unreadable right now (permissions, transient IO): retry
+                    // next run instead of quarantining a good job.
+                    report.skipped_incomplete.push(format!("{name} ({error})"));
+                    continue;
+                }
+            };
+            let job = match serde_json::from_str::<LinkJob>(&text) {
+                Ok(job) => match job.accept_queued() {
+                    Ok(job) => job,
+                    Err(reason) => {
+                        self.reject_link_job(&mut report, &entry, &name, &reason, dry_run);
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    // A foreign writer may still be writing the file; only a
+                    // settled file that still does not parse is junk.
+                    if !entry_is_settled(&entry, self.config.settle_seconds) {
+                        report.skipped_incomplete.push(name);
+                        continue;
+                    }
+                    let reason = format!("任务文件不是合法的 JSON: {error}");
+                    self.reject_link_job(&mut report, &entry, &name, &reason, dry_run);
+                    continue;
+                }
+            };
+            if dry_run {
+                report.accepted.push(AcceptedLinkJob {
+                    job_id: job.job_id,
+                    url: job.url,
+                    file: name,
+                    status: LINK_JOB_STATUS_NEEDS_115,
+                });
+                continue;
+            }
+            let record = LinkJobStateRecord {
+                recorded_at_unix: unix_now(),
+                status: LINK_JOB_STATUS_NEEDS_115,
+                job_id: job.job_id.clone(),
+                url: job.url.clone(),
+                title: job.title.clone().unwrap_or_default(),
+                mode: job.mode.clone().unwrap_or_default(),
+                source: job.source.clone().unwrap_or_default(),
+                reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+                job_file: name.clone(),
+            };
+            let state_path = self.config.link_state_file();
+            append_link_state(&state_path, &record).map_err(|error| {
+                format!("写链接状态文件 {} 失败: {error}", state_path.display())
+            })?;
+            let done = unique_target(&self.config.link_done_dir(), &name);
+            move_entry(&entry, &done).map_err(|error| {
+                format!("移动任务文件 {name} 失败: {error}")
+            })?;
+            tracing::warn!(
+                job_id = %record.job_id,
+                url = %record.url,
+                title = %record.title,
+                mode = %record.mode,
+                "link job needs the 115 transfer client (not implemented): recorded, nothing downloaded"
+            );
+            report.accepted.push(AcceptedLinkJob {
+                job_id: record.job_id,
+                url: record.url,
+                file: done.display().to_string(),
+                status: LINK_JOB_STATUS_NEEDS_115,
+            });
+        }
+        Ok(report)
+    }
+
+    fn reject_link_job(
+        &self,
+        report: &mut LinkQueueReport,
+        entry: &Path,
+        name: &str,
+        reason: &str,
+        dry_run: bool,
+    ) {
+        report.invalid.push(FailedItem {
+            source: name.to_owned(),
+            reason: reason.to_owned(),
+        });
+        tracing::warn!(file = %name, reason, "link job rejected");
+        if dry_run {
+            return;
+        }
+        let record = LinkJobStateRecord {
+            recorded_at_unix: unix_now(),
+            status: LINK_JOB_STATUS_INVALID,
+            job_id: String::new(),
+            url: String::new(),
+            title: String::new(),
+            mode: String::new(),
+            source: String::new(),
+            reason: reason.to_owned(),
+            job_file: name.to_owned(),
+        };
+        if let Err(error) = append_link_state(&self.config.link_state_file(), &record) {
+            tracing::warn!(%error, file = %name, "failed to record a rejected link job");
+        }
+        let target = unique_target(&self.config.link_invalid_dir(), name);
+        if let Err(error) = move_entry(entry, &target) {
+            tracing::warn!(%error, file = %name, "failed to quarantine a rejected link job");
+        }
+    }
+
+    /// Wash-mode support: how big is the copy we already have? Name-based and
+    /// metadata-only (no content is read): the biggest directory under
+    /// `媒体目录/` whose name looks like the requested title wins.
+    pub(crate) fn lookup_library_size(&self, title: &str) -> LibraryLookup {
+        let mut lookup = LibraryLookup {
+            title: title.trim().to_owned(),
+            ..LibraryLookup::default()
+        };
+        let query = normalize_title_key(&lookup.title);
+        if query.is_empty() {
+            return lookup;
+        }
+        let mut best: Option<(String, u64)> = None;
+        collect_library_entries(&self.config.media_dir(), 0, &query, &mut best);
+        if let Some((name, size)) = best {
+            lookup.matched = Some(name);
+            lookup.size_bytes = Some(size);
+        }
+        lookup
+    }
+
     pub(crate) fn status(&self) -> ArchiveStatus {
         ArchiveStatus {
             root: self.config.root.display().to_string(),
@@ -1256,6 +1729,9 @@ impl ArchiveService {
             failed_dir: self.config.failed_dir().display().to_string(),
             duplicate_dir: self.config.duplicate_dir().display().to_string(),
             wash_dir: self.config.wash_dir().display().to_string(),
+            link_queue_dir: self.config.link_queue_dir().display().to_string(),
+            link_state_file: self.config.link_state_file().display().to_string(),
+            pending_link_jobs: count_link_jobs(&self.config.link_queue_dir()),
             settle_seconds: self.config.settle_seconds,
             wash_enabled: self.config.wash_enabled,
             wash_tolerance_ratio: self.config.wash_tolerance_ratio,
@@ -2097,11 +2573,190 @@ pub(crate) struct ArchiveStatus {
     pub(crate) failed_dir: String,
     pub(crate) duplicate_dir: String,
     pub(crate) wash_dir: String,
+    /// `<root>/链接队列/`: where ingest jobs are written.
+    #[serde(default)]
+    pub(crate) link_queue_dir: String,
+    /// `<root>/链接队列/状态.jsonl`: append-only job audit trail.
+    #[serde(default)]
+    pub(crate) link_state_file: String,
+    /// Job files waiting in the queue right now.
+    #[serde(default)]
+    pub(crate) pending_link_jobs: usize,
     pub(crate) settle_seconds: u64,
     pub(crate) wash_enabled: bool,
     pub(crate) wash_tolerance_ratio: f64,
     pub(crate) watch_dirs: Vec<String>,
     pub(crate) tmdb_configured: bool,
+}
+
+/// Only real share links may enter the queue: a `file://` URL (or a crafted
+/// `javascript:` one) must never reach a future transfer client.
+pub(crate) fn validate_link_url(raw: &str) -> Result<String, String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err("url 不能为空".to_owned());
+    }
+    if url.chars().count() > LINK_JOB_MAX_URL_CHARS {
+        return Err(format!(
+            "url 过长（上限 {LINK_JOB_MAX_URL_CHARS} 字符）"
+        ));
+    }
+    if url.chars().any(|character| character.is_control() || character.is_whitespace()) {
+        return Err("url 不能含空白或控制字符".to_owned());
+    }
+    let lowered = url.to_ascii_lowercase();
+    const ALLOWED: &[&str] = &["https://", "http://", "magnet:", "ed2k://"];
+    if !ALLOWED.iter().any(|prefix| lowered.starts_with(prefix)) {
+        return Err("不支持的链接协议（只接受 http(s) / magnet / ed2k）".to_owned());
+    }
+    Ok(url.to_owned())
+}
+
+/// Human-readable, file-name-safe job slug: alphanumerics and CJK kept,
+/// everything else collapsed to `-`, capped at 40 characters.
+fn link_slug(title: Option<&str>, url: &str) -> String {
+    let source = title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(url);
+    let mut slug = String::new();
+    let mut length = 0;
+    for character in source.chars() {
+        if character.is_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            length += 1;
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+            length += 1;
+        }
+        if length >= 40 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        "link".to_owned()
+    } else {
+        slug
+    }
+}
+
+/// Trim, drop control characters and cap the length (queue metadata only).
+fn clean_optional_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    let value = value?;
+    let cleaned: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed: String = cleaned.chars().take(max_chars).collect();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
+}
+
+fn count_link_jobs(directory: &Path) -> usize {
+    let Ok(reader) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    reader
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .count()
+}
+
+/// Append one JSON line to the job state file. `0600`: share links are private.
+fn append_link_state(path: &Path, record: &LinkJobStateRecord) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut line = serde_json::to_string(record).map_err(std::io::Error::other)?;
+    line.push('\n');
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()
+}
+
+/// Comparison key for library titles: lowercase alphanumerics only, so
+/// `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
+fn normalize_title_key(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+/// Heuristic title match between a requested title and a library directory
+/// name. Exact containment wins; otherwise a long enough common prefix counts,
+/// because a Telegram title usually carries extra tags (`4K`, `HDR`, …) that
+/// the library directory does not.
+fn library_title_matches(query: &str, entry: &str) -> bool {
+    if query.is_empty() || entry.is_empty() {
+        return false;
+    }
+    if entry.contains(query) || query.contains(entry) {
+        return true;
+    }
+    let common = query
+        .chars()
+        .zip(entry.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let shorter = query.chars().count().min(entry.chars().count());
+    shorter >= 4 && common * 5 >= shorter * 3
+}
+
+/// Walk `媒体目录/` (four levels: type / region / year / title, and the shorter
+/// 晚会 chain) collecting the biggest directory whose name matches `query`.
+fn collect_library_entries(
+    directory: &Path,
+    depth: usize,
+    query: &str,
+    best: &mut Option<(String, u64)>,
+) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(reader) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in reader.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        if library_title_matches(query, &normalize_title_key(&name)) {
+            let size = path_size(&path);
+            if best.as_ref().is_none_or(|(_, current)| size > *current) {
+                *best = Some((name.clone(), size));
+            }
+        }
+        collect_library_entries(&path, depth + 1, query, best);
+    }
 }
 
 #[cfg(test)]
@@ -2326,5 +2981,247 @@ mod tests {
         assert_eq!(sanitize_component("A/B: C*?"), "A B： C");
         assert_eq!(sanitize_component("20:23"), "20：23");
         assert_eq!(sanitize_component("  .  "), "未命名");
+    }
+
+    fn archive_config(root: &std::path::Path) -> ArchiveConfig {
+        ArchiveConfig {
+            root: root.to_path_buf(),
+            tmdb_api_key: None,
+            tmdb_language: "zh-CN".to_owned(),
+            watch_dirs: Vec::new(),
+            mirror_root: root.join("镜像库"),
+            cd2_prefix: String::new(),
+            cd2_container_mount: "/media/cloud".to_owned(),
+            settle_seconds: 0,
+            wash_enabled: true,
+            wash_tolerance_ratio: 0.02,
+        }
+    }
+
+    /// One link job as the Telegram sidecar posts it.
+    fn link_job(url: &str) -> LinkJob {
+        LinkJob {
+            url: url.to_owned(),
+            title: Some("某剧 第二季 4K".to_owned()),
+            mode: Some("上新".to_owned()),
+            source: Some("telegram".to_owned()),
+            ..LinkJob::default()
+        }
+    }
+
+    #[test]
+    fn accepts_only_real_share_links() {
+        assert_eq!(
+            validate_link_url(" https://115.com/s/abc?password=1 ").unwrap(),
+            "https://115.com/s/abc?password=1"
+        );
+        assert!(validate_link_url("http://example.com/a").is_ok());
+        assert!(validate_link_url("magnet:?xt=urn:btih:abc").is_ok());
+        assert!(validate_link_url("ed2k://|file|a.mkv|1|HASH|/").is_ok());
+        assert!(validate_link_url("").is_err());
+        assert!(validate_link_url("file:///etc/passwd").is_err());
+        assert!(validate_link_url("javascript:alert(1)").is_err());
+        assert!(validate_link_url("https://115.com/s/a b").is_err());
+        let long = format!("https://115.com/s/{}", "a".repeat(3000));
+        assert!(validate_link_url(&long).is_err());
+    }
+
+    #[test]
+    fn normalizes_link_job_fields() {
+        let job = LinkJob {
+            url: " https://115.com/s/abc ".to_owned(),
+            title: Some("  某剧\n 第二季  ".to_owned()),
+            mode: Some(" 上新 ".to_owned()),
+            ..LinkJob::default()
+        }
+        .normalized()
+        .expect("valid job");
+        assert_eq!(job.url, "https://115.com/s/abc");
+        assert_eq!(job.title.as_deref(), Some("某剧 第二季"));
+        assert_eq!(job.mode.as_deref(), Some("上新"));
+        assert!(job.received_at_unix > 0);
+        // `<毫秒时间戳>-<标题 slug>`: sortable, human readable, path safe.
+        let (millis, slug) = job.job_id.split_once('-').expect("timestamp-slug");
+        assert!(millis.chars().all(|character| character.is_ascii_digit()));
+        assert_eq!(slug, "某剧-第二季");
+        assert!(!job.job_id.contains('/') && !job.job_id.contains(".."));
+
+        // A producer-supplied id is ignored, so it cannot escape the queue dir.
+        let supplied = LinkJob {
+            job_id: "../逃逸 id".to_owned(),
+            url: "https://115.com/s/abc".to_owned(),
+            ..LinkJob::default()
+        }
+        .normalized()
+        .expect("valid job");
+        assert!(!supplied.job_id.contains('/') && !supplied.job_id.contains('.'));
+        // No title -> the URL supplies the slug.
+        let untitled = LinkJob {
+            url: "magnet:?xt=urn:btih:abc".to_owned(),
+            ..LinkJob::default()
+        }
+        .normalized()
+        .expect("valid job");
+        assert!(untitled.job_id.ends_with("-magnet-xt-urn-btih-abc"));
+    }
+
+    #[test]
+    fn queues_and_consumes_link_jobs() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queued = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+        assert!(Path::new(&queued.file).exists());
+        assert_eq!(queued.status, LINK_JOB_STATUS_NEEDS_115);
+        assert!(!queued.duplicate);
+        assert_eq!(service.status().pending_link_jobs, 1);
+        assert!(
+            queued.file.ends_with("-某剧-第二季-4k.json"),
+            "job file name: {}",
+            queued.file
+        );
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_NEEDS_115);
+        assert!(report.invalid.is_empty());
+
+        // Nothing was transferred or downloaded: the queue is empty and no
+        // media/pending directory was created.
+        assert_eq!(service.status().pending_link_jobs, 0);
+        assert!(!tmp.path().join(TRANSFER_DIR).exists());
+        assert!(!tmp.path().join(PENDING_DIR).exists());
+        assert!(!tmp.path().join(MEDIA_DIR).exists());
+
+        // The job is recorded once, with the reason the operator needs, and the
+        // record keeps the id the file was named after.
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(state.lines().count(), 1);
+        assert!(state.contains(LINK_JOB_STATUS_NEEDS_115));
+        assert!(state.contains("https://115.com/s/abc"));
+        assert!(state.contains(LINK_JOB_NEEDS_115_REASON));
+        assert!(
+            state.contains(&queued.job_id),
+            "state record must keep job id {}: {state}",
+            queued.job_id
+        );
+
+        // Consuming twice is a no-op: the file moved into 已处理/.
+        let again = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(again.examined, 0);
+        assert_eq!(
+            std::fs::read_dir(service.config.link_done_dir())
+                .expect("done dir")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn link_ingest_is_idempotent_on_the_url() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+
+        let first = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+        // Same link while it is still waiting -> no second file.
+        let again = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+        assert!(again.duplicate);
+        assert_eq!(again.job_id, first.job_id);
+        assert_eq!(service.status().pending_link_jobs, 1);
+
+        service.ingest_link_queue(false).expect("consumed");
+        // Same link after consumption -> still no second file.
+        let third = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+        assert!(third.duplicate);
+        assert_eq!(third.job_id, first.job_id);
+        assert_eq!(service.status().pending_link_jobs, 0);
+
+        // A different link is queued normally.
+        let other = service
+            .enqueue_link_job(link_job("https://115.com/s/def"))
+            .expect("queued");
+        assert!(!other.duplicate);
+        assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    #[test]
+    fn quarantines_unusable_link_jobs() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        std::fs::write(queue.join("broken.json"), b"not json").unwrap();
+        std::fs::write(queue.join("evil.json"), br#"{"url":"file:///etc/passwd"}"#).unwrap();
+        // `状态.jsonl` shares the directory but is not a job.
+        std::fs::write(queue.join(LINK_QUEUE_STATE_FILE), b"{}\n").unwrap();
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 2);
+        assert_eq!(report.invalid.len(), 2);
+        assert!(report.accepted.is_empty());
+        assert_eq!(
+            std::fs::read_dir(service.config.link_invalid_dir())
+                .expect("invalid dir")
+                .count(),
+            2
+        );
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(
+            state
+                .lines()
+                .filter(|line| line.contains(LINK_JOB_STATUS_INVALID))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn link_queue_keeps_unsettled_junk_for_the_next_run() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = archive_config(tmp.path());
+        config.settle_seconds = 3600;
+        let service = ArchiveService::new_for_tests(config);
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        std::fs::write(queue.join("writing.json"), b"{\"url\":").unwrap();
+
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.skipped_incomplete.len(), 1);
+        assert!(report.invalid.is_empty());
+        assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    #[test]
+    fn lookup_finds_the_library_copy() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电视剧")
+            .join("国内")
+            .join("2024")
+            .join("某剧 第二季 (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("S01E01.mkv"), vec![0u8; 1024]).unwrap();
+
+        // The Telegram title carries extra tags the library directory does not.
+        let lookup = service.lookup_library_size("某剧 第二季 4K");
+        assert_eq!(lookup.matched.as_deref(), Some("某剧 第二季 (2024)"));
+        assert_eq!(lookup.size_bytes, Some(1024));
+
+        let missing = service.lookup_library_size("完全不同的剧");
+        assert_eq!(missing.matched, None);
+        assert_eq!(missing.size_bytes, None);
+        assert_eq!(service.lookup_library_size("   ").size_bytes, None);
     }
 }
