@@ -1,0 +1,37 @@
+# 把这段并进 Lux 仓库根目录的 compose.yaml（本模块不直接改根文件）。
+#
+# 前置：
+#   mkdir -p /vol5/1000/build/lux-telegram/{session,state}
+#   chown -R 10001:10001 /vol5/1000/build/lux-telegram
+#   chmod 700 /vol5/1000/build/lux-telegram/session
+#   在 /vol5/1000/build/archive-settings.json 的 telegram 段里填 api_key
+#   （Lux 管理 API key：管理页「API key」或 POST /api/v1/admin/api-key/rotate）
+#
+# 首次登录：`docker compose up -d telegram` 后看日志里的验证码提示，
+# 把收到的验证码写进 /vol5/1000/build/lux-telegram/session/code.txt
+# （或在 `docker attach lux-telegram` 的终端里直接敲）。
+services:
+  telegram:
+    build:
+      context: ./sidecar/telegram
+    image: lux-telegram:1
+    container_name: lux-telegram
+    # 非 root：session 授权密钥不该只有 root 能读
+    user: "10001:10001"
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      LUX_ARCHIVE_SETTINGS: /config/archive-settings.json
+      LUX_TG_SESSION_DIR: /app/session
+      LUX_TG_STATE_DIR: /app/state
+      LUX_TG_LOG_LEVEL: INFO
+      LUX_TG_BACKFILL_LIMIT: "200"
+      LUX_TG_GAP_LIMIT: "200"
+      # 走 Lux 项目网络时用服务名；单独跑这段 compose 的话改成 http://<nas-ip>:8097
+      LUX_TG_LUX_BASE: http://lux:8097
+      # 有二步验证时一次性传入（平时留空）
+      # TG_2FA_PASSWORD: ""
+    volumes:
+      - /vol5/1000/build/archive-settings.json:/config/archive-settings.json:ro
+      - /vol5/1000/build/lux-telegram/session:/app/session
+      - /vol5/1000/build/lux-telegram/state:/app/state

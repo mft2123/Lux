@@ -35,3 +35,59 @@ sidecar/telegram/
 - 测试频道发一条链接，`/watch-inbox/` 出现对应文件，Lux 随后自动整理
 - 五种模式各有单元测试（消息过滤逻辑），不依赖真实 TG
 - 日志不含 api_hash/phone 明文
+
+## 交付状态（2026-10-18，review 整改后）
+
+分支 `feat/telegram-sidecar`（worktree `/vol5/1000/build/lux-telegram-sidecar`，基线 `fork/phase-a`）。
+状态以 `docs/handoff/REVIEW-BUS.md` 的「旁挂」一节为准。
+
+| 提交 | 内容 |
+| --- | --- |
+| `3b8d2ec9` | F7 体积单位（4K/8K/8M 不算体积）+ F8 洗版判定表（三要素缺一即 held） |
+| `f2ff9698` | F1 默认投递到 Lux ingest（`{url,title,mode}` + `X-Lux-Api-Key`）+ F8 lookup 鉴权 + F3 假凭证 |
+| `0fdcbf14` | F2 权限加固、F4 回填取最新、F5 catch_up/游标补拉、F6 损坏 session 干净报错 |
+| `42529388` | F2/F9 非 root 镜像、`.dockerignore`、healthcheck 无 session 时非零 |
+
+Lux 侧的 ingest/lookup 由 `feat/telegram-ingest` 实现并已合并到 `fork/phase-a`
+（`POST /api/v1/admin/archive/ingest`、`GET /api/v1/admin/archive/lookup`、
+`<archive_root>/链接队列/` 与状态文件）。本模块只消费这两个接口，不改 Rust 文件。
+
+逐条对照本 brief：
+
+| 文档要求 | 实现 |
+| --- | --- |
+| `main.py`：读配置 → 登录 → 监听 → 投递 | `run`（首次运行即登录）/ `status` / `check` / `held` / `replay` |
+| `requirements.txt` = telethon | `telethon==1.45.0`，其余全用标准库 |
+| `session/` 是卷 | 默认 `sidecar/telegram/session/`，容器 `/app/session`；**目录 0700、文件 0600** |
+| 读 `archive-settings.json` 的 telegram 段 | `tgwatch/config.py` 只读；另读 `telegram.api_key` 与顶层 `wash_tolerance_ratio` |
+| 登录：日志提示 + 在 `session/` 下录入 | `runner.code_provider()`：提示进日志，读 `session/code.txt`（读走即删）或 tty 直接敲 |
+| 2FA：`TG_2FA_PASSWORD` | 同名环境变量，只进 `client.start(password=)`，不进日志 |
+| 投递 A：`POST …/archive/ingest` | **默认通道** `{url,title,mode}` + `X-Lux-Api-Key`（Lux `LinkJob` 就这三个字段起） |
+| 投递 B：`/watch-inbox/<ts>-<slug>.txt` | `LUX_TG_SINK=inbox` 时可用（诊断用；`ingest_watch_dirs` 只收视频，不作正式通道） |
+| 手动 | `held`，`main.py replay --all` 才投递 |
+| 上新 | 新消息含链接即投递；启动时 `catch_up()` + 游标补拉宕机窗口 |
+| 追更 | 只匹配**链接标题**（锚文本/正文首行），支持 `/正则/` |
+| 洗版 | `GET /archive/lookup?title=` 查库中体积，按 `wash_tolerance_ratio` 比较；体积未知/查询失败一律 `held` |
+| 全量 | 所有链接投递 + 启动时回填**最新** N 条（按时间顺序处理） |
+| 验收：session 持久化 | 0600 落卷；重启走已授权分支不再要码 |
+| 验收：五模式单测、不依赖真实 TG | `tests/test_filters.py` + `tests/test_runner.py`，全库 123 个离线用例 |
+| 验收：日志不含 api_hash/phone | `tgwatch/logsafe.py`（api_key 一并脱敏）+ `tests/test_logsafe.py` |
+
+## 验证记录（NAS）
+
+```
+python3 -m unittest discover -s sidecar/telegram/tests -t sidecar/telegram   # 123 passed
+cargo test --locked --lib archive                                           # 24 passed
+docker build -f sidecar/telegram/Dockerfile -t lux-telegram:1 sidecar/telegram
+docker run --rm --entrypoint id lux-telegram:1                              # uid=10001(lux)
+# 容器内 harden_permissions 实测：session 0o600、目录 0o700
+# check 无 session → exit 1；缺 api_key → exit 2 并给出可操作提示
+# stub Lux 契约冒烟 6/6：路径、body、X-Lux-Api-Key、lookup 查询串与解析
+```
+
+## 遗留
+
+- **115 转存客户端（计划 U11）未实现**：Lux ingest 只入队并把状态记成 `needs_115_client`，
+  链接还不会真的转存。端到端验收（测试频道发链接 → `链接队列/` 出现 json）需要真实登录 +
+  已部署含 ingest 的 Lux，留给总控合并后实测。
+- `listen_channels` 需要运维填（设置页 UI 归 module-settings）；当前线上设置是手动模式且频道为空。

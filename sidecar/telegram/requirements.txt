@@ -1,0 +1,2 @@
+# Telethon 是唯一的外部依赖：旁挂只用标准库（sqlite3 / urllib / asyncio / logging）
+telethon==1.45.0
