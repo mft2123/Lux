@@ -34,6 +34,8 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/strm-probe-jobs",
             get(admin_list_strm_probe_jobs).post(admin_start_strm_probe),
         )
+        .route("/api/v1/admin/archive/status", get(admin_archive_status))
+        .route("/api/v1/admin/archive/run", post(admin_archive_run))
         .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
@@ -1259,5 +1261,49 @@ pub(crate) fn strm_probe_error(headers: &HeaderMap, error: StrmProbeError) -> Re
         )
         .into_response(),
         StrmProbeError::Plugin(error) => plugin_error(headers, error),
+    }
+}
+
+
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct ArchiveRunQuery {
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+pub(crate) async fn admin_archive_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let service = crate::application::archive::ArchiveService::new(
+        crate::application::archive::ArchiveConfig::from_env(),
+    );
+    Json(service.status()).into_response()
+}
+
+pub(crate) async fn admin_archive_run(
+    headers: HeaderMap,
+    Query(query): Query<ArchiveRunQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let service = crate::application::archive::ArchiveService::new(
+        crate::application::archive::ArchiveConfig::from_env(),
+    );
+    let dry_run = query.dry_run.unwrap_or(true);
+    match service.run_once(dry_run).await {
+        Ok(report) => Json(report).into_response(),
+        Err(message) => api_error(
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            &message,
+        )
+        .into_response(),
     }
 }

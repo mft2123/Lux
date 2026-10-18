@@ -160,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker();
+    luxd::application::archive::start_poller();
     // A large existing library can contain hundreds of thousands of episodes.
     // Repairing their legacy identities is a one-time background operation and
     // must not block the HTTP listener from becoming available.
