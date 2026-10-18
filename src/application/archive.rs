@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 mod nfo;
 mod settings;
 
-pub(crate) use settings::ArchiveSettings;
+pub(crate) use settings::{ArchiveSettings, mask_secret};
 
 pub(crate) const ARCHIVE_ROOT_ENV: &str = "LUX_ARCHIVE_ROOT";
 pub(crate) const ARCHIVE_TMDB_KEY_ENV: &str = "LUX_TMDB_API_KEY";
