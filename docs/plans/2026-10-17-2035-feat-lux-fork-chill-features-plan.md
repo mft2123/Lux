@@ -456,3 +456,4 @@ U1 → (U2,U3,U4,U5,U6 可并行) → U7 → 阶段 A 验收 → U8 → U13 → 
 - **运行环境:** NAS `qiangli@192.168.8.8:4888`（密钥 `id_ed25519_feiniu`，BatchMode）；仓库 `/vol5/1000/build/lux`（test 分支）；生产 compose `/vol5/1000/docker/lux/docker-compose.yml`（端口 8098、`:ro` 媒体挂载、`LUX_*` 调参）；DB 备份 `/vol5/1000/docker/lux/backup-pre069/lux.db`；生产库规模：5,292 电影 / 5,668 剧集 / 7,564 季 / 161,386 分集 / 14,337 UNRESOLVED / 54 万条目；库 ID：媒体库 `01a1450d-…`、真实库 `01a14514-…`、音乐 KTV `01a1499b-…`（已独立）。
 - **缺陷证据摘要:** 见 Sources & Research；完整数字与日志样本另存于工作区 `lux-bug-reports.md`（上游 issue 材料，用户已提交）。
 - **chill 退役门:** 退役前 chill 保持现状运行（其 8011 继续服务旧 strm），直至 U14 切换完成且用户确认。
+- **归档匹配算法（已固化）:** `docs/archive-pipeline.md` 是归档流水线的行为规范（目录角色、名称解析、TMDB 双语检索与评分、发行地区判定、年份回退链、入库/重复/洗版/失败规则、性能与配置）。实现按该文档执行，算法变更先改文档。

@@ -7,6 +7,9 @@
 //! The pipeline is deliberately directory-driven: every stage is a visible
 //! directory role, so a failed identification can be inspected by hand and a
 //! half-finished run leaves no hidden state.
+//!
+//! The matching rules are frozen in `docs/archive-pipeline.md`; change that
+//! document first and then the code, never the other way around.
 
 use std::{
     collections::HashMap,
