@@ -91,3 +91,15 @@ docker run --rm --entrypoint id lux-telegram:1                              # ui
   链接还不会真的转存。端到端验收（测试频道发链接 → `链接队列/` 出现 json）需要真实登录 +
   已部署含 ingest 的 Lux，留给总控合并后实测。
 - `listen_channels` 需要运维填（设置页 UI 归 module-settings）；当前线上设置是手动模式且频道为空。
+
+## 第二轮整改（2026-10-18）
+
+- **管理 key 的来源**：优先读设置文件 `telegram.api_key`，缺失时才用 `LUX_TG_API_KEY` 兜底；
+  Lux 设置页新增了该字段（打码、留空不改），所以从 UI 保存设置不会再把它抹掉。
+- **设置文件可读性**：Lux 以 0600 写、旁挂以 uid 10001 只读挂载。部署时要把文件改成 `0640` 并把属组
+  设成旁挂的 gid（compose 里用 `LUX_ARCHIVE_SETTINGS_GROUP` + `group_add`），README 的"部署检查清单"有步骤；
+  旁挂读到权限错误会直接提示这一条，而不是笼统报配置错误。
+- **投递语义**：400/403 视为永久失败落死信（`main.py status` 可查、`replay --id` 可人工放行），
+  其余错误最多重试 20 次并指数退避；401 保留可重试（运维换 key 后能自愈）。
+- **默认只收已知网盘/磁力**，`LUX_TG_ALLOW_OTHER=1` 才收其它 http 链接。
+- 状态回执仍是聚合的 `pending_link_jobs`；单作业状态查询（`GET …/ingest/{jobId}`）留待 115 转存客户端接入时一并做。
