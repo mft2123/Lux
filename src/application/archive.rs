@@ -692,6 +692,12 @@ impl ArchiveService {
                 .tmdb_search(api_key, segment, &parsed.title, parsed.year)
                 .await?;
             let Some(best) = pick_best_result(&results, &parsed.title, parsed.year) else {
+                tracing::debug!(
+                    query = %parsed.title,
+                    segment,
+                    candidates = results.len(),
+                    "TMDB search returned no usable match"
+                );
                 continue;
             };
             let id = best
@@ -725,17 +731,10 @@ impl ArchiveService {
                 .tmdb_search_in_language(api_key, segment, query, year, &self.config.tmdb_language)
                 .await
             {
-                let mut seen = results
-                    .iter()
-                    .filter_map(|result| result.get("id").and_then(|value| value.as_i64()))
-                    .collect::<std::collections::HashSet<_>>();
-                for item in extra {
-                    if let Some(id) = item.get("id").and_then(|value| value.as_i64())
-                        && seen.insert(id)
-                    {
-                        results.push(item);
-                    }
-                }
+                // Keep both entries even when the ids match: the localized one
+                // carries the Chinese name that a Chinese release name matches
+                // against (刑事侦缉档案4 vs Detective Investigation Files IV).
+                results.extend(extra);
             }
         }
         Ok(results)
