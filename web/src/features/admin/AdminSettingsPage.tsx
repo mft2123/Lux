@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
+import { ArchiveSettingsSection } from "../settings/ArchiveSettingsSection";
 import type {
   AdminNetworkProxySettings,
   LoginBackgroundSource,
@@ -263,6 +264,8 @@ export function AdminSettingsPage() {
         {testProxy.error ? <p className="lux-error-copy">{testProxy.error.message}</p> : null}
         {proxyDiagnostics ? <NetworkProxyDiagnosticsView diagnostics={proxyDiagnostics} /> : null}
       </section>
+
+      <ArchiveSettingsSection />
 
       <section className="lux-admin-panel lux-admin-settings-note">
         <div className="lux-admin-panel-heading"><div><h2>服务信息</h2></div></div>

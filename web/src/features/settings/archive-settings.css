@@ -1,0 +1,18 @@
+/* Layout only: the shared admin settings classes and the global form control
+   rules in react.css provide the colors, borders and focus rings. */
+.lux-archive-settings-group { display: grid; gap: 14px; }
+.lux-archive-settings-group > h3 { margin: 0; color: var(--lux-text); font-size: .95rem; letter-spacing: -.01em; }
+.lux-archive-settings-group > p { margin: 0; color: var(--lux-subtle); font-size: .74rem; line-height: 1.55; }
+.lux-archive-settings-group textarea { min-height: 84px; padding: 10px var(--lux-control-padding-x); line-height: 1.55; resize: vertical; }
+.lux-archive-settings-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.lux-archive-settings-fieldset { display: grid; gap: 8px; }
+.lux-archive-settings-legend { color: var(--lux-subtle); font-size: .74rem; }
+.lux-archive-settings-toggles { display: grid; gap: 4px 16px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+.lux-archive-settings-toggles .lux-admin-toggle { min-height: 32px; }
+.lux-archive-settings-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
+.lux-archive-settings-actions .lux-settings-saved { margin: 0; }
+.lux-archive-settings-status { display: grid; gap: 6px; padding: 13px 15px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.03); }
+.lux-archive-settings-status div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.lux-archive-settings-status span { flex: none; color: var(--lux-subtle); font-size: .73rem; }
+.lux-archive-settings-status strong { color: var(--lux-text); font-size: .76rem; font-weight: 500; text-align: right; overflow-wrap: anywhere; }
+.lux-archive-settings-hint { margin: 0; color: var(--lux-subtle); font-size: .74rem; }

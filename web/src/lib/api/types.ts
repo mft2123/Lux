@@ -1129,3 +1129,60 @@ export type ApiErrorBody = {
     requestId?: string;
   };
 };
+
+// Archive settings mirror the on-disk JSON document (`archive-settings.json`)
+// key for key: the admin API returns and accepts that document as-is, so the
+// keys stay snake_case instead of the camelCase used by the other admin APIs.
+export type ArchiveNotifySelection = string[] | Record<string, boolean> | null;
+
+export type ArchiveTelegramSettings = {
+  bot_token: string;
+  chat_id: string;
+  api_id: string;
+  api_hash: string;
+  phone: string;
+  notify: ArchiveNotifySelection;
+  listen_mode: string;
+  listen_channels: string[];
+  follow_list: string[];
+  enabled?: boolean | null;
+  api_base?: string | null;
+  message_thread_id?: number | null;
+  silent?: boolean | null;
+  min_interval_ms?: number | null;
+  max_per_minute?: number | null;
+  dedupe_seconds?: number | null;
+  timezone_offset_hours?: number | null;
+};
+
+export type ArchiveSettings = {
+  tmdb_api_key: string;
+  watch_dirs: string[];
+  mirror_root: string;
+  cd2_prefix: string;
+  cd2_mount: string;
+  poll_seconds: number;
+  settle_seconds: number;
+  wash_enabled: boolean;
+  wash_tolerance_ratio: number;
+  telegram: ArchiveTelegramSettings;
+};
+
+export type ArchiveSettingsPatch = Partial<Omit<ArchiveSettings, "telegram">> & {
+  telegram?: Partial<ArchiveTelegramSettings>;
+};
+
+export type ArchiveStatus = {
+  root: string;
+  transfer_dir: string;
+  pending_dir: string;
+  media_dir: string;
+  failed_dir: string;
+  duplicate_dir: string;
+  wash_dir: string;
+  settle_seconds: number;
+  wash_enabled: boolean;
+  wash_tolerance_ratio: number;
+  watch_dirs: string[];
+  tmdb_configured: boolean;
+};
