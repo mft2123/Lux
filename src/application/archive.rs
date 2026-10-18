@@ -553,13 +553,30 @@ impl ArchiveService {
             ..ArchiveReport::default()
         };
 
-        let link_queue = self.ingest_link_queue(dry_run)?;
+        // The link queue is one stage, not the pipeline. A queue / state file
+        // that cannot be read skips that stage for this round (WARN) and lets
+        // watch dirs, transfer and pending still run; otherwise one broken
+        // file would freeze the whole archive for every poll.
+        let link_queue = match self.ingest_link_queue(dry_run) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "link queue round skipped; continuing with the rest of the pipeline"
+                );
+                LinkQueueReport {
+                    dry_run,
+                    ..LinkQueueReport::default()
+                }
+            }
+        };
         if link_queue.examined > 0 {
             tracing::info!(
                 dry_run = link_queue.dry_run,
                 examined = link_queue.examined,
                 accepted = link_queue.accepted.len(),
                 invalid = link_queue.invalid.len(),
+                failed = link_queue.failed.len(),
                 incomplete = link_queue.skipped_incomplete.len(),
                 "link queue consumed; accepted links wait for the 115 transfer client"
             );
@@ -1710,7 +1727,18 @@ impl ArchiveService {
         let _ingest_guard = LINK_INGEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = self.find_existing_link_job(&job.url) {
+        // A broken queue / state file means "cannot tell whether this is a
+        // duplicate": answer 500 and queue nothing, instead of writing a
+        // possible second job for one link.
+        let existing = self.find_existing_link_job(&job.url).map_err(|error| {
+            tracing::warn!(
+                url = %mask_link_for_log(&job.url),
+                %error,
+                "could not check for an existing link job; refusing to queue a possible duplicate"
+            );
+            LinkIngestError::Storage(error)
+        })?;
+        if let Some(existing) = existing {
             tracing::info!(
                 url = %mask_link_for_log(&job.url),
                 job_id = %existing.job_id,
@@ -1760,36 +1788,45 @@ impl ArchiveService {
 
     /// Find a job for `url` that is either still waiting in the queue or
     /// already recorded in the state file. Used to make ingest idempotent.
-    fn find_existing_link_job(&self, url: &str) -> Option<QueuedLinkJob> {
-        for entry in read_dir_entries(&self.config.link_queue_dir()).ok()? {
+    ///
+    /// An unreadable queue directory or state file is an **error**, never "no
+    /// duplicate" (review I12): guessing wrong queues the same link twice and
+    /// hands it to the transfer client twice.
+    fn find_existing_link_job(&self, url: &str) -> Result<Option<QueuedLinkJob>, String> {
+        for entry in read_dir_entries(&self.config.link_queue_dir())? {
             if !is_link_job_file(&entry) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&entry) else {
-                continue;
+            let text = match std::fs::read_to_string(&entry) {
+                Ok(text) => text,
+                Err(error) => {
+                    // One unreadable job file must not make every ingest fail,
+                    // but it may be hiding this URL: say so in the log.
+                    tracing::warn!(
+                        file = %entry.display(),
+                        %error,
+                        "could not read a queued link job while checking for duplicates; it may hide this URL"
+                    );
+                    continue;
+                }
             };
             let Ok(job) = serde_json::from_str::<LinkJob>(&text) else {
                 continue;
             };
             if job.url == url {
-                return Some(QueuedLinkJob {
+                return Ok(Some(QueuedLinkJob {
                     job_id: job.job_id,
                     file: entry.display().to_string(),
                     status: LINK_JOB_STATUS_NEEDS_115,
                     duplicate: true,
-                });
+                }));
             }
         }
-        let Ok(text) = std::fs::read_to_string(self.config.link_state_file()) else {
-            return None;
-        };
-        // Newest record last: walk backwards so the most recent match wins.
-        for line in text.lines().rev() {
-            let Ok(record) = serde_json::from_str::<LinkStateLine>(line) else {
-                continue;
-            };
+        // Newest record last: walk backwards so the most recent match wins. A
+        // missing state file is "nothing consumed yet"; any other error is real.
+        for record in read_link_state(&self.config.link_state_file())?.into_iter().rev() {
             if record.url == url && record.status != LINK_JOB_STATUS_INVALID {
-                return Some(QueuedLinkJob {
+                return Ok(Some(QueuedLinkJob {
                     job_id: record.job_id,
                     file: self
                         .config
@@ -1799,10 +1836,10 @@ impl ArchiveService {
                         .to_string(),
                     status: LINK_JOB_STATUS_NEEDS_115,
                     duplicate: true,
-                });
+                }));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Consume the JSON job files in `链接队列/`.
@@ -3384,8 +3421,19 @@ fn is_link_job_file(path: &Path) -> bool {
 }
 
 fn count_link_jobs(directory: &Path) -> usize {
-    let Ok(reader) = std::fs::read_dir(directory) else {
-        return 0;
+    let reader = match std::fs::read_dir(directory) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            // The status endpoint keeps answering, but the operator must see
+            // that the number is unknown rather than "0 waiting".
+            tracing::warn!(
+                path = %directory.display(),
+                %error,
+                "could not count the pending link jobs"
+            );
+            return 0;
+        }
     };
     reader
         .flatten()
@@ -4670,6 +4718,52 @@ mod tests {
 
     /// One job predicate: the status counter and the consumer agree on
     /// `X.JSON` vs dotfiles vs `状态.jsonl` vs symlinks.
+    /// A read failure is not "no duplicate": ingest refuses instead of writing a
+    /// second job, and the consumer skips the round instead of consuming blindly.
+    #[test]
+    fn an_unreadable_state_file_is_not_no_duplicate() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        // A directory where 状态.jsonl should be: reading it fails (EISDIR).
+        std::fs::create_dir_all(service.config.link_state_file()).expect("state dir");
+
+        let error = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect_err("must not queue a possible duplicate");
+        assert!(matches!(error, LinkIngestError::Storage(_)), "{error}");
+        assert_eq!(count_link_jobs(&queue), 0, "nothing was written");
+
+        // The consumer cannot read the state either: that round fails and the
+        // job file stays where it is for the next round.
+        std::fs::write(
+            queue.join("job.json"),
+            serde_json::to_vec(&link_job("https://115.com/s/def")).unwrap(),
+        )
+        .unwrap();
+        assert!(service.ingest_link_queue(false).is_err());
+        assert_eq!(count_link_jobs(&queue), 1);
+    }
+
+    /// One unreadable queue / state file skips only the link stage of a run; the
+    /// rest of the pipeline still executes.
+    #[tokio::test]
+    async fn a_broken_link_queue_does_not_stop_the_run() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        std::fs::create_dir_all(service.config.link_state_file()).expect("state dir");
+
+        let report = service
+            .run_once(false)
+            .await
+            .expect("the rest of the pipeline still runs");
+        assert!(!report.dry_run);
+        assert!(report.organized.is_empty());
+    }
+
     #[test]
     fn count_and_consume_agree_on_what_a_job_is() {
         let tmp = tempfile::tempdir().expect("temp dir");
