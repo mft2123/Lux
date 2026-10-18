@@ -1,0 +1,610 @@
+"""Telethon 接线：首次运行登录、频道解析、监听、回填/补拉、投递、失败重试。
+
+只有本文件 import telethon；其余模块保持纯逻辑，便于在没有 telethon 的环境跑单测。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from . import config as config_mod
+from . import filters
+from . import links as links_mod
+from . import sink as sink_mod
+from . import store as store_mod
+
+log = logging.getLogger("tgwatch.runner")
+
+DELIVER_CONCURRENCY = 4
+
+# 容器里没有 tty 时，验证码文档写进 session/code.txt；最多等 15 分钟
+CODE_WAIT_SECONDS = 900
+CODE_POLL_SECONDS = 2
+CODE_REMIND_SECONDS = 30
+
+
+class RunnerError(RuntimeError):
+    """启动前置条件不满足（未登录、session 损坏、频道解析不到、未装 telethon）。"""
+
+
+def _telethon():
+    try:
+        from telethon import TelegramClient, events, utils
+    except ImportError as error:  # pragma: no cover - 容器里一定装好
+        raise RunnerError("未安装 telethon：pip install -r requirements.txt") from error
+    return TelegramClient, events, utils
+
+
+@dataclass
+class IncomingMessage:
+    """一条待判定消息的纯数据视图（测试里直接造这个）。"""
+
+    channel: str  # 配置里的频道标识，用于日志与 DB
+    chat_id: int
+    msg_id: int
+    date: str
+    text: str = ""
+    entities: list[dict] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        return f"{self.chat_id}:{self.msg_id}"
+
+
+def entities_to_dicts(message) -> list[dict]:
+    """telethon entity → 纯 dict（links 模块的输入契约）。
+
+    已经是 dict 的原样保留，方便测试直接喂纯数据。
+    """
+    out: list[dict] = []
+    for entity in getattr(message, "entities", None) or ():
+        if isinstance(entity, dict):
+            out.append(dict(entity))
+            continue
+        item = {
+            "type": type(entity).__name__,
+            "offset": int(getattr(entity, "offset", 0) or 0),
+            "length": int(getattr(entity, "length", 0) or 0),
+        }
+        url = getattr(entity, "url", None)
+        if url:
+            item["url"] = str(url)
+        out.append(item)
+    return out
+
+
+def incoming_from_message(message, channel_label: str, chat_id: int | None = None) -> IncomingMessage:
+    date = getattr(message, "date", None)
+    return IncomingMessage(
+        channel=channel_label,
+        chat_id=int(chat_id if chat_id is not None else getattr(message, "chat_id", 0) or 0),
+        msg_id=int(getattr(message, "id", 0) or 0),
+        date=date.isoformat() if isinstance(date, datetime) else str(date or ""),
+        text=getattr(message, "text", None) or getattr(message, "message", None) or "",
+        entities=entities_to_dicts(message),
+    )
+
+
+def peer_key(obj, peer_id: int | None = None) -> str:
+    """稳定标识：有 username 用 `@name`，否则 `id:<peer_id>`（-100… 形式）。"""
+    username = getattr(obj, "username", None)
+    if username:
+        return f"@{username}"
+    if peer_id is None:
+        peer_id = getattr(obj, "id", None)
+    return f"id:{peer_id}"
+
+
+# ---------------------------------------------------------------- 权限加固
+
+
+def harden_permissions(config: config_mod.SidecarConfig) -> None:
+    """session 里是账号授权密钥：目录 0700、文件 0600，进程 umask 077。
+
+    必须显式 chmod：bind mount 会盖掉 Dockerfile 里的权限设置，而且 Telethon
+    建 session 文件时用的是 0644。
+    """
+    os.umask(0o077)
+    for directory in (config.session_dir, config.state_dir):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+        except OSError as error:
+            log.warning("无法收紧目录权限 %s: %s", directory, error)
+    if config.session_path.exists():
+        try:
+            os.chmod(config.session_path, 0o600)
+        except OSError as error:
+            log.warning("无法收紧 session 权限 %s: %s", config.session_path, error)
+
+
+# ---------------------------------------------------------------- 登录
+
+
+def code_provider(config: config_mod.SidecarConfig):
+    """验证码回调：提示打到容器日志，人工在 session/ 目录下录入。
+
+    两种录入方式，先到先用：
+    - `session/code.txt`：容器没开 tty（`docker compose up -d`）时用，写入后本进程读走即删
+    - tty 里的 stdin：`docker attach` / `docker run -it` 时直接敲
+    """
+
+    def provider() -> str:
+        log.info(
+            "需要登录：验证码已发到 %s。请把验证码写进 %s，或在本终端直接输入",
+            config.phone or "Telegram 账号",
+            config.code_file,
+        )
+        deadline = time.monotonic() + CODE_WAIT_SECONDS
+        next_remind = time.monotonic() + CODE_REMIND_SECONDS
+        while True:
+            if config.code_file.exists():
+                code = config.code_file.read_text(encoding="utf-8").strip()
+                config.code_file.unlink(missing_ok=True)
+                if code:
+                    return code
+            if sys.stdin is not None and sys.stdin.isatty():
+                return input("请输入 Telegram 验证码: ").strip()
+            if time.monotonic() >= deadline:
+                raise RunnerError(
+                    f"等待验证码超时（{CODE_WAIT_SECONDS}s）：重跑一次，把验证码写进 {config.code_file}"
+                )
+            if time.monotonic() >= next_remind:
+                next_remind = time.monotonic() + CODE_REMIND_SECONDS
+                log.info("仍在等待验证码：把收到的验证码写入 %s 即可继续", config.code_file)
+            time.sleep(CODE_POLL_SECONDS)
+
+    return provider
+
+
+async def _authorize(client, config: config_mod.SidecarConfig) -> None:
+    """首次运行登录（文档流程）：日志提示 → 人工录入 → session 落盘。"""
+    if not config.session_path.exists():
+        log.info("首次运行：%s 不存在，开始登录流程", config.session_path)
+    await client.start(
+        phone=config.phone or None,
+        password=config.password or None,
+        code_callback=code_provider(config),
+    )
+    harden_permissions(config)
+    me = await client.get_me()
+    log.info(
+        "已登录：id=%s username=%s；session 已保存到 %s（0600）",
+        getattr(me, "id", "?"),
+        getattr(me, "username", "") or "-",
+        config.session_path,
+    )
+
+
+@contextlib.contextmanager
+def session_errors(config: config_mod.SidecarConfig):
+    """把 sqlite 层面的 session 损坏翻译成干净的中文错误（review F6）。
+
+    Telethon 的 session 就是 sqlite 文件；被截断/写坏时 `TelegramClient(...)`
+    或 `start()` 会抛 `sqlite3.DatabaseError`，默认会连栈一起打到日志里，
+    再被 `restart: unless-stopped` 反复刷屏。
+    """
+    try:
+        yield
+    except sqlite3.Error as error:
+        raise RunnerError(
+            f"session 文件损坏（{config.session_path}）：删掉它后重启，会重新走登录流程"
+        ) from error
+
+
+# ---------------------------------------------------------------- 洗版查询
+
+
+class LibraryLookup:
+    """问 Lux「库中同名版本多大」：`GET /api/v1/admin/archive/lookup?title=`。
+
+    返回 `{"ok", "size_bytes", "matched"}`；带 `X-Lux-Api-Key`。
+    查询失败（接口不存在/鉴权失败/超时）时 `ok=False`，调用方挂起而不是猜。
+    """
+
+    def __init__(self, url: str = "", api_key: str = "", timeout: float = 15.0):
+        self.url = url
+        self.api_key = api_key
+        self.timeout = timeout
+        self._cache: dict[str, dict] = {}
+
+    async def lookup(self, title: str) -> dict:
+        if not title:
+            return {"ok": False, "size_bytes": None, "matched": None}
+        if title in self._cache:
+            return self._cache[title]
+        result = await asyncio.to_thread(sink_mod.lookup_size, self.url, self.api_key, title, self.timeout)
+        self._cache[title] = result
+        return result
+
+
+# ---------------------------------------------------------------- 监听
+
+
+class Watcher:
+    def __init__(
+        self,
+        config: config_mod.SidecarConfig,
+        store: store_mod.Store,
+        sink,
+        lookup: LibraryLookup | None = None,
+    ):
+        self.config = config
+        self.store = store
+        self.sink = sink
+        self.lookup = lookup or LibraryLookup(config.lookup_url, config.api_key, config.http_timeout)
+        self.counts = {"messages": 0, "delivered": 0, "held": 0, "skipped": 0, "failed": 0}
+        self._semaphore = asyncio.Semaphore(DELIVER_CONCURRENCY)
+        self._stop = asyncio.Event()
+        # peer_key → ChannelConfig；启动解析频道时填充
+        self.by_key: dict[str, config_mod.ChannelConfig] = {}
+
+    # ---- 消息处理（核心，可单测） ----
+
+    async def process(self, incoming: IncomingMessage, channel: config_mod.ChannelConfig) -> None:
+        self.counts["messages"] += 1
+        if incoming.msg_id <= 0:
+            return
+        if self.store.seen(incoming.key):
+            log.debug("重复消息，跳过: %s", incoming.key)
+            return
+
+        found = links_mod.extract_links(incoming.text, incoming.entities)
+        accepted = links_mod.split_kinds(found, self.config.allowed_kinds)
+        mode = channel.mode
+        title = links_mod.title_from(incoming.text, accepted or found)
+        size_bytes = links_mod.parse_size(incoming.text)
+
+        if not accepted:
+            self.store.record_message(
+                msg_key=incoming.key,
+                channel=incoming.channel,
+                msg_id=incoming.msg_id,
+                msg_date=incoming.date,
+                mode=mode,
+                link_count=len(found),
+                status=store_mod.STATUS_SKIPPED,
+                reason="no_allowed_link" if found else "no_link",
+            )
+            self.store.advance_message_id(incoming.channel, incoming.msg_id)
+            self.counts["skipped"] += 1
+            log.debug("%s 无可用链接（提取到 %d 条），跳过", incoming.key, len(found))
+            return
+
+        library: dict = {"ok": True, "size_bytes": None, "matched": None}
+        if mode == filters.MODE_WASH and size_bytes is not None:
+            library = await self.lookup.lookup(title)
+
+        decision = filters.decide(
+            mode,
+            title=title,
+            follow_list=self.config.follow_for(channel.key()),
+            size_bytes=size_bytes,
+            library_size=library.get("size_bytes"),
+            library_known=bool(library.get("ok", True)),
+            wash_tolerance=self.config.wash_tolerance,
+            link_count=len(accepted),
+        )
+
+        initial_status = {
+            filters.STATUS_DELIVER: store_mod.STATUS_PENDING,
+            filters.STATUS_HOLD: store_mod.STATUS_HELD,
+            filters.STATUS_SKIP: store_mod.STATUS_SKIPPED,
+        }[decision.status]
+
+        self.store.record_message(
+            msg_key=incoming.key,
+            channel=incoming.channel,
+            msg_id=incoming.msg_id,
+            msg_date=incoming.date,
+            mode=mode,
+            link_count=len(accepted),
+            status=initial_status,
+            reason=decision.reason,
+        )
+        self.store.advance_message_id(incoming.channel, incoming.msg_id)
+
+        item_ids: list[int] = []
+        for link in accepted:
+            item_id = self.store.add_item(
+                msg_key=incoming.key,
+                channel=incoming.channel,
+                msg_id=incoming.msg_id,
+                msg_date=incoming.date,
+                url=link.url,
+                kind=link.kind,
+                anchor=link.anchor,
+                title=title,
+                size_bytes=size_bytes,
+                mode=mode,
+                status=initial_status,
+                reason=decision.reason,
+            )
+            if item_id:
+                item_ids.append(item_id)
+
+        if not decision.deliver:
+            self.counts["held" if decision.status == filters.STATUS_HOLD else "skipped"] += 1
+            log.info(
+                "%s %s %s：%s（%d 条链接）",
+                incoming.channel,
+                incoming.msg_id,
+                "挂起" if decision.status == filters.STATUS_HOLD else "不投递",
+                decision.reason,
+                len(item_ids),
+            )
+            return
+
+        log.info(
+            "%s %s 投递 %d 条链接（%s / %s）",
+            incoming.channel,
+            incoming.msg_id,
+            len(item_ids),
+            mode,
+            decision.reason,
+        )
+        await self.deliver(item_ids)
+
+    async def deliver(self, item_ids: list[int]) -> None:
+        for item_id in item_ids:
+            item = self.store.get_item(item_id)
+            if not item or item["status"] == store_mod.STATUS_DELIVERED:
+                continue
+            async with self._semaphore:
+                try:
+                    await self.sink.send(item)
+                except sink_mod.SinkError as error:
+                    self.counts["failed"] += 1
+                    self.store.set_status(item_id, store_mod.STATUS_FAILED, str(error)[:200], bump_attempts=True)
+                    log.warning("投递失败 item=%s: %s", item_id, error)
+                else:
+                    self.counts["delivered"] += 1
+                    self.store.set_status(item_id, store_mod.STATUS_DELIVERED)
+
+    # ---- 重试循环（failed + 手动放行后的 pending） ----
+
+    async def retry_once(self, limit: int = 50) -> int:
+        items = self.store.items_by_status((store_mod.STATUS_FAILED, store_mod.STATUS_PENDING), limit=limit)
+        if not items:
+            return 0
+        if self.config.dry_run:
+            log.info("dry-run：跳过 %d 条待投递条目", len(items))
+            return 0
+        log.info("重试投递 %d 条", len(items))
+        await self.deliver([int(item["id"]) for item in items])
+        return len(items)
+
+    async def retry_loop(self) -> None:
+        interval = max(10, int(self.config.retry_seconds))
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self.retry_once()
+            except Exception:  # pragma: no cover - 重试循环不能死
+                log.exception("重试循环异常")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # ---- telethon 事件入口 ----
+
+    def on_event(self, event) -> None:
+        """由 telethon 调用；解析成纯数据后交给 process。"""
+        channel = self._channel_for(event)
+        if channel is None:
+            log.debug("未登记的会话，忽略: %s", getattr(event, "chat_id", "?"))
+            return
+        message = getattr(event, "message", None)
+        if message is None:
+            return
+        incoming = incoming_from_message(message, channel.key(), getattr(event, "chat_id", None))
+        task = asyncio.create_task(self._safe_process(incoming, channel))
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
+
+    async def _safe_process(self, incoming: IncomingMessage, channel: config_mod.ChannelConfig) -> None:
+        try:
+            await self.process(incoming, channel)
+        except Exception:
+            log.exception("处理消息失败: %s", incoming.key)
+            self.store.record_message(
+                msg_key=incoming.key,
+                channel=incoming.channel,
+                msg_id=incoming.msg_id,
+                msg_date=incoming.date,
+                mode=channel.mode,
+                link_count=0,
+                status=store_mod.STATUS_FAILED,
+                reason="exception",
+            )
+
+    def _channel_for(self, event) -> config_mod.ChannelConfig | None:
+        chat = getattr(event, "chat", None)
+        key = peer_key(chat, getattr(event, "chat_id", None))
+        if key in self.by_key:
+            return self.by_key[key]
+        label = str(getattr(chat, "username", "") or "")
+        for channel in self.config.channels:
+            if label and channel.key().lstrip("@") == label:
+                return channel
+        return None
+
+
+_BACKGROUND: set[asyncio.Task] = set()
+
+
+async def _resolve_channel(client, channel: config_mod.ChannelConfig):
+    """按配置解析出 telethon entity；数字 id 与 @username 都试一遍。"""
+    candidate = channel.key()
+    attempts: list = []
+    if candidate.lstrip("-").isdigit():
+        attempts.append(int(candidate))
+    attempts.append(candidate)
+    last_error: Exception | None = None
+    for value in attempts:
+        try:
+            return await client.get_entity(value)
+        except Exception as error:  # noqa: BLE001 - 逐个候选试，最后统一报错
+            last_error = error
+    raise RunnerError(f"频道 {candidate} 解析失败: {last_error}")
+
+
+async def _backfill_newest(client, watcher: "Watcher", channel, entity, limit: int) -> int:
+    """全量模式：取**最新** N 条，再按时间顺序处理。
+
+    `iter_messages(limit=N)` 默认从新到旧；加 `reverse=True` 会从频道第一条
+    开始往回翻，在成熟频道上等于永远读最老的 200 条（review F4）。
+    """
+    if limit <= 0:
+        return 0
+    messages = [message async for message in client.iter_messages(entity, limit=limit)]
+    log.info("回填 %s 最新 %d 条消息（全量模式）", channel.key(), len(messages))
+    for message in reversed(messages):
+        await watcher.process(incoming_from_message(message, channel.key()), channel)
+    return len(messages)
+
+
+async def _gap_backfill(client, watcher: "Watcher", channel, entity, limit: int) -> int:
+    """按游标补拉宕机期间的消息（`min_id` = 已处理的最大消息 id）。"""
+    last_id = watcher.store.last_message_id(channel.key())
+    if last_id <= 0 or limit <= 0:
+        return 0
+    messages = [
+        message async for message in client.iter_messages(entity, min_id=last_id, limit=limit)
+    ]
+    if not messages:
+        return 0
+    log.info("补拉 %s 宕机期间 %d 条消息（> %s）", channel.key(), len(messages), last_id)
+    for message in reversed(messages):
+        await watcher.process(incoming_from_message(message, channel.key()), channel)
+    return len(messages)
+
+
+async def run(config: config_mod.SidecarConfig) -> None:
+    """常驻：加固权限 → 登录（首次）→ 解析频道 → 回填 → 订阅 → 补拉 → 重试循环。"""
+    if not config.channels:
+        raise RunnerError("listen_channels 为空：没有可监听的频道")
+    TelegramClient, events, utils = _telethon()
+
+    harden_permissions(config)
+
+    store = store_mod.Store(config.state_db)
+    sink = sink_mod.build(config)
+    log.info(
+        "旁挂启动：sink=%s 模式=%s 频道=%d 设置=%s",
+        sink.describe().get("sink"),
+        config.default_mode,
+        len(config.channels),
+        config.settings_path,
+    )
+    if config.dry_run:
+        log.warning("dry-run 已开启：只判定与记录，不写下游")
+
+    watcher = Watcher(config, store, sink, LibraryLookup(config.lookup_url, config.api_key, config.http_timeout))
+    client = None
+    try:
+        try:
+            with session_errors(config):
+                client = TelegramClient(str(config.session_path), config.api_id, config.api_hash)
+                await _authorize(client, config)
+        except RunnerError:
+            raise
+        except sqlite3.Error as error:  # pragma: no cover - session_errors 已兜住
+            raise RunnerError(f"session 文件损坏：{error}") from error
+
+        resolved: list[tuple[config_mod.ChannelConfig, object]] = []
+        for channel in config.channels:
+            try:
+                entity = await _resolve_channel(client, channel)
+            except RunnerError as error:
+                log.error("%s", error)
+                continue
+            key = peer_key(entity, utils.get_peer_id(entity))
+            watcher.by_key[key] = channel
+            watcher.by_key[channel.key()] = channel
+            resolved.append((channel, entity))
+            log.info("监听 %s → %s（%s）", channel.key(), key, channel.mode)
+
+        if not resolved:
+            raise RunnerError("所有频道都解析失败：检查 listen_channels 是否正确、账号是否在频道内")
+
+        for channel, entity in resolved:
+            if channel.mode != filters.MODE_FULL:
+                continue
+            try:
+                await _backfill_newest(client, watcher, channel, entity, config.backfill_limit)
+            except Exception:  # noqa: BLE001 - 回填失败不该拖死常驻
+                log.exception("回填 %s 失败", channel.key())
+
+        client.add_event_handler(
+            watcher.on_event,
+            events.NewMessage(chats=[entity for _, entity in resolved], incoming=True),
+        )
+
+        # 宕机窗口：先让 telethon 收差量更新（走 handler），再按游标兜底补拉
+        try:
+            await client.catch_up()
+        except Exception:  # noqa: BLE001
+            log.warning("catch_up 失败，改由游标补拉兜底", exc_info=True)
+        for channel, entity in resolved:
+            try:
+                await _gap_backfill(client, watcher, channel, entity, config.gap_limit)
+            except Exception:  # noqa: BLE001
+                log.exception("补拉 %s 失败", channel.key())
+
+        retry_task = asyncio.create_task(watcher.retry_loop())
+        log.info("就绪：%d 个频道在线", len(resolved))
+        try:
+            await client.run_until_disconnected()
+        finally:
+            watcher.stop()
+            retry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retry_task
+            log.info("统计: %s", watcher.counts)
+    finally:
+        if client is not None:
+            await client.disconnect()
+        store.close()
+
+
+async def deliver_pending(
+    config: config_mod.SidecarConfig, item_ids: list[int] | None, statuses, limit: int
+) -> int:
+    """`replay` 子命令：把 held/failed/pending 推到下游（"管理员触发时才处理"）。"""
+    harden_permissions(config)
+    store = store_mod.Store(config.state_db)
+    sink = sink_mod.build(config)
+    watcher = Watcher(config, store, sink, LibraryLookup(config.lookup_url, config.api_key, config.http_timeout))
+    try:
+        if item_ids:
+            store.promote(item_ids)
+            ids = item_ids
+        else:
+            ids = [int(item["id"]) for item in store.items_by_status(tuple(statuses), limit=limit)]
+            if ids:
+                store.promote(ids)
+        if not ids:
+            log.info("没有可投递的条目")
+            return 0
+        log.info("投递 %d 条", len(ids))
+        await watcher.deliver(ids)
+        return len(ids)
+    finally:
+        store.close()
