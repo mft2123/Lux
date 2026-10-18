@@ -426,15 +426,11 @@ impl ArchiveService {
             let is_dir = entry.is_dir();
             if is_dir {
                 if !dir_contains_video(&entry) {
-                    report
-                        .skipped
-                        .push(format!("{name} (目录内没有视频文件，留在待整理)"));
+                    self.fail_entry(report, &entry, "目录内没有视频文件")?;
                     continue;
                 }
             } else if video_extension(&entry).is_none() {
-                report
-                    .skipped
-                    .push(format!("{name} (不是视频文件，留在待整理)"));
+                self.fail_entry(report, &entry, "不是视频文件")?;
                 continue;
             }
             let raw_name = if is_dir {
@@ -573,6 +569,7 @@ impl ArchiveService {
             });
             return Ok(());
         }
+        tracing::warn!(entry = %name, %reason, "archive entry moved to the failure directory");
         let stamp = unix_now();
         let bucket = self.config.failed_dir().join(format!("{stamp}"));
         std::fs::create_dir_all(&bucket).map_err(|error| format!("创建失败目录: {error}"))?;
@@ -679,7 +676,7 @@ impl ArchiveService {
             };
             for (_kind, segment) in attempts {
                 if let Ok(mut details) = self.tmdb_details(api_key, segment, tmdb_id).await {
-                    self.attach_release_country(api_key, segment, tmdb_id, &mut details)
+                    self.enrich_details(api_key, segment, tmdb_id, &mut details)
                         .await;
                     return Ok(Some(tmdb_match_from(segment, tmdb_id, &details, &details)?));
                 }
@@ -702,7 +699,7 @@ impl ArchiveService {
                 .and_then(|value| value.as_i64())
                 .ok_or_else(|| "TMDB 返回缺少 id".to_owned())?;
             let mut details = self.tmdb_details(api_key, segment, id).await?;
-            self.attach_release_country(api_key, segment, id, &mut details)
+            self.enrich_details(api_key, segment, id, &mut details)
                 .await;
             return Ok(Some(tmdb_match_from(segment, id, &best, &details)?));
         }
@@ -758,20 +755,46 @@ impl ArchiveService {
             .unwrap_or_default())
     }
 
-    /// Attach the earliest-release country to a movie's details so the board
-    /// decision uses `release_dates` instead of production metadata. Series
-    /// keep origin_country (TMDB has no per-country TV release dates).
-    async fn attach_release_country(
+    /// Attach the earliest-release country (movies) and a fallback year to the
+    /// details. Some TMDB entries have no `release_date` / `first_air_date` at
+    /// all (e.g. Detective Investigation Files IV), so the year is taken from
+    /// the earliest release date or from season 1's air date instead of giving
+    /// up with "未知年份".
+    async fn enrich_details(
         &self,
         api_key: &str,
         segment: &str,
         id: i64,
         details: &mut serde_json::Value,
     ) {
-        if segment != "movie" {
+        if segment == "movie" {
+            let url = format!("https://api.themoviedb.org/3/movie/{id}/release_dates?api_key={api_key}");
+            let Ok(response) = self.http.get(&url).send().await else {
+                return;
+            };
+            if !response.status().is_success() {
+                return;
+            }
+            let Ok(body) = response.json::<serde_json::Value>().await else {
+                return;
+            };
+            if let Some((date, country)) = earliest_release(&body) {
+                details["_release_country"] = serde_json::Value::String(country);
+                if let Some(year) = date.get(..4).and_then(|year| year.parse::<i64>().ok()) {
+                    details["_fallback_year"] = serde_json::json!(year);
+                }
+            }
             return;
         }
-        let url = format!("https://api.themoviedb.org/3/movie/{id}/release_dates?api_key={api_key}");
+        // TV: a missing first_air_date is common; the season list and
+        // last_air_date in the same details payload usually carry a date
+        // (e.g. Detective Investigation Files IV -> season 4 aired 1999-03-29).
+        if let Some(year) = season_or_last_air_year(details) {
+            details["_fallback_year"] = serde_json::json!(year);
+            return;
+        }
+        // TV: season 1's air date is the most reliable fallback year.
+        let url = format!("https://api.themoviedb.org/3/tv/{id}/season/1?api_key={api_key}&language=en-US");
         let Ok(response) = self.http.get(&url).send().await else {
             return;
         };
@@ -781,8 +804,10 @@ impl ArchiveService {
         let Ok(body) = response.json::<serde_json::Value>().await else {
             return;
         };
-        if let Some((_, country)) = earliest_release(&body) {
-            details["_release_country"] = serde_json::Value::String(country);
+        if let Some(air_date) = body.get("air_date").and_then(|value| value.as_str())
+            && let Some(year) = air_date.get(..4).and_then(|year| year.parse::<i64>().ok())
+        {
+            details["_fallback_year"] = serde_json::json!(year);
         }
     }
 
@@ -914,7 +939,15 @@ fn tmdb_match_from(
         .get(date_key)
         .and_then(|value| value.as_str())
         .and_then(|date| date.get(..4))
-        .and_then(|year| year.parse::<i64>().ok());
+        .and_then(|year| year.parse::<i64>().ok())
+        .or_else(|| {
+            summary
+                .get(date_key)
+                .and_then(|value| value.as_str())
+                .and_then(|date| date.get(..4))
+                .and_then(|year| year.parse::<i64>().ok())
+        })
+        .or_else(|| details.get("_fallback_year").and_then(|value| value.as_i64()));
     let origin_countries = details
         .get("origin_country")
         .and_then(|value| value.as_array())
@@ -973,6 +1006,32 @@ fn tmdb_match_from(
 
 /// Earliest dated release (premiere / theatrical) across all countries:
 /// returns `(normalized_date, country)`.
+/// Fallback year for a series whose `first_air_date` is empty: the earliest
+/// dated season, then the last air date.
+fn season_or_last_air_year(details: &serde_json::Value) -> Option<i64> {
+    let from_seasons = details
+        .get("seasons")
+        .and_then(|value| value.as_array())
+        .and_then(|seasons| {
+            seasons
+                .iter()
+                .filter_map(|season| {
+                    season
+                        .get("air_date")
+                        .and_then(|value| value.as_str())
+                        .filter(|date| !date.is_empty())
+                })
+                .min()
+        });
+    let date = from_seasons.or_else(|| {
+        details
+            .get("last_air_date")
+            .and_then(|value| value.as_str())
+            .filter(|date| !date.is_empty())
+    })?;
+    date.get(..4).and_then(|year| year.parse::<i64>().ok())
+}
+
 fn earliest_release(details: &serde_json::Value) -> Option<(String, String)> {
     let results = details.get("results")?.as_array()?;
     let mut best: Option<(String, String)> = None;
@@ -1211,7 +1270,8 @@ fn sanitize_component(value: &str) -> String {
     let cleaned = value
         .chars()
         .map(|character| match character {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            ':' => '：',
+            '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
             other => other,
         })
         .collect::<String>();
@@ -1683,6 +1743,28 @@ mod tests {
     }
 
     #[test]
+    fn series_without_first_air_date_uses_the_season_list() {
+        let details = serde_json::json!({
+            "first_air_date": "",
+            "last_air_date": "1999-05-26",
+            "seasons": [
+                { "season_number": 4, "air_date": "1999-03-29" }
+            ]
+        });
+        assert_eq!(season_or_last_air_year(&details), Some(1999));
+
+        let details = serde_json::json!({
+            "first_air_date": "",
+            "last_air_date": "2021-11-02",
+            "seasons": []
+        });
+        assert_eq!(season_or_last_air_year(&details), Some(2021));
+
+        let details = serde_json::json!({ "first_air_date": "", "seasons": [] });
+        assert_eq!(season_or_last_air_year(&details), None);
+    }
+
+    #[test]
     fn release_country_overrides_origin_for_the_board() {
         let movie = TmdbMatch {
             kind: MediaKind::Movie,
@@ -1721,7 +1803,10 @@ mod tests {
 
     #[test]
     fn sanitizes_path_components() {
-        assert_eq!(sanitize_component("A/B: C*?"), "A B C");
+        // Illegal path separators collapse, but a colon becomes a full-width
+        // colon so titles like `20:23` survive.
+        assert_eq!(sanitize_component("A/B: C*?"), "A B： C");
+        assert_eq!(sanitize_component("20:23"), "20：23");
         assert_eq!(sanitize_component("  .  "), "未命名");
     }
 }
