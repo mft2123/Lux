@@ -86,7 +86,7 @@
   0600、日志脱敏、lookup 标题层/缓存/spawn_blocking、mode 校验、全角归一、读失败不再当无重复）
 
 测试：archive 71 / notify 41 / playback 97 / sidecar 184 全绿；
-整库 `cargo test --lib` 仅剩一个**既有** metadata 用例不稳定（trunk 上同样失败，见总线「已知的 trunk 问题」）。
+整库 `cargo test --lib` **1080 通过 / 0 失败**（第四轮修掉了既有的 metadata 不稳定用例，含一个真实的 credit 丢失 bug）。
 
 待办：
 - 重建 `lux:phase-a` 镜像，`lux-testlib` 重建，端到端验收（设置保存语义、通知类别、旁挂投递）

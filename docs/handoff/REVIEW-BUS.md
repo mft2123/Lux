@@ -153,11 +153,17 @@
 
 ---
 
-## 已知的 trunk 问题（非本轮引入）
+## 既有 trunk 问题：已修（第四轮）
 
-- `application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`
-  在 `fork/phase-a`（`385c421e`）上单独跑也失败：断言哪个条目失败依赖内部顺序，属于既有不稳定用例。
-  本轮所有模块测试（archive/notify/playback、sidecar）不受影响；整库 `cargo test --lib` 因此仍报 1 failed。
+`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 早于本轮就失败/不稳定，第四轮定位到两个原因：
+
+1. **真 bug**：演员 credit 分块提交失败后，`people.json` 关系快照仍是「当前」，而 credit 已回滚 →
+   之后任何扫描都不会再补这些 credit（静默丢失）。现在失败分块会为每个受影响条目失效关系快照，下一轮会重做。
+2. **并发锁**：NFO 富化并发执行时，people index 的短读改写事务会被 WAL 以 `SQLITE_BUSY_SNAPSHOT` 立即拒绝
+   （busy_timeout 不生效）。持久化现在对该瞬时错误重试 3 次。
+3. 测试自身还依赖「扫描器是否已预写关系快照」，现在测试先清掉快照，让两部电影确定都需要同步。
+
+整库 `cargo test --locked --lib` → **1080 passed / 0 failed**（26 ignored 为手工 bench 等）。
 
 ---
 
