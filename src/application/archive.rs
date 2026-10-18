@@ -790,6 +790,32 @@ impl ArchiveService {
             } else {
                 target_dir.join(&name)
             };
+            // A series pack is judged season by season. A pack that carries
+            // Season 01 and Season 02 must still contribute the missing season
+            // when another season is already in the library (or is a
+            // duplicate); comparing the whole package would park all of it in
+            // the duplicate directory and lose the new season. Packs without
+            // season subdirectories keep the whole-package rule below.
+            if is_dir
+                && matched.kind == MediaKind::Series
+                && (target.exists() || planned_targets.contains_key(&target))
+            {
+                let handled = self
+                    .organize_series_pack(
+                        report,
+                        &entry,
+                        &target,
+                        &parsed,
+                        &matched,
+                        region,
+                        year,
+                        &mut planned_targets,
+                    )
+                    .await?;
+                if handled {
+                    continue;
+                }
+            }
             let existing_size = if target.exists() {
                 Some(path_size(&target))
             } else {
@@ -969,6 +995,226 @@ impl ArchiveService {
             source: name,
             existing: existing.display().to_string(),
         });
+        Ok(())
+    }
+
+    /// Judge a series pack season by season and merge only the seasons the
+    /// library is missing. Returns `false` when the pack has no season
+    /// subdirectories, so the caller falls back to the whole-package rule.
+    #[allow(clippy::too_many_arguments)]
+    async fn organize_series_pack(
+        &self,
+        report: &mut ArchiveReport,
+        entry: &Path,
+        title_dir: &Path,
+        parsed: &ParsedName,
+        matched: &TmdbMatch,
+        region: &str,
+        year: Option<i64>,
+        planned_targets: &mut HashMap<PathBuf, u64>,
+    ) -> Result<bool, String> {
+        let plan = plan_season_pack(
+            entry,
+            title_dir,
+            self.config.wash_enabled,
+            self.config.wash_tolerance_ratio,
+            planned_targets,
+        );
+        if plan.is_empty() {
+            return Ok(false);
+        }
+        let pack_name = entry
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| entry.display().to_string());
+        // Every season already in the library at the same size: nothing to
+        // merge, so the pack stays one duplicate package as before.
+        if plan.iter().all(|item| item.action == SeasonAction::Duplicate) {
+            self.duplicate_entry(report, entry, title_dir)?;
+            return Ok(true);
+        }
+        if report.dry_run {
+            for item in &plan {
+                match item.action {
+                    SeasonAction::Add => {
+                        report.organized.push(organized_item(
+                            format!("{pack_name}/{}", season_dir_name(item.season)),
+                            matched,
+                            region,
+                            year,
+                            &item.target,
+                        ));
+                        planned_targets.insert(item.target.clone(), item.incoming_size);
+                    }
+                    SeasonAction::Wash => {
+                        report.washed.push(WashedItem {
+                            source: format!("{pack_name}/{}", season_dir_name(item.season)),
+                            replaced: item.target.display().to_string(),
+                            replaced_size: item.existing_size,
+                            kept_size: item.incoming_size,
+                        });
+                        planned_targets.insert(item.target.clone(), item.incoming_size);
+                    }
+                    SeasonAction::Duplicate => {
+                        report.duplicates.push(DuplicateItem {
+                            source: format!("{pack_name}/{}", season_dir_name(item.season)),
+                            existing: item.target.display().to_string(),
+                        });
+                        planned_targets
+                            .entry(item.target.clone())
+                            .or_insert(item.existing_size);
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        let merged = self.apply_season_plan(report, entry, title_dir, &plan, matched, region, year)?;
+        if merged {
+            // The mirror is regenerated for the whole series: existing sidecars
+            // are never overwritten, so only the season just merged appears.
+            let mut metadata_report = nfo::MetadataReport::default();
+            if let Some(mirror) = self.mirror_dir_for(title_dir) {
+                let writer = nfo::MetadataWriter::new(self, false);
+                writer
+                    .write_entry(title_dir, &mirror, parsed, matched, &mut metadata_report)
+                    .await;
+            }
+            if !metadata_report.failed.is_empty() {
+                tracing::warn!(
+                    target = %title_dir.display(),
+                    failed = ?metadata_report.failed,
+                    "metadata sidecar generation had failures"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Move the planned seasons into place, best effort per season: one broken
+    /// season must not undo the ones already merged. Returns whether anything
+    /// entered the library.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_season_plan(
+        &self,
+        report: &mut ArchiveReport,
+        entry: &Path,
+        title_dir: &Path,
+        plan: &[SeasonPlanItem],
+        matched: &TmdbMatch,
+        region: &str,
+        year: Option<i64>,
+    ) -> Result<bool, String> {
+        let pack_name = entry
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| entry.display().to_string());
+        if let Err(error) = std::fs::create_dir_all(title_dir) {
+            self.fail_entry(
+                report,
+                entry,
+                &format!("创建目标目录失败: {error}"),
+            )?;
+            return Ok(false);
+        }
+        let mut merged = false;
+        for item in plan {
+            let label = format!("{pack_name}/{}", season_dir_name(item.season));
+            match item.action {
+                SeasonAction::Add => match move_entry(&item.source, &item.target) {
+                    Ok(()) => {
+                        merged = true;
+                        report.organized.push(organized_item(
+                            label,
+                            matched,
+                            region,
+                            year,
+                            &item.target,
+                        ));
+                    }
+                    Err(error) => report.failed.push(FailedItem {
+                        source: label,
+                        reason: format!("移动失败: {error}"),
+                    }),
+                },
+                SeasonAction::Wash => {
+                    match self.wash_entry(
+                        report,
+                        &item.source,
+                        &item.target,
+                        item.incoming_size,
+                        item.existing_size,
+                    ) {
+                        Ok(()) => merged = true,
+                        Err(reason) => report.failed.push(FailedItem {
+                            source: label,
+                            reason,
+                        }),
+                    }
+                }
+                SeasonAction::Duplicate => {
+                    // Keep the duplicate season next to its siblings so the
+                    // parked copy still shows which series it belongs to.
+                    let duplicate_dir = self.config.duplicate_dir().join(&pack_name);
+                    let duplicate_target = duplicate_dir.join(season_dir_name(item.season));
+                    let outcome = std::fs::create_dir_all(&duplicate_dir)
+                        .map_err(|error| format!("创建重复目录: {error}"))
+                        .and_then(|()| {
+                            move_entry(&item.source, &duplicate_target)
+                                .map_err(|error| format!("移入重复目录: {error}"))
+                        });
+                    match outcome {
+                        Ok(()) => report.duplicates.push(DuplicateItem {
+                            source: label,
+                            existing: item.target.display().to_string(),
+                        }),
+                        Err(reason) => report.failed.push(FailedItem {
+                            source: label,
+                            reason,
+                        }),
+                    }
+                }
+            }
+        }
+        self.merge_pack_leftovers(report, entry, title_dir, &pack_name)?;
+        Ok(merged)
+    }
+
+    /// Move whatever is left in the pack (NFOs, samples, stray files) into the
+    /// title directory once its seasons were handled, then drop the empty pack.
+    fn merge_pack_leftovers(
+        &self,
+        report: &mut ArchiveReport,
+        pack: &Path,
+        title_dir: &Path,
+        pack_name: &str,
+    ) -> Result<(), String> {
+        for child in read_dir_entries(pack)? {
+            let name = child
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| child.display().to_string());
+            let target = title_dir.join(&name);
+            if target.exists() {
+                tracing::warn!(
+                    pack = %pack_name,
+                    leftover = %name,
+                    "pack leftover not merged: the target already exists"
+                );
+                report
+                    .skipped
+                    .push(format!("{pack_name}/{name} (目标已存在，未合并)"));
+                continue;
+            }
+            if let Err(error) = move_entry(&child, &target) {
+                report.failed.push(FailedItem {
+                    source: format!("{pack_name}/{name}"),
+                    reason: format!("移动失败: {error}"),
+                });
+            }
+        }
+        if is_dir_empty(pack) {
+            let _ = std::fs::remove_dir(pack);
+        }
         Ok(())
     }
 
@@ -2039,6 +2285,143 @@ fn decide_existing(
     }
 }
 
+/// What should happen to one season of a series pack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeasonAction {
+    /// The library has no such season: merge it in.
+    Add,
+    /// The library copy is the same version: park the incoming season.
+    Duplicate,
+    /// The incoming season is meaningfully bigger: retire the library copy.
+    Wash,
+}
+
+#[derive(Clone, Debug)]
+struct SeasonPlanItem {
+    season: u32,
+    source: PathBuf,
+    target: PathBuf,
+    action: SeasonAction,
+    incoming_size: u64,
+    /// Size of the library season; `0` when the library has no such season.
+    existing_size: u64,
+}
+
+fn season_dir_name(season: u32) -> String {
+    format!("Season {season:02}")
+}
+
+/// `Season 02`, `Season 2`, `season02`, `S02` and `S2` all name season 2.
+fn season_number_from_dir(name: &str) -> Option<u32> {
+    let lowered = name.trim().to_ascii_lowercase();
+    let rest = if let Some(rest) = lowered.strip_prefix("season") {
+        rest.trim_start_matches([' ', '_', '-', '.'])
+    } else if let Some(rest) = lowered.strip_prefix('s') {
+        rest
+    } else {
+        return None;
+    };
+    let digits: String = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Season subdirectories of a release pack that actually hold video, sorted by
+/// season number so the report and the moves stay deterministic.
+fn season_dirs(pack: &Path) -> Vec<(u32, PathBuf)> {
+    let Ok(reader) = std::fs::read_dir(pack) else {
+        return Vec::new();
+    };
+    let mut seasons: Vec<(u32, PathBuf)> = reader
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() || !dir_contains_video(&path) {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some((season_number_from_dir(&name)?, path))
+        })
+        .collect();
+    seasons.sort_by_key(|(season, _)| *season);
+    seasons
+}
+
+/// Decide every season of a pack on its own. `planned` carries the dry-run plan
+/// of the current batch, so a season an earlier entry would have added counts
+/// as present.
+fn plan_season_pack(
+    pack: &Path,
+    title_dir: &Path,
+    wash_enabled: bool,
+    tolerance_ratio: f64,
+    planned: &HashMap<PathBuf, u64>,
+) -> Vec<SeasonPlanItem> {
+    season_dirs(pack)
+        .into_iter()
+        .map(|(season, source)| {
+            let target = title_dir.join(season_dir_name(season));
+            let incoming_size = path_size(&source);
+            let existing_size = if target.exists() {
+                Some(path_size(&target))
+            } else {
+                planned.get(&target).copied()
+            };
+            match existing_size {
+                None => SeasonPlanItem {
+                    season,
+                    source,
+                    target,
+                    action: SeasonAction::Add,
+                    incoming_size,
+                    existing_size: 0,
+                },
+                Some(existing_size) => {
+                    let action =
+                        if decide_existing(incoming_size, existing_size, wash_enabled, tolerance_ratio)
+                            == ExistingDecision::Wash
+                        {
+                            SeasonAction::Wash
+                        } else {
+                            SeasonAction::Duplicate
+                        };
+                    SeasonPlanItem {
+                        season,
+                        source,
+                        target,
+                        action,
+                        incoming_size,
+                        existing_size,
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+fn organized_item(
+    source: String,
+    matched: &TmdbMatch,
+    region: &str,
+    year: Option<i64>,
+    target: &Path,
+) -> OrganizedItem {
+    OrganizedItem {
+        source,
+        tmdb_id: matched.tmdb_id,
+        target: target.display().to_string(),
+        kind: matched.category_label().to_owned(),
+        region: region.to_owned(),
+        year,
+        title: matched.title.clone(),
+    }
+}
+
 /// Total size of a file or directory tree (metadata only, no data read).
 fn path_size(path: &Path) -> u64 {
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -2974,9 +3357,128 @@ mod tests {
         assert_eq!(decide_existing(0, 1000, true, 0.02), ExistingDecision::Duplicate);
     }
 
+    /// A file with an exact apparent size, so the size decisions are testable
+    /// without writing real media.
+    fn write_sized_file(path: &std::path::Path, size: usize) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, vec![b'x'; size]).unwrap();
+    }
+
+    fn series_tmdb_match() -> TmdbMatch {
+        TmdbMatch {
+            kind: MediaKind::Series,
+            tmdb_id: 68678,
+            title: "聊斋".to_owned(),
+            year: Some(1996),
+            origin_countries: vec!["CN".to_owned()],
+            release_country: None,
+            original_language: Some("zh".to_owned()),
+            genres: Vec::new(),
+        }
+    }
+
+    /// A series pack is judged season by season: a season the library already
+    /// holds is parked as a duplicate, a missing one is merged in, even though
+    /// the pack as a whole is not bigger than the library copy.
+    #[test]
+    fn merges_only_the_missing_season_of_a_pack() {
+        let base = std::env::temp_dir().join(format!("lux-seasons-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pack = base
+            .join("待整理")
+            .join("聊斋 (1996) {tmdb-68678}");
+        let title = base
+            .join("媒体目录")
+            .join("电视剧")
+            .join("国内")
+            .join("1996")
+            .join("聊斋 (1996)");
+        let s01 = "Dark Tales.S01E01.1996.1080p.mkv";
+        let s02 = "Dark Tales.S02E01.1996.1080p.mkv";
+        write_sized_file(&pack.join("Season 01").join(s01), 2000);
+        write_sized_file(&pack.join("Season 02").join(s02), 3000);
+        write_sized_file(&title.join("Season 01").join(s01), 2000);
+
+        let planned = HashMap::new();
+        let plan = plan_season_pack(&pack, &title, true, 0.02, &planned);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].season, 1);
+        assert_eq!(plan[0].action, SeasonAction::Duplicate);
+        assert_eq!(plan[1].season, 2);
+        assert_eq!(plan[1].action, SeasonAction::Add);
+
+        let service = ArchiveService::new_for_tests(archive_config(&base));
+        let mut report = ArchiveReport {
+            dry_run: false,
+            ..ArchiveReport::default()
+        };
+        let merged = service
+            .apply_season_plan(
+                &mut report,
+                &pack,
+                &title,
+                &plan,
+                &series_tmdb_match(),
+                "国内",
+                Some(1996),
+            )
+            .expect("season plan applies");
+        assert!(merged);
+        // The missing season is in the library, the duplicate one is parked
+        // under the pack name, and the emptied pack is gone.
+        assert!(title.join("Season 02").join(s02).exists());
+        assert!(base
+            .join("重复目录")
+            .join("聊斋 (1996) {tmdb-68678}")
+            .join("Season 01")
+            .join(s01)
+            .exists());
+        assert!(!pack.exists());
+        assert_eq!(report.organized.len(), 1);
+        assert_eq!(report.duplicates.len(), 1);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Same two seasons on both sides -> the whole pack stays one duplicate.
+    #[test]
+    fn plans_a_fully_duplicate_series_pack() {
+        let base = std::env::temp_dir().join(format!("lux-seasons2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pack = base.join("待整理").join("某剧");
+        let title = base.join("媒体目录").join("电视剧").join("国内").join("2024").join("某剧 (2024)");
+        for season in ["Season 01", "Season 02"] {
+            write_sized_file(&pack.join(season).join("ep.mkv"), 1000);
+            write_sized_file(&title.join(season).join("ep.mkv"), 1000);
+        }
+        let plan = plan_season_pack(&pack, &title, true, 0.02, &HashMap::new());
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|item| item.action == SeasonAction::Duplicate));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A bigger season in the pack washes the library season; a smaller one does
+    /// not.
+    #[test]
+    fn a_bigger_season_washes_the_library_season() {
+        let base = std::env::temp_dir().join(format!("lux-seasons3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pack = base.join("待整理").join("某剧");
+        let title = base.join("媒体目录").join("电视剧").join("国内").join("2024").join("某剧 (2024)");
+        write_sized_file(&pack.join("Season 02").join("ep.mkv"), 5000);
+        write_sized_file(&title.join("Season 02").join("ep.mkv"), 1000);
+        let plan = plan_season_pack(&pack, &title, true, 0.02, &HashMap::new());
+        assert_eq!(plan[0].action, SeasonAction::Wash);
+        write_sized_file(&pack.join("Season 02").join("ep.mkv"), 1000);
+        let plan = plan_season_pack(&pack, &title, true, 0.02, &HashMap::new());
+        assert_eq!(plan[0].action, SeasonAction::Duplicate);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn sanitizes_path_components() {
-        // Illegal path separators collapse, but a colon becomes a full-width
         // colon so titles like `20:23` survive.
         assert_eq!(sanitize_component("A/B: C*?"), "A B： C");
         assert_eq!(sanitize_component("20:23"), "20：23");
