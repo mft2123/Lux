@@ -3472,14 +3472,29 @@ fn job_file_job_id(path: &Path) -> Option<String> {
     (!job.job_id.trim().is_empty()).then_some(job.job_id)
 }
 
-/// Comparison key for library titles: lowercase alphanumerics only, so
-/// `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
+/// Comparison key for library titles: full-width characters folded to ASCII
+/// first (so `流浪地球２` equals `流浪地球2`), then lowercase alphanumerics
+/// only, so `某剧 第二季 (2024)` and `某剧.第二季` normalize alike.
 fn normalize_title_key(value: &str) -> String {
     value
         .chars()
+        .map(fold_full_width)
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
         .collect()
+}
+
+/// Simplified NFKC: the full-width ASCII block `！`–`～` (`Ａ`–`Ｚ`, `０`–`９`,
+/// `．`, …) and the ideographic space fold to their ASCII forms. The project has
+/// no ICU dependency and a title only needs these two ranges.
+fn fold_full_width(character: char) -> char {
+    match character {
+        '\u{3000}' => ' ',
+        '\u{FF01}'..='\u{FF5E}' => {
+            char::from_u32(character as u32 - 0xFEE0).unwrap_or(character)
+        }
+        _ => character,
+    }
 }
 
 /// Deepest level walked by the library lookup. A title is a child of a year
@@ -4516,6 +4531,32 @@ mod tests {
         );
         assert_eq!(mode_of(&done), 0o600, "已处理/ keeps the mode");
         assert_eq!(mode_of(&service.config.link_state_file()), 0o600, "状态.jsonl");
+    }
+
+    /// Full-width forms (common in hand-typed and IME titles) fold to ASCII
+    /// before comparison, so the lookup and the wash decision see one title.
+    #[test]
+    fn normalizes_full_width_title_characters() {
+        assert_eq!(normalize_title_key("流浪地球２"), "流浪地球2");
+        assert_eq!(normalize_title_key("ＡＢＣ１２３"), "abc123");
+        assert_eq!(normalize_title_key("某剧　第二季"), "某剧第二季");
+        assert_eq!(normalize_title_key("某剧（２０２４）"), "某剧2024");
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let title_dir = tmp
+            .path()
+            .join(MEDIA_DIR)
+            .join("电影")
+            .join("国内")
+            .join("2024")
+            .join("某剧２ (2024)");
+        std::fs::create_dir_all(&title_dir).expect("title dir");
+        std::fs::write(title_dir.join("movie.mkv"), vec![0u8; 300]).unwrap();
+
+        let lookup = service.lookup_library_size("某剧2");
+        assert_eq!(lookup.matched.as_deref(), Some("某剧２ (2024)"));
+        assert_eq!(lookup.size_bytes, Some(300));
     }
 
     /// The part number belongs to the title: asking for part two must not return
