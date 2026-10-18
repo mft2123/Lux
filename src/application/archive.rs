@@ -1762,7 +1762,7 @@ impl ArchiveService {
     /// already recorded in the state file. Used to make ingest idempotent.
     fn find_existing_link_job(&self, url: &str) -> Option<QueuedLinkJob> {
         for entry in read_dir_entries(&self.config.link_queue_dir()).ok()? {
-            if entry.extension().is_none_or(|extension| !extension.eq_ignore_ascii_case("json")) {
+            if !is_link_job_file(&entry) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&entry) else {
@@ -1842,15 +1842,10 @@ impl ArchiveService {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
-            // `状态.jsonl` shares the directory but is not a job file; the
-            // `已处理/` and `无效/` sub-directories are skipped below.
-            if name.starts_with('.') || !name.ends_with(".json") {
-                continue;
-            }
-            let Ok(metadata) = std::fs::symlink_metadata(&entry) else {
-                continue;
-            };
-            if !metadata.file_type().is_file() {
+            // The consumer, the duplicate check and the status counter all use
+            // `is_link_job_file`, so they can never disagree about what a job
+            // is: `状态.jsonl`, `已处理/`, `无效/`, `X.TMP` and symlinks are not.
+            if !is_link_job_file(&entry) {
                 continue;
             }
             report.examined += 1;
@@ -3293,18 +3288,41 @@ fn unix_millis() -> u128 {
         .unwrap_or_default()
 }
 
+/// What counts as a link job file. Shared by the consumer, the duplicate check
+/// and the status counter so the three can never disagree:
+///
+/// - a regular file directly in the queue directory (`已处理/` and `无效/` are
+///   directories, so they never qualify);
+/// - name does not start with `.` (temp files);
+/// - extension is `.json`, case-insensitively (`X.JSON` is a job);
+/// - a symlink is **not** a job: `symlink_metadata` never follows it, so the
+///   consumer and `count_link_jobs` see the same set.
+fn is_link_job_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.starts_with('.') {
+        return false;
+    }
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return false;
+    }
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
 fn count_link_jobs(directory: &Path) -> usize {
     let Ok(reader) = std::fs::read_dir(directory) else {
         return 0;
     };
     reader
         .flatten()
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-        })
+        .filter(|entry| is_link_job_file(&entry.path()))
         .count()
 }
 
@@ -4524,6 +4542,54 @@ mod tests {
         assert_eq!(service.lookup_library_size("2024").size_bytes, None);
         assert_eq!(service.lookup_library_size("国内").size_bytes, None);
         assert_eq!(service.lookup_library_size("电视剧").size_bytes, None);
+    }
+
+    /// One job predicate: the status counter and the consumer agree on
+    /// `X.JSON` vs dotfiles vs `状态.jsonl` vs symlinks.
+    #[test]
+    fn count_and_consume_agree_on_what_a_job_is() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
+        let queue = service.config.link_queue_dir();
+        std::fs::create_dir_all(&queue).expect("queue");
+        let job = |id: &str| LinkJob {
+            job_id: id.to_owned(),
+            url: format!("https://115.com/s/{id}"),
+            ..LinkJob::default()
+        };
+        std::fs::write(
+            queue.join("UPPER.JSON"),
+            serde_json::to_vec(&job("upper")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            queue.join(".hidden.json"),
+            serde_json::to_vec(&job("hidden")).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(queue.join(LINK_QUEUE_STATE_FILE), b"{}\n").unwrap();
+        std::fs::write(queue.join("notes.txt"), b"x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(queue.join("UPPER.JSON"), queue.join("link.json"))
+            .expect("symlink");
+
+        assert_eq!(count_link_jobs(&queue), 1, "only UPPER.JSON is a job");
+        let report = service.ingest_link_queue(false).expect("consumed");
+        assert_eq!(report.examined, 1);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].job_id, "upper");
+        assert_eq!(
+            count_link_jobs(&queue),
+            0,
+            "the symlink and the dotfile are not jobs"
+        );
+        assert!(queue.join(".hidden.json").exists());
+        assert!(queue.join("notes.txt").exists());
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(queue.join("link.json")).is_ok(),
+            "the symlink is left alone"
+        );
     }
 
     /// The walk is cached for `LIBRARY_LOOKUP_CACHE_SECONDS`: a second ask for
