@@ -70,3 +70,25 @@
 - 每个模块合并前：`cargo test --locked --lib archive` 全绿、前端 `pnpm build` 通过、在测试库跑一次 dry-run 验证
 - 模块之间不互相改文件；跨模块需求由总控对话框转达
 - 每次合并后更新本文件「当前进度」与提交哈希
+
+## 第三轮：审核组接手实现（2026-10-18）
+
+用户决定「以后所有模块都由审核组做」，于是从本轮起审核与实现合并到同一个对话框。
+工作分支 `integration/round2`（`fork/phase-a` + settings/notify/sidecar 三个模块分支 + 本轮的整改提交）。
+
+已完成：
+- 设置：S1/S2(F4)/S3/S4/S5/S7/S10/S11/S12（越界 400、provenance 保存、`telegram.api_key`、
+  原地写备份、对象型 channels 保留、PUT 串行、打码、类型校验、按改动校验路径）
+- 通知：N1/N2（类别由后端下发、保存不改形态）、N3（播放通知 IP）、N4（逐条去重键）、N5（发送成功后再记账）、
+  N12（Debug 打码）
+- 旁挂：SC1–SC6、SC8、SC11、SC14–SC18（模块方实现）+ 测试清理与 inbox 0644（审核组补）
+- 归档：F1 剧集按季判定（前一轮已合入 `fork/phase-a`）
+
+测试：archive 62 / notify 41 / playback 97 / sidecar 184（3 skip）全绿；
+整库 `cargo test --lib` 仅剩一个**既有** metadata 用例不稳定（trunk 上同样失败，见总线「已知的 trunk 问题」）。
+
+待办：
+- ingest 分支 `feat/r2-ingest`（I1–I6/I8–I12）合并 + 全量回归
+- 重建 `lux:phase-a` 镜像，`lux-testlib` 重建，端到端验收（设置保存语义、通知类别、旁挂投递）
+- I7/I13/I14、N6/N7/N9–N11/N13、SC7/SC9/SC10/SC12/SC13 留待下一轮
+- U11（115 转存客户端）仍是功能链最后缺口
