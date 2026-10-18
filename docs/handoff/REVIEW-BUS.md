@@ -23,19 +23,29 @@
 
 ---
 
-## 模块：通知（fork/phase-a 上已合并，ad8502b2）
+## 模块：通知（feat/notify-settings）
 
-状态: CHANGES
-分支 / 提交: 直接在 `fork/phase-a`（`ad8502b2`）
+状态: READY
+分支 / 提交: `feat/notify-settings` @ `10cb5e47`（基于 `feat/settings` 87a77c48，已合并 `fork/phase-a`）
 逐条:
-- ✅ 实测发出消息（messageId 48311）、类别过滤、长度截断、非阻塞
-- ⏳ F1 env 覆盖文件（违反约定）
-- ⏳ F2 单文件挂载（同设置）
-- ⏳ F3 重复事件缺失（需决定）
-新意见（审核方）:
-- F1 [严重] `notify/config.rs:304-343` `apply_env` 无条件覆盖；env 只补缺失，并改 `module-notify.md:59` — 验收: 文件与 env 同时设置时用文件值
-- F3 [一般] 增加 `duplicate` 类别逐条通知，或文档写明不做
-- F5 [小项] `api_base` 未打码；两处 chat_id 打码格式不一致；3900 上限按 UTF-16 计
+- ✅ F1 env 覆盖文件 → 改为消费 `ArchiveSettings::load()`，文件优先、`LUX_TG_*` 只补缺失键 — `80ef8046`
+  证据: 单测 `file_values_win_over_environment`、`environment_only_fills_missing_keys`、`environment_notify_list_is_used_only_when_the_file_has_none`
+- ✅ F2 单文件 bind mount PUT → `rename` 遇 EBUSY/EXDEV 退化为原地写（截断重写 + 0600 + WARN），其他错误照常透传 — `24090385`
+  证据: 单测 3 个（fallback 内容/权限、非 bind 错误透传、EBUSY/EXDEV 分类）+ 单文件挂载 E2E `10cb5e47`
+  E2E: `-v /vol5/1000/build/bind-settings.json:/tmp/archive-settings.json` + `LUX_BIND_MOUNT_TEST_PATH=/tmp/archive-settings.json`，`cargo test --lib bind_mount_save_end_to_end -- --ignored` → 1 passed，宿主文件内容更新且仍 600
+  备注: 挂载文件必须对容器运行用户可写（生产为 root:root 600）；首次尝试用 qiangli 600 的宿主文件会 EACCES，属预期权限错误
+- ✅ F3 重复事件 → 新增 `duplicate`/`重复` 类别逐条通知（受开关控制），汇总保留计数 — `1401b09d`
+  证据: 单测 `archive_report_produces_one_event_per_item_and_a_summary`、`duplicate_event_carries_the_existing_path`
+- ✅ F5 api_base 打码、chat_id 统一 `head6…(len)`、3900 上限按 UTF-16 码元 — `191dd852`
+  证据: 单测 `api_base_drops_credentials_and_paths`、`chat_id_uses_the_settings_mask_format`、`emoji_count_as_two_utf16_units_and_stay_within_the_limit`
+测试:
+- `cargo test --locked --lib notify` → 40 通过
+- `cargo test --locked --lib archive` → 46 通过（另 1 ignored 即 bind-mount E2E）
+- `cargo test --locked --lib playback` → 97 通过
+遗留:
+- F4（save 不落 env 派生值）属设置模块，本分支未改
+- 未做真实 TG 发送（测试库无 settings 文件；需审核方许可后执行）
+新意见（审核方）: 无（F1/F2/F3/F5 已按上表处理，等待复审）
 
 ---
 
