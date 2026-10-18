@@ -26,7 +26,7 @@ sidecar/telegram/
   tools/api_smoke.py # 升级 telethon 后核对 API
   session/           # telethon session（0700 目录 / 0600 文件，不进仓库）
   state/             # SQLite 状态库（0700 目录 / 0600 文件）
-  Dockerfile         # 非 root（10001），healthcheck 会真的失败
+  Dockerfile         # 非 root（10001），healthcheck 走 `check --deep`（掉线即 unhealthy）
   compose.fragment.yml
 ```
 
@@ -255,18 +255,21 @@ telethon==1.45.0  pyaes==1.6.1  rsa==4.9.1  pyasn1==0.6.4  python-socks==2.8.2
 
 ```bash
 cd sidecar/telegram
-python -m unittest discover -s tests -t .    # 184 个用例，全部离线
-python tools/api_smoke.py                    # 升级 telethon 后核对 API（21 项，需要 telethon）
+python -m unittest discover -s tests -t .    # 207 个用例，全部离线
+python tools/api_smoke.py                    # 升级 telethon 后核对 API（24 项，需要 telethon）
 ```
 
 权限类用例（session / 设置文件的 `chmod`）在 root 或「不校验 chmod」的文件系统上会自动
-`skip`，不会假装通过；正常情况下 184 条全跑。
+`skip`，不会假装通过；没装 telethon 时「真 session 文件」那条也会 skip，正常情况下 207 条全跑
+（装了 telethon 的环境会多跑一条真 `TelegramClient` 用例）。
 
 覆盖：UTF-16 锚文本切片、隐藏链接、类型判定、体积解析（`4K/8K/8M` 不算体积）、五模式、
 洗版容差与「未知就挂起」、配置优先级/打码/硬错误、`other` 默认不放行、HTML 实体反转义、
 SQLite 去重与频道游标、inbox 与 HTTP 契约（完整 payload）、`X-Lux-Api-Key`、lookup 失败降级、
 死信与重试上限/退避、日志脱敏、登录验证码两条路径与首登 phone 校验、回填取最新 / 按游标补拉、
-session 权限加固、sqlite 错误分类（损坏 vs 权限/磁盘）、关停前收尾后台任务、部署片段静态检查。
+session 权限加固、sqlite 错误分类（损坏 vs 权限/磁盘）、关停前收尾后台任务、部署片段静态检查、
+逐链接标题与 `title_ambiguous` 挂起、`check --deep` 三种登录态结果、requirements 版本锁定、
+`channel:msg_id` 去重键在 backfill/handler 一致、垃圾 session 走真 `TelegramClient`。
 
 ## 升级注意：去重键语义（SC12）
 

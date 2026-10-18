@@ -865,6 +865,51 @@ class SessionErrorClassificationTest(unittest.TestCase):
         self.assertIn("errno 28", message)
 
 
+try:  # 只有装了 telethon 的环境才跑「真 client」用例（容器里装了，开发机常常没装）
+    from telethon import TelegramClient as _RealTelegramClient
+except ImportError:  # pragma: no cover - 取决于环境
+    _RealTelegramClient = None
+
+
+@unittest.skipUnless(_RealTelegramClient is not None, "需要 telethon：pip install -r requirements.txt")
+class RealSessionCorruptionTest(unittest.TestCase):
+    """review SC13：垃圾 session 文件走**真的** `TelegramClient`，不手工 raise。
+
+    老用例是 `raise sqlite3.DatabaseError("file is not a database")`——它只测了
+    `session_errors` 的分类表，并没有证明 telethon 真的会抛这个异常、也没有证明
+    我们的 with 块罩得住构造/连接阶段。这里把垃圾字节写进 session 路径，让
+    telethon 自己去读它。
+    """
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+        self.config = make_config(self.tmp)
+        self.config.session_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def test_garbage_session_becomes_runner_error(self):
+        self.config.session_path.write_bytes(b"\x00\x01this is not a database" * 64)
+
+        def open_client() -> None:
+            # telethon 1.45 的 SQLiteSession 在构造时就 `select ... from sqlite_master`，
+            # 所以垃圾文件在这里就炸；万一某个版本改成延迟读取，下面 connect() 之前
+            # 读 auth key 也会先碰到 sqlite（不会真连网）。
+            client = _RealTelegramClient(
+                str(self.config.session_path), 123456, "0123456789abcdef0123456789abcdef"
+            )
+            asyncio.run(client.connect())
+
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                open_client()
+        message = str(ctx.exception)
+        self.assertIn("session 文件损坏", message)
+        self.assertIn(str(self.config.session_path), message)
+        self.assertIn("not a database", message.lower())
+
+
 class PhoneValidationTest(unittest.TestCase):
     """review SC16：首次登录缺 phone 要抛 RunnerError（exit 2），不是 telethon 的裸异常。"""
 
