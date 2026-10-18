@@ -1551,7 +1551,7 @@ pub(crate) async fn admin_archive_lookup(
     let service = crate::application::archive::ArchiveService::new(
         crate::application::archive::ArchiveConfig::from_env(),
     );
-    Json(service.lookup_library_size(title)).into_response()
+    Json(service.lookup_library_size_isolated(title).await).into_response()
 }
 
 pub(crate) async fn admin_notify_status(
