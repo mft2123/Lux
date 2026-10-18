@@ -11,6 +11,12 @@
 //! The matching rules are frozen in `docs/archive-pipeline.md`; change that
 //! document first and then the code, never the other way around.
 
+// TODO(I16): the archive admin endpoints parse `dry_run` / `overwrite` as
+// `bool` only, so `?dry_run=1` answers 400 even though the old docs promised
+// `1|0`. `docs/archive-pipeline.md` §9 now documents `true|false`; accepting
+// `1|0` needs the query parser in `src/api/admin/admin_jobs.rs` (owned by the
+// settings change), not this module.
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
