@@ -519,7 +519,7 @@ impl ArchiveService {
                 .or(matched.year)
                 .filter(|year| (1888..=2100).contains(year));
             let region = if matched.is_domestic() { "国内" } else { "国外" };
-            let board = format!("{region}{}", matched.category_label());
+            let category = matched.category_label();
             let year_segment = year
                 .map(|year| year.to_string())
                 .unwrap_or_else(|| "未知年份".to_owned());
@@ -531,7 +531,8 @@ impl ArchiveService {
             let mut target_dir = self
                 .config
                 .media_dir()
-                .join(&board)
+                .join(category)
+                .join(region)
                 .join(&year_segment)
                 .join(&title_dir);
             if matched.kind == MediaKind::Series && !is_dir {
@@ -969,22 +970,31 @@ impl ArchiveService {
     ) -> Result<nfo::MetadataReport, String> {
         let mut report = nfo::MetadataReport::default();
         let media = self.config.media_dir();
-        for board in read_dir_entries(&media)? {
-            if !board.is_dir() {
+        for category_dir in read_dir_entries(&media)? {
+            if !category_dir.is_dir() {
                 continue;
             }
-            let board_name = board
+            let category_name = category_dir
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let series_board = board_name.contains("电视剧")
-                || board_name.contains("综艺")
-                || board_name.contains("动画");
-            let movie_board = board_name.contains("电影");
-            if !series_board && !movie_board {
+            let series_category = category_name.contains("电视剧")
+                || category_name.contains("综艺")
+                || category_name.contains("动画");
+            let movie_category = category_name.contains("电影");
+            if !series_category && !movie_category {
                 continue;
             }
-            for year_dir in read_dir_entries(&board)? {
+            for region_dir in read_dir_entries(&category_dir)? {
+                if !region_dir.is_dir() {
+                    continue;
+                }
+                let mut year_dirs = vec![region_dir.clone()];
+                let nested = read_dir_entries(&region_dir)?;
+                if nested.iter().any(|path| path.is_dir()) {
+                    year_dirs = nested;
+                }
+                for year_dir in year_dirs {
                 if !year_dir.is_dir() {
                     continue;
                 }
@@ -999,7 +1009,7 @@ impl ArchiveService {
                         continue;
                     };
                     let already_done = mirror_dir.join("tvshow.nfo").exists()
-                        || (!series_board && dir_has_nfo(&mirror_dir));
+                        || (!series_category && dir_has_nfo(&mirror_dir));
                     if !overwrite && already_done {
                         report.skipped.push(title_dir.display().to_string());
                         continue;
@@ -1014,7 +1024,7 @@ impl ArchiveService {
                             .push(format!("{}: 无法从目录名解析", title_dir.display()));
                         continue;
                     };
-                    let matched = match self.lookup_tmdb(&parsed, series_board).await {
+                    let matched = match self.lookup_tmdb(&parsed, series_category).await {
                         Ok(Some(matched)) => matched,
                         Ok(None) => {
                             report
@@ -1044,6 +1054,7 @@ impl ArchiveService {
                         .write_entry(&title_dir, &mirror_dir, &parsed, &matched, &mut report)
                         .await;
                 }
+            }
             }
         }
         Ok(report)
