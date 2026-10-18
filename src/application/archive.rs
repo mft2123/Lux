@@ -763,11 +763,25 @@ impl ArchiveService {
             let results = self
                 .tmdb_search(api_key, segment, &parsed.title, parsed.year)
                 .await?;
-            let Some(best) = pick_best_result(&results, &parsed.title, parsed.year) else {
+            let mut candidate_count = results.len();
+            // Owned candidate: the year-filtered search may be replaced by an
+            // unfiltered one, and a borrow into the replaced value would not
+            // outlive the loop body.
+            let mut best = pick_best_result(&results, &parsed.title, parsed.year).cloned();
+            if best.is_none() && parsed.year.is_some() {
+                // The year filter hides entries whose TMDB date is missing
+                // (Detective Investigation Files IV); retry without it.
+                let without_year = self
+                    .tmdb_search(api_key, segment, &parsed.title, None)
+                    .await?;
+                candidate_count = without_year.len();
+                best = pick_best_result(&without_year, &parsed.title, None).cloned();
+            }
+            let Some(best) = best else {
                 tracing::debug!(
                     query = %parsed.title,
                     segment,
-                    candidates = results.len(),
+                    candidates = candidate_count,
                     "TMDB search returned no usable match"
                 );
                 continue;
