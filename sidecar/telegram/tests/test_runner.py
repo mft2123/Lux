@@ -688,6 +688,52 @@ class SessionErrorClassificationTest(unittest.TestCase):
         self.assertIn("errno 28", message)
 
 
+class PhoneValidationTest(unittest.TestCase):
+    """review SC16：首次登录缺 phone 要抛 RunnerError（exit 2），不是 telethon 的裸异常。"""
+
+    class FakeClient:
+        def __init__(self):
+            self.started = False
+            self.kwargs = {}
+
+        async def start(self, **kwargs):
+            self.started = True
+            self.kwargs = kwargs
+
+        async def get_me(self):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(id=1, username="me")
+
+    def test_first_login_without_phone_is_runner_error(self):
+        with support.temp_dir() as tmp:
+            config = make_config(Path(tmp), phone="")
+            client = self.FakeClient()
+            with self.assertRaises(runner.RunnerError) as ctx:
+                asyncio.run(runner._authorize(client, config))
+        self.assertIn("phone", str(ctx.exception))
+        self.assertIn("LUX_TG_PHONE", str(ctx.exception))
+        self.assertFalse(client.started)
+
+    def test_first_login_with_phone_starts(self):
+        with support.temp_dir() as tmp:
+            config = make_config(Path(tmp), phone="+10000000000")
+            client = self.FakeClient()
+            asyncio.run(runner._authorize(client, config))
+        self.assertTrue(client.started)
+        self.assertEqual(client.kwargs["phone"], "+10000000000")
+
+    def test_existing_session_does_not_require_phone(self):
+        with support.temp_dir() as tmp:
+            config = make_config(Path(tmp), phone="")
+            config.session_dir.mkdir(parents=True, exist_ok=True)
+            config.session_path.write_text("x", encoding="utf-8")
+            client = self.FakeClient()
+            asyncio.run(runner._authorize(client, config))
+        self.assertTrue(client.started)
+        self.assertIsNone(client.kwargs["phone"])
+
+
 class LoginFlowTest(unittest.TestCase):
     """文档要求的登录录入方式：验证码写进 session/code.txt，或 tty 里直接敲。"""
 

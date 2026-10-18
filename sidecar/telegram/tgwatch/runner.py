@@ -187,8 +187,18 @@ def code_provider(config: config_mod.SidecarConfig):
 
 
 async def _authorize(client, config: config_mod.SidecarConfig) -> None:
-    """首次运行登录（文档流程）：日志提示 → 人工录入 → session 落盘。"""
-    if not config.session_path.exists():
+    """首次运行登录（文档流程）：日志提示 → 人工录入 → session 落盘。
+
+    首次登录必须有 phone；缺了就在这里抛 `RunnerError`（exit 2 + 一行中文），
+    而不是让 telethon 抛一个带栈的 `ValueError`（review SC16）。
+    """
+    first_run = not config.session_path.exists()
+    if first_run and not config.phone:
+        raise RunnerError(
+            "首次登录缺少 phone：在设置文件的 telegram.phone 里填，或设置 LUX_TG_PHONE"
+            f"（session 已存在时不需要；当前 session 路径 {config.session_path}）"
+        )
+    if first_run:
         log.info("首次运行：%s 不存在，开始登录流程", config.session_path)
     await client.start(
         phone=config.phone or None,
