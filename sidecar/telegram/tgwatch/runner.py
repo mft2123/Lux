@@ -308,6 +308,60 @@ def session_errors(config: config_mod.SidecarConfig):
         ) from error
 
 
+# ---------------------------------------------------------------- 登录态自检（check --deep）
+
+
+# `check --deep` 连一次 Telegram 的等待上限（秒）。Dockerfile 的 HEALTHCHECK
+# `--timeout` 必须比它大，否则 docker 会先杀掉进程、报不出「超时」的原因。
+DEEP_CHECK_TIMEOUT = 10.0
+
+
+def _new_client(config: config_mod.SidecarConfig):
+    """按配置造一个 TelegramClient；测试里替换掉它来注入假 client。"""
+    TelegramClient, _events, _utils = _telethon()
+    return TelegramClient(str(config.session_path), config.api_id, config.api_hash)
+
+
+async def _probe_authorized(factory, config: config_mod.SidecarConfig) -> bool:
+    client = factory(config)
+    try:
+        await client.connect()
+        return bool(await client.is_user_authorized())
+    finally:
+        # 连不上/超时也要断开，别在 healthcheck 里泄漏连接
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+
+async def check_session(
+    config: config_mod.SidecarConfig,
+    *,
+    client_factory=None,
+    timeout: float = DEEP_CHECK_TIMEOUT,
+) -> tuple[bool, str]:
+    """`check --deep`：真的连一次 Telegram，确认 session 还有登录态（review SC9）。
+
+    `check` 只证明「文件在、字段不空」；session 过期但文件还在时它照样说健康。
+    这里用 `is_user_authorized()` 问一次服务端（带 10s 超时）：无 session、未授权、
+    连不上都返回 `(False, 原因)`。**不抛异常**——healthcheck 只看退出码。
+    """
+    if not config.session_path.exists():
+        return False, f"session 不存在（{config.session_path}）：先跑 `main.py run` 完成首次登录"
+    factory = client_factory or _new_client
+    try:
+        with session_errors(config):
+            authorized = await asyncio.wait_for(_probe_authorized(factory, config), timeout)
+    except RunnerError as error:
+        return False, str(error)
+    except asyncio.TimeoutError:
+        return False, f"连接 Telegram 超时（{timeout:g}s）：检查容器网络/代理后重试"
+    except Exception as error:  # noqa: BLE001 - healthcheck 不能因为异常类型而崩
+        return False, f"连接 Telegram 失败：{type(error).__name__}: {error}"
+    if not authorized:
+        return False, "session 未登录或已失效（is_user_authorized=False）：删掉 session 后重新登录"
+    return True, "session 已登录（is_user_authorized=True）"
+
+
 # ---------------------------------------------------------------- 洗版查询
 
 

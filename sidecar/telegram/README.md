@@ -158,11 +158,22 @@ docker compose up -d telegram && docker logs -f lux-telegram
 ## 运维命令
 
 ```bash
-docker exec -u 10001 lux-telegram python main.py status      # 配置（打码）+ session 权限 + inbox
-docker exec -u 10001 lux-telegram python main.py check       # 校验（无 session 时返回 1，healthcheck 用）
+docker exec -u 10001 lux-telegram python main.py status       # 配置（打码）+ session 权限 + inbox
+docker exec -u 10001 lux-telegram python main.py check        # 只验配置就绪（不联网）
+docker exec -u 10001 lux-telegram python main.py check --deep # 再连一次 Telegram 验登录态
 docker exec -u 10001 lux-telegram python main.py held --limit 50
 docker exec -u 10001 lux-telegram python main.py replay --all
 ```
+
+### `check` 与 `check --deep` 的区别（SC9）
+
+| 命令 | 检查什么 | 用在哪 |
+| --- | --- | --- |
+| `main.py check` | 只看**配置就绪**：设置文件能读、`listen_channels` 非空、session 文件存在、`sink=http` 时 `api_key` 非空。**不联网**。 | 部署检查清单第 5 步、改配置后快速自检 |
+| `main.py check --deep` | 在上面基础上真的连一次 Telegram，用 `is_user_authorized()` 确认 session 还有登录态（10s 超时）。无 session、未授权、连不上都返回非零。 | `Dockerfile` 的 `HEALTHCHECK` |
+
+session 过期但文件还在时 `check` 仍然通过——这是它「只验配置就绪」的边界。容器健康状态
+由 `check --deep` 决定：掉线即 unhealthy；容器内没有网络时也会失败，这是期望行为（不是误报）。
 
 ## 下游契约
 

@@ -3,11 +3,12 @@
 
     python main.py run               # 首次运行即登录（验证码提示在日志里），之后常驻监听
     python main.py status            # 配置（打码）+ 状态库统计
-    python main.py check             # 只校验配置，不起网络
+    python main.py check             # 只校验配置是否就绪，不联网
+    python main.py check --deep      # 配置 + 连一次 Telegram 确认登录态（HEALTHCHECK 用）
     python main.py held              # 看被挂起的条目（手动模式 / 洗版判定未知）
     python main.py replay --all      # 管理员触发：把挂起/失败/pending 的条目推给 Lux
 
-退出码：0 正常，1 check 有硬错误，2 配置或登录前置条件缺失。
+退出码：0 正常，1 check 有硬错误（含 `check --deep` 未登录/连不上），2 配置或登录前置条件缺失。
 """
 
 from __future__ import annotations
@@ -43,7 +44,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("run", help="常驻监听（首次运行会走登录流程）")
     sub.add_parser("status", help="打印配置（打码）与状态库统计")
-    sub.add_parser("check", help="校验配置，不联网")
+    check = sub.add_parser("check", help="校验配置是否就绪；--deep 额外验 Telegram 登录态")
+    check.add_argument(
+        "--deep",
+        action="store_true",
+        help="连一次 Telegram，用 is_user_authorized() 确认 session 仍有登录态（healthcheck 用）",
+    )
 
     held = sub.add_parser("held", help="列出被挂起的条目")
     held.add_argument("--limit", type=int, default=50)
@@ -100,7 +106,11 @@ def _cmd_status(config: config_mod.SidecarConfig) -> int:
     return 0
 
 
-def _cmd_check(config: config_mod.SidecarConfig) -> int:
+def _cmd_check(config: config_mod.SidecarConfig, deep: bool = False) -> int:
+    """`check`：配置就绪；`check --deep`：再加一次真的 Telegram 登录态自检。
+
+    两者都返回 0/1：healthcheck 只看退出码，原因打成一行中文。
+    """
     for warning in config_mod.runtime_warnings(config):
         print(f"⚠️  {warning}")
     problems = config_mod.runtime_problems(config)
@@ -108,7 +118,14 @@ def _cmd_check(config: config_mod.SidecarConfig) -> int:
         for problem in problems:
             print(f"❌ {problem}")
         return 1
-    print("✅ 配置可用")
+    if not deep:
+        print("✅ 配置可用")
+        return 0
+    ok, detail = asyncio.run(runner.check_session(config))
+    if not ok:
+        print(f"❌ {detail}")
+        return 1
+    print(f"✅ 配置可用；{detail}")
     return 0
 
 
@@ -192,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             return _cmd_status(config)
         if args.command == "check":
-            return _cmd_check(config)
+            return _cmd_check(config, deep=args.deep)
         if args.command == "held":
             return _cmd_held(config, args.limit, args.channel)
         if args.command == "run":
