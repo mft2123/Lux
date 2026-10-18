@@ -326,6 +326,111 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(store.stats()["by_status"].get(store_mod.STATUS_DELIVERED), 1)
 
 
+class PerLinkTitleTest(unittest.TestCase):
+    """review SC7：一条消息多个链接时，每个链接用自己的标题；拿不到就挂起不猜。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def build(self, config, lookup=None, sink=None):
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        watcher = runner.Watcher(config, store, sink or FakeSink(), lookup or FakeLookup())
+        return watcher, store
+
+    # 「第一集」挂隐藏链接，另一个链接只有明文 URL（没有锚文本）
+    ONE_ANCHOR_TEXT = "第一集 https://115.com/s/two"
+    ONE_ANCHOR_ENTITIES = [
+        {"type": "MessageEntityTextUrl", "offset": 0, "length": 3, "url": "https://115.com/s/one"}
+    ]
+
+    def test_link_without_own_title_is_held_not_guessed(self):
+        config = make_config(self.tmp)
+        sink = FakeSink()
+        watcher, store = self.build(config, sink=sink)
+        asyncio.run(
+            watcher.process(message(self.ONE_ANCHOR_TEXT, self.ONE_ANCHOR_ENTITIES), config.channels[0])
+        )
+
+        # 有锚文本的那条正常投递，标题就是它自己的锚文本
+        self.assertEqual(len(sink.sent), 1)
+        self.assertEqual(sink.sent[0]["url"], "https://115.com/s/one")
+        self.assertEqual(sink.sent[0]["title"], "第一集")
+        # 没有独立标题的那条挂起，原因可见、且没有拿整段正文当标题
+        held = store.items_by_status((store_mod.STATUS_HELD,))
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["url"], "https://115.com/s/two")
+        self.assertEqual(held[0]["reason"], "title_ambiguous")
+        self.assertEqual(held[0]["title"], "")
+        self.assertNotEqual(held[0]["title"], self.ONE_ANCHOR_TEXT)
+        # 一条消息一行留痕，两个条目
+        self.assertEqual(store.stats()["messages"], 1)
+        self.assertEqual(store.stats()["items"], 2)
+        self.assertEqual(watcher.counts["delivered"], 1)
+        self.assertEqual(watcher.counts["held"], 1)
+
+    def test_single_link_still_falls_back_to_first_line(self):
+        """单链接消息没有锚文本时，首行正文就是它的标题（保持老行为）。"""
+        config = make_config(self.tmp)
+        sink = FakeSink()
+        watcher, _ = self.build(config, sink=sink)
+        asyncio.run(
+            watcher.process(
+                message(text="沙丘2 2024 https://115.com/s/plain 12G"), config.channels[0]
+            )
+        )
+        self.assertEqual(len(sink.sent), 1)
+        self.assertTrue(sink.sent[0]["title"])
+        self.assertIn("沙丘2 2024", sink.sent[0]["title"])
+
+    # 两个链接各自有锚文本
+    TWO_ANCHORS_TEXT = "某剧A 某剧B 12G"
+    TWO_ANCHORS_ENTITIES = [
+        {"type": "MessageEntityTextUrl", "offset": 0, "length": 3, "url": "https://115.com/s/a"},
+        {"type": "MessageEntityTextUrl", "offset": 4, "length": 3, "url": "https://115.com/s/b"},
+    ]
+
+    def test_wash_looks_up_each_link_by_its_own_title(self):
+        config = make_config(
+            self.tmp,
+            channels=(config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_WASH),),
+        )
+        lookup = FakeLookup(size_bytes=5 * 1024**3)
+        sink = FakeSink()
+        watcher, _ = self.build(config, lookup=lookup, sink=sink)
+
+        asyncio.run(
+            watcher.process(message(self.TWO_ANCHORS_TEXT, self.TWO_ANCHORS_ENTITIES), config.channels[0])
+        )
+
+        # 两条链接各查各的标题，不再用「整条消息一个标题」查一次
+        self.assertEqual(lookup.calls, ["某剧A", "某剧B"])
+        self.assertEqual(len(sink.sent), 2)
+        self.assertEqual([item["title"] for item in sink.sent], ["某剧A", "某剧B"])
+
+    def test_wash_holds_untitled_link_without_querying_the_library(self):
+        config = make_config(
+            self.tmp,
+            channels=(config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_WASH),),
+        )
+        lookup = FakeLookup(size_bytes=5 * 1024**3)
+        sink = FakeSink()
+        watcher, store = self.build(config, lookup=lookup, sink=sink)
+
+        asyncio.run(
+            watcher.process(message(self.ONE_ANCHOR_TEXT + " 12G", self.ONE_ANCHOR_ENTITIES), config.channels[0])
+        )
+
+        # 只按有标题的那条查库；缺标题的那条不查、不猜
+        self.assertEqual(lookup.calls, ["第一集"])
+        self.assertEqual([item["url"] for item in sink.sent], ["https://115.com/s/one"])
+        held = store.items_by_status((store_mod.STATUS_HELD,))
+        self.assertEqual([item["reason"] for item in held], ["title_ambiguous"])
+
+
 class DeadLetterTest(unittest.TestCase):
     """review SC4：400/403 只尝试一次就落死信；其余错误重试到上限后落死信。"""
 

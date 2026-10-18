@@ -45,6 +45,33 @@ class RunnerError(RuntimeError):
     """启动前置条件不满足（未登录、session 损坏、频道解析不到、未装 telethon）。"""
 
 
+# 判定结果 → 条目初始状态（逐链接判定，一条消息里可以有不同结果）
+_ITEM_STATUS = {
+    filters.STATUS_DELIVER: store_mod.STATUS_PENDING,
+    filters.STATUS_HOLD: store_mod.STATUS_HELD,
+    filters.STATUS_SKIP: store_mod.STATUS_SKIPPED,
+}
+
+
+def _message_outcome(decisions: list[filters.Decision]) -> tuple[str, str]:
+    """消息级留痕（去重行，不决定投递）：有链接要投递就 pending，否则 held/skipped。
+
+    逐链接判定后一条消息可能「一半投递一半挂起」，消息行只记最能代表这条消息的
+    那个结果；每条链接的真实状态在 items 表中（review SC7）。
+    """
+    for decision in decisions:
+        if decision.deliver:
+            return store_mod.STATUS_PENDING, decision.reason
+    for decision in decisions:
+        if decision.status == filters.STATUS_HOLD:
+            return store_mod.STATUS_HELD, decision.reason
+    return store_mod.STATUS_SKIPPED, decisions[0].reason
+
+
+def _short_url(url: str, limit: int = 80) -> str:
+    return url if len(url) <= limit else url[: limit - 3] + "..."
+
+
 def backoff_seconds(base: int, consecutive_failures: int) -> int:
     """连续失败时的重试间隔：base → 2*base → 4*base… 封顶 MAX_BACKOFF_SECONDS。
 
@@ -341,7 +368,6 @@ class Watcher:
         found = links_mod.extract_links(incoming.text, incoming.entities)
         accepted = links_mod.split_kinds(found, self.config.allowed_kinds)
         mode = channel.mode
-        title = links_mod.title_from(incoming.text, accepted or found)
         size_bytes = links_mod.parse_size(incoming.text)
 
         if not accepted:
@@ -360,27 +386,16 @@ class Watcher:
             log.debug("%s 无可用链接（提取到 %d 条），跳过", incoming.key, len(found))
             return
 
-        library: dict = {"ok": True, "size_bytes": None, "matched": None}
-        if mode == filters.MODE_WASH and size_bytes is not None:
-            library = await self.lookup.lookup(title)
+        # review SC7：逐链接判定。每个链接只用自己的锚文本当标题；一条消息里有多个
+        # 链接时，缺标题的那个不许拿整段正文兜底（那等于把别人的标题套给它），
+        # 记 held/title_ambiguous，其余链接照常投递。
+        allow_text_fallback = len(accepted) == 1
+        outcomes: list[tuple[links_mod.Link, str, filters.Decision]] = []
+        for link in accepted:
+            title = links_mod.link_title(link, incoming.text, fallback_to_text=allow_text_fallback)
+            outcomes.append((link, title, await self._decide_link(channel, mode, title, size_bytes)))
 
-        decision = filters.decide(
-            mode,
-            title=title,
-            follow_list=self.config.follow_for(channel.key()),
-            size_bytes=size_bytes,
-            library_size=library.get("size_bytes"),
-            library_known=bool(library.get("ok", True)),
-            wash_tolerance=self.config.wash_tolerance,
-            link_count=len(accepted),
-        )
-
-        initial_status = {
-            filters.STATUS_DELIVER: store_mod.STATUS_PENDING,
-            filters.STATUS_HOLD: store_mod.STATUS_HELD,
-            filters.STATUS_SKIP: store_mod.STATUS_SKIPPED,
-        }[decision.status]
-
+        msg_status, msg_reason = _message_outcome([decision for _, _, decision in outcomes])
         self.store.record_message(
             msg_key=incoming.key,
             channel=incoming.channel,
@@ -388,13 +403,16 @@ class Watcher:
             msg_date=incoming.date,
             mode=mode,
             link_count=len(accepted),
-            status=initial_status,
-            reason=decision.reason,
+            status=msg_status,
+            reason=msg_reason,
         )
         self.store.advance_message_id(incoming.channel, incoming.msg_id)
 
-        item_ids: list[int] = []
-        for link in accepted:
+        deliver_ids: list[int] = []
+        held: dict[str, int] = {}
+        skipped: dict[str, int] = {}
+        for link, title, decision in outcomes:
+            item_status = _ITEM_STATUS[decision.status]
             item_id = self.store.add_item(
                 msg_key=incoming.key,
                 channel=incoming.channel,
@@ -406,33 +424,66 @@ class Watcher:
                 title=title,
                 size_bytes=size_bytes,
                 mode=mode,
-                status=initial_status,
+                status=item_status,
                 reason=decision.reason,
             )
-            if item_id:
-                item_ids.append(item_id)
+            if decision.deliver:
+                if item_id:
+                    deliver_ids.append(item_id)
+                continue
+            if decision.reason == filters.HOLD_TITLE_AMBIGUOUS.reason:
+                # 日志点名具体链接：不然运维只看到「有一条被挂起」，不知道该补哪条的标题
+                log.info(
+                    "%s %s 链接 %s 没有独立标题（title_ambiguous）：挂起不猜，其余链接照常处理",
+                    incoming.channel,
+                    incoming.msg_id,
+                    _short_url(link.url),
+                )
+            bucket = held if decision.status == filters.STATUS_HOLD else skipped
+            bucket[decision.reason] = bucket.get(decision.reason, 0) + 1
 
-        if not decision.deliver:
-            self.counts["held" if decision.status == filters.STATUS_HOLD else "skipped"] += 1
-            log.info(
-                "%s %s %s：%s（%d 条链接）",
-                incoming.channel,
-                incoming.msg_id,
-                "挂起" if decision.status == filters.STATUS_HOLD else "不投递",
-                decision.reason,
-                len(item_ids),
-            )
+        self.counts["held"] += sum(held.values())
+        self.counts["skipped"] += sum(skipped.values())
+        for reason, count in held.items():
+            log.info("%s %s 挂起 %d 条链接：%s", incoming.channel, incoming.msg_id, count, reason)
+        for reason, count in skipped.items():
+            log.info("%s %s 不投递 %d 条链接：%s", incoming.channel, incoming.msg_id, count, reason)
+        if not deliver_ids:
             return
 
         log.info(
             "%s %s 投递 %d 条链接（%s / %s）",
             incoming.channel,
             incoming.msg_id,
-            len(item_ids),
+            len(deliver_ids),
             mode,
-            decision.reason,
+            msg_reason,
         )
-        await self.deliver(item_ids)
+        await self.deliver(deliver_ids)
+
+    async def _decide_link(
+        self,
+        channel: config_mod.ChannelConfig,
+        mode: str,
+        title: str,
+        size_bytes: int | None,
+    ) -> filters.Decision:
+        """单个链接的判定；洗版按**这个链接自己的标题**查库（同标题走缓存）。"""
+        if not title:
+            return filters.HOLD_TITLE_AMBIGUOUS
+        library: dict = {"ok": True, "size_bytes": None, "matched": None}
+        if mode == filters.MODE_WASH and size_bytes is not None:
+            library = await self.lookup.lookup(title)
+        return filters.decide(
+            mode,
+            title=title,
+            follow_list=self.config.follow_for(channel.key()),
+            size_bytes=size_bytes,
+            library_size=library.get("size_bytes"),
+            library_known=bool(library.get("ok", True)),
+            wash_tolerance=self.config.wash_tolerance,
+            link_count=1,
+        )
 
     async def deliver(self, item_ids: list[int]) -> int:
         """逐条投递；返回本轮失败（含落死信）的条数。"""
