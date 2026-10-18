@@ -706,6 +706,10 @@ impl ArchiveService {
         Ok(None)
     }
 
+    /// Search in en-US and in the display language, then merge by TMDB id.
+    /// Chinese titles often exist only in the zh-CN index
+    /// (刑事侦缉档案4), while release names are English; one query alone misses
+    /// one of the two.
     async fn tmdb_search(
         &self,
         api_key: &str,
@@ -713,12 +717,45 @@ impl ArchiveService {
         query: &str,
         year: Option<i64>,
     ) -> Result<Vec<serde_json::Value>, String> {
+        let mut results = self
+            .tmdb_search_in_language(api_key, segment, query, year, "en-US")
+            .await?;
+        if !self.config.tmdb_language.eq_ignore_ascii_case("en-US") {
+            if let Ok(extra) = self
+                .tmdb_search_in_language(api_key, segment, query, year, &self.config.tmdb_language)
+                .await
+            {
+                let mut seen = results
+                    .iter()
+                    .filter_map(|result| result.get("id").and_then(|value| value.as_i64()))
+                    .collect::<std::collections::HashSet<_>>();
+                for item in extra {
+                    if let Some(id) = item.get("id").and_then(|value| value.as_i64())
+                        && seen.insert(id)
+                    {
+                        results.push(item);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    async fn tmdb_search_in_language(
+        &self,
+        api_key: &str,
+        segment: &str,
+        query: &str,
+        year: Option<i64>,
+        language: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
         // Search always uses en-US so results keep original titles next to the
         // localized ones; zh-CN results rename well-known titles (Inception ->
         // 盗梦空间) and make title matching against release names unreliable.
         // Details are still fetched in the configured display language.
         let mut url = format!(
-            "https://api.themoviedb.org/3/search/{segment}?api_key={api_key}&language=en-US&query={}",
+            "https://api.themoviedb.org/3/search/{segment}?api_key={api_key}&language={}&query={}",
+            urlencode(language),
             urlencode(query)
         );
         if let Some(year) = year {
