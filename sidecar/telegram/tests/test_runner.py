@@ -762,6 +762,48 @@ class LoginFlowTest(unittest.TestCase):
             self.assertEqual(code, "67890")
 
 
+class ShutdownTest(unittest.TestCase):
+    """review SC11：关库之前必须把后台 handler 任务收尾。"""
+
+    def test_drain_background_cancels_pending_tasks(self):
+        async def scenario():
+            started = asyncio.Event()
+
+            async def forever():
+                started.set()
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(forever())
+            runner._BACKGROUND.add(task)
+            task.add_done_callback(runner._BACKGROUND.discard)
+            await started.wait()
+            await runner._drain_background("测试")
+            return task
+
+        task = asyncio.run(scenario())
+        self.assertTrue(task.cancelled())
+        self.assertNotIn(task, runner._BACKGROUND)
+
+    def test_drain_background_with_no_tasks_is_noop(self):
+        asyncio.run(runner._drain_background("空"))
+
+    def test_drain_background_collects_failures(self):
+        async def scenario():
+            async def boom():
+                raise RuntimeError("handler died")
+
+            task = asyncio.create_task(boom())
+            runner._BACKGROUND.add(task)
+            task.add_done_callback(runner._BACKGROUND.discard)
+            await asyncio.sleep(0)
+            await runner._drain_background("测试")
+            return task
+
+        task = asyncio.run(scenario())
+        self.assertTrue(task.done())
+        self.assertIsNotNone(task.exception())  # 取走异常，避免事件循环报 never retrieved
+
+
 class EntitiesTest(unittest.TestCase):
     def test_entities_to_dicts(self):
         class Entity:

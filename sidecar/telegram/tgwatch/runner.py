@@ -586,6 +586,21 @@ class Watcher:
 _BACKGROUND: set[asyncio.Task] = set()
 
 
+async def _drain_background(reason: str = "退出") -> None:
+    """取消并等待后台 handler 任务收尾（review SC11）。
+
+    `store.close()` 之后若还有 handler 在写库，会抛 `sqlite3.ProgrammingError`
+    （或静默丢记录）。所以断开连接前先把这些任务 cancel 掉并 gather 完。
+    """
+    tasks = [task for task in list(_BACKGROUND) if not task.done()]
+    if not tasks:
+        return
+    log.info("%s：等待 %d 个后台任务收尾", reason, len(tasks))
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _resolve_channel(client, channel: config_mod.ChannelConfig):
     """按配置解析出 telethon entity；数字 id 与 @username 都试一遍。"""
     candidate = channel.key()
@@ -716,6 +731,8 @@ async def run(config: config_mod.SidecarConfig) -> None:
             retry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retry_task
+            # 后台 handler 必须先收尾，再让外层 finally 关库（review SC11）
+            await _drain_background("停止监听")
             log.info("统计: %s", watcher.counts)
     finally:
         if client is not None:
