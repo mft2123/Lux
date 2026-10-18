@@ -7,15 +7,15 @@ use time::{OffsetDateTime, UtcOffset};
 
 use super::event::NotifyEvent;
 
-/// Telegram rejects messages longer than 4096 characters; keep a safety
+/// Telegram rejects messages longer than 4096 UTF-16 code units; keep a safety
 /// margin for the client-side rendering and for future format additions.
-pub(crate) const MAX_MESSAGE_CHARS: usize = 3_900;
+pub(crate) const MAX_MESSAGE_UNITS: usize = 3_900;
 const MAX_OVERVIEW_CHARS: usize = 320;
 const MAX_FIELD_VALUE_CHARS: usize = 400;
 const FOOTER: &str = "— Lux";
 
 pub(crate) fn format_message(event: &NotifyEvent, timezone_offset_hours: i64) -> String {
-    format_message_with(event, timezone_offset_hours, MAX_MESSAGE_CHARS)
+    format_message_with(event, timezone_offset_hours, MAX_MESSAGE_UNITS)
 }
 
 fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: usize) -> String {
@@ -25,13 +25,13 @@ fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: u
         format_timestamp(event.occurred_at, timezone_offset_hours)
     );
     // Reserve room for the closing lines so a long body never hides the time.
-    let reserved = time_line.chars().count() + FOOTER.chars().count() + 3;
+    let reserved = utf16_len(&time_line) + utf16_len(FOOTER) + 3;
     let mut budget = limit.saturating_sub(reserved);
 
-    let max_title = budget.saturating_sub("<b></b>".len()).max(8);
+    let max_title = budget.saturating_sub(utf16_len("<b></b>")).max(8);
     let title = truncate_escaped(&escape_html(&heading), max_title);
     let mut body = format!("<b>{title}</b>");
-    budget = budget.saturating_sub(body.chars().count());
+    budget = budget.saturating_sub(utf16_len(&body));
 
     for field in &event.fields {
         let label = escape_html(field.label.trim());
@@ -47,7 +47,7 @@ fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: u
             Some(rendered) => rendered,
             None => break,
         };
-        budget = budget.saturating_sub(rendered.chars().count() + 1);
+        budget = budget.saturating_sub(utf16_len(&rendered) + 1);
         body.push('\n');
         body.push_str(&rendered);
     }
@@ -62,7 +62,7 @@ fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: u
         let overview = escape_html(&truncate_chars(overview, MAX_OVERVIEW_CHARS));
         let line = format!("📝 简介：{overview}");
         if let Some(rendered) = append_with_budget(&line, budget.saturating_sub(2)) {
-            budget = budget.saturating_sub(rendered.chars().count() + 2);
+            budget = budget.saturating_sub(utf16_len(&rendered) + 2);
             body.push_str("\n\n");
             body.push_str(&rendered);
         }
@@ -74,7 +74,7 @@ fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: u
         let line = format!("🔗 <a href=\"{}\">查看详情</a>", escape_html(url));
         // Never truncate inside a tag: either the whole anchor fits or it is
         // dropped.
-        if line.chars().count() + 1 <= budget {
+        if utf16_len(&line) + 1 <= budget {
             body.push('\n');
             body.push_str(&line);
         }
@@ -88,39 +88,59 @@ fn format_message_with(event: &NotifyEvent, timezone_offset_hours: i64, limit: u
     hard_limit(message, limit)
 }
 
+/// Telegram measures message length in UTF-16 code units, so an emoji counts
+/// as two while a Chinese character counts as one.
+pub(crate) fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
 /// Render one line, truncating it with `…` when it does not fit `budget`.
 fn append_with_budget(line: &str, budget: usize) -> Option<String> {
-    let length = line.chars().count();
-    if length <= budget {
+    if utf16_len(line) <= budget {
         return Some(line.to_owned());
     }
     if budget <= 2 {
         return None;
     }
-    // Keep one character for the ellipsis.
-    let mut truncated = truncate_escaped(line, budget - 1);
-    truncated.push('…');
-    Some(truncated)
+    // Keep one unit for the ellipsis.
+    Some(truncate_units(line, budget - 1))
 }
 
 /// Hard cap for the final message (defensive: parts are already budgeted).
 fn hard_limit(message: String, limit: usize) -> String {
-    if message.chars().count() <= limit {
+    if utf16_len(&message) <= limit {
         return message;
     }
-    let mut truncated: String = message.chars().take(limit.saturating_sub(1)).collect();
-    truncated.push('…');
+    let mut truncated = truncate_units(&message, limit);
     repair_incomplete_entity(&mut truncated);
     truncated
 }
 
-fn truncate_escaped(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+fn truncate_escaped(value: &str, max_units: usize) -> String {
+    let mut truncated = truncate_units(value, max_units);
+    repair_incomplete_entity(&mut truncated);
+    truncated
+}
+
+fn truncate_units(value: &str, max_units: usize) -> String {
+    if max_units == 0 {
+        return String::new();
+    }
+    if utf16_len(value) <= max_units {
         return value.to_owned();
     }
-    let mut truncated: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    let budget = max_units - 1;
+    let mut used = 0;
+    let mut truncated = String::new();
+    for ch in value.chars() {
+        let units = ch.len_utf16();
+        if used + units > budget {
+            break;
+        }
+        used += units;
+        truncated.push(ch);
+    }
     truncated.push('…');
-    repair_incomplete_entity(&mut truncated);
     truncated
 }
 
@@ -258,16 +278,32 @@ mod tests {
             .collect();
         event.overview = Some("简介".repeat(2_000));
         let message = format_message(&event, 8);
-        assert!(message.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(utf16_len(&message) <= MAX_MESSAGE_UNITS);
         assert!(message.contains('…'));
         assert!(message.ends_with("— Lux"));
+    }
+
+    #[test]
+    fn emoji_count_as_two_utf16_units_and_stay_within_the_limit() {
+        assert_eq!(utf16_len("🎬"), 2);
+        assert_eq!(utf16_len("中文"), 2);
+        let mut event = playback_event();
+        event.title = "🎬🎞️✨".repeat(600);
+        event.fields = (0..10)
+            .map(|index| NotifyField {
+                label: format!("🎞️ 字段{index}"),
+                value: "✨内容🎬".repeat(120),
+            })
+            .collect();
+        let message = format_message(&event, 8);
+        assert!(utf16_len(&message) <= MAX_MESSAGE_UNITS);
     }
 
     #[test]
     fn tiny_budget_still_produces_a_valid_entity_stream() {
         let event = playback_event();
         let message = format_message_with(&event, 8, 200);
-        assert!(message.chars().count() <= 200);
+        assert!(utf16_len(&message) <= 200);
         assert!(!message.contains("&am\n"));
     }
 

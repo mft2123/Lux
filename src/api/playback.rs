@@ -1925,6 +1925,12 @@ pub(super) async fn publish_playback_webhook(
     remote_ip: Option<&str>,
     resumed: bool,
 ) {
+    // Both delivery paths need the item context; skip the lookup entirely when
+    // neither webhooks nor Telegram notifications are configured.
+    let notify_enabled = crate::application::notify::is_configured();
+    if state.webhooks.is_none() && !notify_enabled {
+        return;
+    }
     let context = playback_notification_context(
         state,
         principal,
@@ -1933,7 +1939,7 @@ pub(super) async fn publish_playback_webhook(
         requested_play_method,
     )
     .await;
-    if event_type == WebhookEventType::PlaybackStarted {
+    if notify_enabled && event_type == WebhookEventType::PlaybackStarted {
         crate::application::notify::spawn_playback(crate::application::notify::PlaybackNotice {
             item_title: context.item_title.clone(),
             series_title: context.series_title.clone(),

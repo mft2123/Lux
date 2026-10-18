@@ -22,6 +22,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 mod nfo;
+mod settings;
+
+pub(crate) use settings::{ArchiveSettings, mask_secret};
 
 pub(crate) const ARCHIVE_ROOT_ENV: &str = "LUX_ARCHIVE_ROOT";
 pub(crate) const ARCHIVE_TMDB_KEY_ENV: &str = "LUX_TMDB_API_KEY";
@@ -46,6 +49,9 @@ pub(crate) const ARCHIVE_SETTLE_SECONDS_ENV: &str = "LUX_ARCHIVE_SETTLE_SECONDS"
 /// Metadata lookups run concurrently; moves stay sequential so duplicate and
 /// wash decisions see the batch in name order.
 const METADATA_RESOLVE_CONCURRENCY: usize = 8;
+/// How often an idle poller re-reads `poll_seconds` while polling is disabled,
+/// so turning it on in the settings file starts working without a restart.
+const POLL_DISABLED_RECHECK_SECONDS: u64 = 5;
 
 const TRANSFER_DIR: &str = "转存目录";
 const PENDING_DIR: &str = "待整理";
@@ -103,74 +109,36 @@ pub(crate) struct ArchiveConfig {
 }
 
 impl ArchiveConfig {
+    /// Effective configuration: the editable settings file first, environment
+    /// values for the keys the file does not set, then the built-in defaults.
+    ///
+    /// The archive root and the TMDB display language stay environment-only on
+    /// purpose: they describe how the deployment is mounted, not how the
+    /// pipeline behaves, and a wrong root would move files into the void.
     pub(crate) fn from_env() -> Self {
+        let settings = ArchiveSettings::load();
         let root = std::env::var(ARCHIVE_ROOT_ENV)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_ARCHIVE_ROOT));
-        let tmdb_api_key = std::env::var(ARCHIVE_TMDB_KEY_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
         let tmdb_language = std::env::var(ARCHIVE_TMDB_LANGUAGE_ENV)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "zh-CN".to_owned());
-        let watch_dirs = std::env::var(ARCHIVE_WATCH_DIRS_ENV)
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mirror_root = std::env::var(ARCHIVE_MIRROR_ROOT_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_MIRROR_ROOT));
-        let cd2_prefix = std::env::var(ARCHIVE_CD2_PREFIX_ENV)
-            .ok()
-            .map(|value| value.trim().trim_matches('/').to_string())
-            .unwrap_or_default();
-        let cd2_container_mount = std::env::var(ARCHIVE_CD2_MOUNT_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_CD2_CONTAINER_MOUNT.to_owned());
-        let settle_seconds = std::env::var(ARCHIVE_SETTLE_SECONDS_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .filter(|seconds| *seconds <= 3600)
-            .unwrap_or(DEFAULT_SETTLE_SECONDS);
-        let wash_enabled = std::env::var(ARCHIVE_WASH_ENABLED_ENV)
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "no"))
-            .unwrap_or(true);
-        let wash_tolerance_ratio = std::env::var(ARCHIVE_WASH_TOLERANCE_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|ratio| (0.0..=1.0).contains(ratio))
-            .unwrap_or(0.02);
         Self {
             root,
-            tmdb_api_key,
+            tmdb_api_key: (!settings.tmdb_api_key.is_empty()).then(|| settings.tmdb_api_key.clone()),
             tmdb_language,
-            watch_dirs,
-            mirror_root,
-            cd2_prefix,
-            cd2_container_mount,
-            settle_seconds,
-            wash_enabled,
-            wash_tolerance_ratio,
+            watch_dirs: settings.watch_dirs.iter().map(PathBuf::from).collect(),
+            mirror_root: PathBuf::from(&settings.mirror_root),
+            cd2_prefix: settings.cd2_prefix.clone(),
+            cd2_container_mount: settings.cd2_mount.clone(),
+            settle_seconds: settings.settle_seconds,
+            wash_enabled: settings.wash_enabled,
+            wash_tolerance_ratio: settings.wash_tolerance_ratio,
         }
     }
 
@@ -1999,40 +1967,48 @@ impl ArchiveService {
     }
 }
 
-/// Auto-run interval for the archive pipeline. Disabled unless
-/// `LUX_ARCHIVE_POLL_SECONDS` is set to a positive number.
+/// Auto-run interval for the archive pipeline, read from the editable settings
+/// file (with `LUX_ARCHIVE_POLL_SECONDS` as the fallback). It is re-read on
+/// every tick so a new interval takes effect without a restart.
 fn archive_poll_interval() -> Option<Duration> {
-    let seconds = std::env::var(ARCHIVE_POLL_SECONDS_ENV)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    (seconds > 0).then(|| Duration::from_secs(seconds))
+    ArchiveSettings::load().poll_interval()
 }
 
-/// Start the background archive poller when `LUX_ARCHIVE_POLL_SECONDS` is set.
-/// Files dropped into the transfer directory are then archived and organized
-/// without an admin request. Called once from the server startup.
+/// Start the background archive poller. Files dropped into the transfer
+/// directory are then archived and organized without an admin request. Called
+/// once from the server startup.
+///
+/// The loop re-reads the settings file every tick: `poll_seconds`, the watch
+/// directories, the TMDB key and the wash rules all apply to the next run, and
+/// a poller that boots while polling is disabled idles instead of exiting, so
+/// enabling it in the settings UI starts working immediately.
 pub fn start_poller() {
-    let Some(interval) = archive_poll_interval() else {
-        return;
-    };
-    let service = ArchiveService::new(ArchiveConfig::from_env());
-    if let Err(error) = service.config.ensure_directories() {
+    let startup = ArchiveService::new(ArchiveConfig::from_env());
+    if let Err(error) = startup.config.ensure_directories() {
         tracing::warn!(%error, "archive pipeline directories could not be created");
         return;
     }
-    tracing::info!(
-        root = %service.config.root.display(),
-        interval_secs = interval.as_secs(),
-        "archive pipeline poller started"
-    );
+    match archive_poll_interval() {
+        Some(interval) => tracing::info!(
+            root = %startup.config.root.display(),
+            interval_secs = interval.as_secs(),
+            "archive pipeline poller started"
+        ),
+        None => tracing::info!(
+            root = %startup.config.root.display(),
+            "archive pipeline poller idle until poll_seconds is set"
+        ),
+    }
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
         loop {
-            ticker.tick().await;
+            let Some(interval) = archive_poll_interval() else {
+                tokio::time::sleep(Duration::from_secs(POLL_DISABLED_RECHECK_SECONDS)).await;
+                continue;
+            };
+            tokio::time::sleep(interval).await;
+            // Rebuild the service so settings edited in the meantime apply to
+            // this run instead of the values captured at startup.
+            let service = ArchiveService::new(ArchiveConfig::from_env());
             match service.run_once(false).await {
                 Ok(report)
                     if !report.archived_to_pending.is_empty()

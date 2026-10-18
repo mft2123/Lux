@@ -1,5 +1,8 @@
 import type {
   AuthSession,
+  ArchiveSettings,
+  ArchiveSettingsPatch,
+  ArchiveStatus,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -1403,6 +1406,21 @@ export class LuxApiClient {
 
   adminSettings() {
     return this.request<AdminSettings>("/api/v1/admin/settings");
+  }
+
+  archiveSettings() {
+    return this.request<ArchiveSettings>("/api/v1/admin/archive/settings");
+  }
+
+  updateArchiveSettings(input: ArchiveSettingsPatch) {
+    return this.request<ArchiveSettings>("/api/v1/admin/archive/settings", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
+  }
+
+  archiveStatus() {
+    return this.request<ArchiveStatus>("/api/v1/admin/archive/status");
   }
 
   updateAdminSettings(input: AdminSettingsPatch) {

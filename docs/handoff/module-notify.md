@@ -1,8 +1,8 @@
 # 模块：Telegram 通知（module-notify）
 
 目标：把归档/播放/任务事件推送到 Telegram（bot `sendMessage`），凭证来自
-`archive-settings.json` 的 `telegram` 段，可通过环境变量覆盖。通知是 **best effort**：
-发送失败只记 WARN，绝不影响归档或播放流程。
+`archive-settings.json` 的 `telegram` 段。配置 **以文件为准**，环境变量只补文件缺失的键。
+通知是 **best effort**：发送失败只记 WARN，绝不影响归档或播放流程。
 
 ## 交付状态（2026-10-18）
 
@@ -26,6 +26,7 @@
 | `media_added` | 入库 | 预留 API（Lux `MEDIA_ADDED` 尚未接） |
 | `organize_complete` | 整理/归档 | 归档整理成功（已接） |
 | `wash_result` | 洗版 | 归档洗版（已接） |
+| `duplicate` | 重复 | 归档发现重复条目（已接，逐条受开关控制） |
 | `resource_transfer` | 转存 | 转存→待整理（已接） |
 | `drive115_upload` | 115妙传/秒传 | 预留 API（115 模块接入） |
 | `media_organize_task` | 媒体整理 | 预留 API |
@@ -44,7 +45,7 @@
   "telegram": {
     "bot_token": "123:abc",
     "chat_id": "5867802360",
-    "notify": ["播放", "入库", "归档", "失败", "洗版", "转存", "115妙传", "媒体整理", "签到", "其他"],
+    "notify": ["播放", "入库", "归档", "失败", "洗版", "重复", "转存", "115妙传", "媒体整理", "签到", "其他"],
     "api_base": "https://api.telegram.org",
     "message_thread_id": null,
     "silent": false,
@@ -56,7 +57,7 @@
 }
 ```
 
-环境变量兜底（优先于文件）：`LUX_TG_BOT_TOKEN`、`LUX_TG_CHAT_ID`、`LUX_TG_API_BASE`、
+环境变量兜底（**仅补文件缺失的键，文件优先**）：`LUX_TG_BOT_TOKEN`、`LUX_TG_CHAT_ID`、`LUX_TG_API_BASE`、
 `LUX_TG_THREAD_ID`、`LUX_TG_SILENT`、`LUX_TG_NOTIFY`（逗号分隔）、`LUX_TG_MIN_INTERVAL_MS`、
 `LUX_TG_MAX_PER_MINUTE`、`LUX_TG_DEDUPE_SECONDS`、`LUX_TG_TIMEZONE_OFFSET_HOURS`。
 
@@ -65,17 +66,19 @@ bot_token/chat_id 任一缺失：静默跳过（debug 日志），状态接口�
 ## 消息
 
 HTML parse_mode，chill 风格中文卡片：标题 emoji + 字段（用户/客户端/IP/类型/库位/大小/耗时…）
-+ 简介 + 时间 + `— Lux`。单条 ≤ 3900 字符（超出先截简介、再逐字段截断，末尾 `…`），
++ 简介 + 时间 + `— Lux`。单条 ≤ **3900 UTF-16 码元**（Telegram 按 UTF-16 计 4096；
+emoji 算 2），超出先截简介、再逐字段截断，末尾 `…`（截断不破坏 HTML 实体），
 动态文本全部 HTML 转义；URL 只接受 http/https 且整段链接放得下才附加。
 
 ## 发送策略
 
-- 单次归档最多每类 10 条单条通知，其余由汇总承载（汇总含各计数与前 3 个片名）
+- 单次归档最多每类 10 条单条通知（含重复），其余由汇总承载（汇总含各计数与前 3 个片名）
 - dry-run 不发通知
 - 全局串行 + 最小间隔（默认 1.2s）+ 每分钟上限（默认 20），429 时按 `retry_after` 重试一次
 - 相同 `dedupe_key` 在窗口内只发一次（播放按 session+条目，签到等可由调用方传入）
 - 计数：内存态 `sent/failed/skipped/lastSuccessAt/lastFailureAt/lastError`
-- 日志与接口永不输出 token/完整 URL；chat_id 只返回打码值
+- 日志与接口永不输出 token/完整 URL；`chat_id` 与 `api_base` 只返回打码值
+  （chat_id 用 settings 的 `head6…(len)` 格式，api_base 去掉凭据与路径）
 
 ## 接口
 
@@ -109,8 +112,9 @@ Python / 外部：`POST /api/v1/admin/notify/send`。
 
 ## 测试
 
-`cargo test --locked --lib notify`：配置解析（中文数组/对象/缺省）、类别别名、HTML 转义、
-按类别截断、3900 字符上限、时间偏移、去重窗口、限流、请求体、429 重试解析、状态序列化。
+`cargo test --locked --lib notify`：配置解析（中文数组/对象/缺省）、文件优先与 env 补缺、
+类别别名、HTML 转义、按类别截断、3900 UTF-16 码元上限、时间偏移、去重窗口、限流、请求体、
+429 重试解析、打码、状态序列化。
 
 ## 待办 / 边界
 
@@ -118,3 +122,17 @@ Python / 外部：`POST /api/v1/admin/notify/send`。
 - `drive115_upload` / `media_organize_task` / `checkin` 等待对应模块接入
 - 设置页 UI 由 module-settings 提供；本模块只读设置文件
 - 不做持久化重试队列（chill 行为对齐：失败记日志）
+
+## 验收整改（2026-10-18，分支 `feat/notify-settings`）
+
+依据 `docs/handoff/fix-notify-settings.md`：
+
+- **A 配置优先级**：改为消费 `ArchiveSettings::load()`，删除 notify 自己的设置文件解析；
+  `LUX_TG_*` 只补文件缺失的键（文件优先），单测覆盖「文件值覆盖 env」与「env 补缺」。
+- **C 重复通知**：新增 `duplicate` 类别，逐条发送且受 `telegram.notify` 开关控制；汇总保留重复计数。
+- **E 小项**：status 的 `api_base` 打码（去凭据/路径）；`chat_id` 复用 settings 的
+  `mask_secret`（`head6…(len)`）；消息长度按 UTF-16 码元计算；播放通知上下文在
+  `state.webhooks` 与通知都未配置时短路，不做无用的条目查询。
+
+说明：整改单中的 **B（单文件挂载 PUT）** 与 **D（save 不落 env 派生值）** 属 settings 模块，
+本分支未改动，交由设置侧整改。
