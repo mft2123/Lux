@@ -34,6 +34,10 @@ services:
       LUX_TG_GAP_LIMIT: "200"
       # 走 Lux 项目网络时用服务名；单独跑这段 compose 的话改成 http://<nas-ip>:8097
       LUX_TG_LUX_BASE: http://lux:8097
+      # Lux 管理 API key 的两个来源（D1：设置文件优先、env 兜底）：
+      #   1) /config/archive-settings.json 的 telegram.api_key —— 权威值，Lux 保存设置时写入
+      #   2) 环境变量 LUX_TG_API_KEY —— 只在设置文件里为空时生效（窗口期/临时排障）
+      # LUX_TG_API_KEY: ""
       # 有二步验证时一次性传入（平时留空）
       # TG_2FA_PASSWORD: ""
     volumes:

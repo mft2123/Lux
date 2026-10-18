@@ -1,10 +1,11 @@
 """配置加载：读 Lux 的 `archive-settings.json` + 环境变量覆盖。
 
-优先级：环境变量 > 设置文件 > 内置默认值。
+优先级：设置文件 > 环境变量 > 内置默认值。唯一的例外是 `LUX_TG_API_KEY`，
+它只在设置文件 `telegram.api_key` 为空时兜底（D1：文件优先，env 只补缺）。
 
 `telegram` 段由 module-settings 维护，本模块 **只读**。额外读取两个顶层字段：
 - `wash_tolerance_ratio`：洗版容差，与 Lux 归档流水线用同一个值（默认 0.02）
-- `telegram.api_key`：调用 Lux 管理接口的 `X-Lux-Api-Key`
+- `telegram.api_key`：调用 Lux 管理接口的 `X-Lux-Api-Key`（env `LUX_TG_API_KEY` 兜底）
 """
 
 from __future__ import annotations
@@ -324,10 +325,14 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
     base = (_env("LUX_TG_LUX_BASE") or DEFAULT_LUX_BASE).rstrip("/")
     ingest_url = _env("LUX_TG_INGEST_URL") or f"{base}{DEFAULT_INGEST_PATH}"
     lookup_url = _env("LUX_ARCHIVE_LOOKUP_URL") or f"{base}{DEFAULT_LOOKUP_PATH}"
-    api_key = _env("LUX_TG_API_KEY") or str(section.get("api_key") or "").strip()
+    # D1：文件优先、env 兜底。Lux 保存设置时会把 key 写进 telegram.api_key，
+    # 那才是唯一权威值；LUX_TG_API_KEY 只补「文件里还没填」的窗口期。
+    api_key = str(section.get("api_key") or "").strip() or _env("LUX_TG_API_KEY")
     if sink == SINK_HTTP and not api_key:
         raise ConfigError(
-            "sink=http 需要 Lux 管理 API key：在设置文件 telegram.api_key 里填，或设置 LUX_TG_API_KEY"
+            "缺少 Lux 管理 API key（sink=http 必需）：在设置文件的 telegram.api_key 里填"
+            f"（{path}；管理页「API key」或 POST /api/v1/admin/api-key/rotate 生成），"
+            "或设置环境变量 LUX_TG_API_KEY 兜底"
         )
 
     tolerance_raw = _env("LUX_TG_WASH_TOLERANCE") or settings.get("wash_tolerance_ratio")

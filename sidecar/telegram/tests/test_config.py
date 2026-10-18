@@ -135,6 +135,43 @@ class LoadTest(unittest.TestCase):
             self.load(payload)
         self.assertIn("api_key", str(ctx.exception))
 
+    def test_api_key_prefers_settings_file_over_env(self):
+        """review SC1 / D1：设置文件里的 key 是权威值，env 不能盖掉它。"""
+        cfg = self.load(env={"LUX_TG_API_KEY": "key-from-env"})
+        self.assertEqual(cfg.api_key, FAKE_API_KEY)
+
+    def test_api_key_falls_back_to_env(self):
+        payload = {"telegram": {"api_id": 1, "api_hash": "h", "api_key": ""}}
+        cfg = self.load(payload, env={"LUX_TG_API_KEY": "key-from-env"})
+        self.assertEqual(cfg.api_key, "key-from-env")
+
+    def test_missing_api_key_error_is_actionable(self):
+        payload = {"telegram": {"api_id": 1, "api_hash": "h"}}
+        with self.assertRaises(config_mod.ConfigError) as ctx:
+            self.load(payload)
+        message = str(ctx.exception)
+        self.assertIn("telegram.api_key", message)
+        self.assertIn("LUX_TG_API_KEY", message)
+        self.assertIn("API key", message)
+
+    def test_env_only_startup_works(self):
+        """只给 env 也要能启动（SC1 验收的三种情况之一）。"""
+        payload = {"telegram": {"api_id": 1, "api_hash": "h"}}
+        cfg = self.load(
+            payload,
+            env={
+                "LUX_TG_API_KEY": "key-from-env",
+                "LUX_TG_CHANNELS": "@a",
+            },
+        )
+        self.assertEqual(cfg.api_key, "key-from-env")
+        self.assertNotIn("key-from-env", json.dumps(cfg.masked(), ensure_ascii=False))
+
+    def test_settings_only_startup_works(self):
+        cfg = self.load()  # BASE 里只有文件、没有 LUX_TG_API_KEY
+        self.assertEqual(cfg.api_key, FAKE_API_KEY)
+        self.assertNotIn(FAKE_API_KEY, json.dumps(cfg.masked(), ensure_ascii=False))
+
     def test_inbox_sink_does_not_require_api_key(self):
         payload = {"telegram": {"api_id": 1, "api_hash": "h", "api_key": ""}}
         cfg = self.load(payload, env={"LUX_TG_SINK": "inbox"})

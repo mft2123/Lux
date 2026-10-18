@@ -80,16 +80,17 @@ sidecar/telegram/
 }
 ```
 
-`api_key` 用于 `X-Lux-Api-Key`（ingest + lookup 都是管理员接口）。
+`api_key` 用于 `X-Lux-Api-Key`（ingest + lookup 都是管理员接口）。**它是设置文件优先的**：
+只要 `telegram.api_key` 有值就忽略 `LUX_TG_API_KEY`，env 只在文件里还没填时兜底（D1）。
 
-环境变量（优先于设置文件）：
+环境变量（设置文件缺失/为空时覆盖；`LUX_TG_API_KEY` 见上一条的特殊优先级）：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `LUX_ARCHIVE_SETTINGS` | `/config/archive-settings.json` | 设置文件路径 |
 | `LUX_TG_API_ID` / `LUX_TG_API_HASH` / `LUX_TG_PHONE` | 取设置文件 | 覆盖凭证 |
 | `TG_2FA_PASSWORD` | 空 | 二步验证密码，一次性 |
-| `LUX_TG_API_KEY` | 取设置文件 `telegram.api_key` | Lux 管理 API key |
+| `LUX_TG_API_KEY` | 取设置文件 `telegram.api_key` | **文件优先**，这里只兜底 |
 | `LUX_TG_MODE` / `LUX_TG_CHANNELS` / `LUX_TG_FOLLOW` | 取设置文件 | 模式与频道 |
 | `LUX_TG_ALLOWED_KINDS` | `115,magnet,ed2k,aliyun,quark,baidu` | 只投递这些类型（`telegram`/`other` 不在默认里） |
 | `LUX_TG_ALLOW_OTHER` | `0` | 设为 `1` 才收 `kind=other`（任意 http 网页） |
