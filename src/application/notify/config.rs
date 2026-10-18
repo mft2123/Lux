@@ -298,6 +298,10 @@ impl Default for NotifyConfig {
     }
 }
 
+/// Set after the first "notify is not a list" warning so a typo does not spam
+/// the log on every event.
+static WARNED_INVALID_NOTIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl NotifyConfig {
     /// Effective settings: the archive settings file wins, `LUX_TG_*` only
     /// fills keys the file does not define.
@@ -311,6 +315,16 @@ impl NotifyConfig {
         let telegram = &settings.telegram;
         let toggles = NotifyToggles::from_json(&telegram.notify)
             .or_else(|| {
+                // A string is not a valid selection list: warn once and treat it
+                // like `null` (everything on) instead of failing open silently.
+                if matches!(telegram.notify, Value::String(_))
+                    && !WARNED_INVALID_NOTIFY.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        value = %telegram.notify,
+                        "telegram.notify should be an array, an object or null; treating it as null"
+                    );
+                }
                 env.notify
                     .as_deref()
                     .map(|value| toggles_from_list(value.split(',')))
