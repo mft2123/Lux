@@ -29,6 +29,14 @@ fn spawn_nfo_person_asset_task(
     });
 }
 
+/// A transient SQLite write-lock error, stringified by `PeopleError::Storage`.
+fn is_sqlite_busy(error: &PeopleError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database table is locked")
+        || message.contains("sqlite_busy")
+}
+
 impl PeopleService {
     pub(super) async fn resolve_person_key(
         &self,
@@ -207,6 +215,30 @@ impl PeopleService {
         .await
     }
 
+    /// Forget the cached actor relation of an item so the next NFO pass
+    /// re-persists its credits. Used when the credit chunk could not be
+    /// committed: without this the snapshot would stay "current", the credits
+    /// would stay rolled back, and no later scan would repair them.
+    pub(crate) async fn invalidate_nfo_actor_relation(&self, item_id: &str) -> bool {
+        let Ok(directory) = library_item_directory(&self.config_dir, item_id) else {
+            return false;
+        };
+        let path = directory.join("people.json");
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    path = %path.display(),
+                    %error,
+                    "stale actor relation could not be invalidated; its credits may stay missing"
+                );
+                false
+            }
+        }
+    }
+
     pub(crate) async fn persist_nfo_item_actors_deferred(
         &self,
         item_id: &str,
@@ -215,14 +247,31 @@ impl PeopleService {
         source_fingerprint: &[u8],
         deferred_credits: &DeferredNfoActorCredits,
     ) -> Result<ActorPersistReport, PeopleError> {
-        self.persist_item_actors_with_source(
-            item_id,
-            provider,
-            actors,
-            Some(source_fingerprint),
-            Some(deferred_credits),
-        )
-        .await
+        // NFO enrichment runs several items at once; the people index write is a
+        // short read-then-write transaction that WAL can reject with
+        // SQLITE_BUSY_SNAPSHOT without honouring the busy timeout. Retrying is
+        // safe: the relation file is only written after the index write.
+        let mut attempt = 0_u32;
+        loop {
+            match self
+                .persist_item_actors_with_source(
+                    item_id,
+                    provider,
+                    actors,
+                    Some(source_fingerprint),
+                    Some(deferred_credits),
+                )
+                .await
+            {
+                Ok(report) => return Ok(report),
+                Err(error) if attempt < 3 && is_sqlite_busy(&error) => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[cfg(test)]

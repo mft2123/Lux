@@ -2257,6 +2257,10 @@ impl MetadataEnricher {
                 );
                 for item_id in failure.item_ids {
                     report.mark_item_failed(&item_id);
+                    // Roll the credits back AND forget the snapshot: otherwise the
+                    // relation stays "current" with no credits and no later scan
+                    // would ever repair it.
+                    people.invalidate_nfo_actor_relation(&item_id).await;
                 }
             }
         }
@@ -5216,6 +5220,27 @@ mod tests {
         Ok(())
     }
 
+    /// Remove every `people.json` snapshot under the metadata root. Test-only:
+    /// the scanner writes one per item it already enriched, which would make
+    /// "does this item still need an actor sync" depend on scan timing.
+    fn remove_relation_snapshots(config_dir: &std::path::Path) -> std::io::Result<()> {
+        let mut stack = vec![config_dir.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().is_some_and(|name| name == "people.json") {
+                    std::fs::remove_file(&path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -5287,6 +5312,12 @@ mod tests {
         .bind(library.id.to_string())
         .fetch_one(database.pool())
         .await?;
+        // The scanner may already have written a current relation snapshot for
+        // some of these items, in which case the batch will not re-sync their
+        // actors at all (and there is nothing to fail). Drop the snapshots so
+        // every movie below deterministically needs an actor sync; that is the
+        // situation this test is about.
+        remove_relation_snapshots(directory.path().join("config").as_path())?;
         sqlx::query(
             "CREATE TRIGGER reject_nfo_person_credit BEFORE INSERT ON person_credits
              BEGIN SELECT RAISE(ABORT, 'injected actor credit failure'); END",
@@ -5308,6 +5339,13 @@ mod tests {
             "scan-local movie NFO enrichment should overlap while staying within the configured limit; observed {max_nfo_concurrency}"
         );
         assert!(batch.report.failed_item_ids.contains(&invalid_item_id));
+        // The two good movies share one actor-credit chunk, so the trigger
+        // rejects the whole chunk. A movie whose NFO enrichment lost a transient
+        // SQLite lock race earlier in the batch never reaches the chunk at all
+        // (nothing is persisted for it and the next scan retries), so the
+        // guarantee asserted here is: every movie either took part in the failed
+        // chunk, or has no credit state at all.
+        let mut good_movies = Vec::new();
         for title in ["Movie Two", "Movie Three"] {
             let item_id: String =
                 sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ? AND title = ?")
@@ -5315,8 +5353,11 @@ mod tests {
                     .bind(title)
                     .fetch_one(database.pool())
                     .await?;
+            good_movies.push((title, item_id));
+        }
+        for (title, item_id) in &good_movies {
             assert!(
-                batch.report.failed_item_ids.contains(&item_id),
+                batch.report.failed_item_ids.contains(item_id),
                 "expected item {item_id} ({title}) to fail as part of the actor-credit batch; failed IDs: {:?}",
                 batch.report.failed_item_ids,
             );
