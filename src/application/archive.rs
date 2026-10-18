@@ -488,6 +488,11 @@ impl TmdbMatch {
 /// serializes them so one never moves an entry the other is already moving.
 static ARCHIVE_RUN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the ingest check-then-write. Two sidecar requests for the same
+/// URL must not both decide "not queued yet" and write a job each: the check
+/// (`find_existing_link_job`) and the write are one critical section.
+static LINK_INGEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) struct ArchiveService {
     config: Arc<ArchiveConfig>,
     http: reqwest::Client,
@@ -1690,11 +1695,18 @@ impl ArchiveService {
     /// `状态.jsonl`), is not queued twice — the existing job is returned with
     /// `duplicate: true`.
     pub(crate) fn enqueue_link_job(&self, job: LinkJob) -> Result<QueuedLinkJob, LinkIngestError> {
-        let job = job.normalized().map_err(LinkIngestError::Invalid)?;
+        let mut job = job.normalized().map_err(LinkIngestError::Invalid)?;
         let queue = self.config.link_queue_dir();
         std::fs::create_dir_all(&queue).map_err(|error| {
             LinkIngestError::Storage(format!("无法创建链接队列 {}: {error}", queue.display()))
         })?;
+        // The duplicate check and the write are one step, otherwise two
+        // concurrent requests for the same URL both see "not queued" and both
+        // write a job file. The guard is process-wide because ingest and the
+        // poller live in the same service.
+        let _ingest_guard = LINK_INGEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = self.find_existing_link_job(&job.url) {
             tracing::info!(
                 url = %mask_link_for_log(&job.url),
@@ -1709,12 +1721,15 @@ impl ArchiveService {
                 duplicate: true,
             });
         }
-        let name = format!("{}.json", job.job_id);
-        let target = unique_target(&queue, &name);
+        // `job_id` is the file name (docs §2.1). A same-millisecond job that
+        // already took the name gets a suffix, and the job adopts it, so the
+        // returned id, the file name and the state record never disagree.
+        let (target, job_id) = link_job_target(&queue, &job.job_id);
+        job.job_id = job_id.clone();
         let body = serde_json::to_string_pretty(&job).map_err(|error| {
             LinkIngestError::Storage(format!("序列化链接任务失败: {error}"))
         })?;
-        let temp = queue.join(format!(".{}.tmp", job.job_id));
+        let temp = queue.join(format!(".{job_id}.tmp"));
         // `0600` from the first byte: a share link may carry `?password=`, and
         // the job file must be as private as the state file (`rename` keeps the
         // mode, so 已处理/ stays 0600 as well).
@@ -1725,7 +1740,7 @@ impl ArchiveService {
             LinkIngestError::Storage(format!("提交 {} 失败: {error}", target.display()))
         })?;
         tracing::info!(
-            job_id = %job.job_id,
+            job_id = %job_id,
             url = %mask_link_for_log(&job.url),
             title = job.title.as_deref().unwrap_or(""),
             mode = job.mode.as_deref().unwrap_or(""),
@@ -1733,7 +1748,7 @@ impl ArchiveService {
             "link job queued"
         );
         Ok(QueuedLinkJob {
-            job_id: job.job_id,
+            job_id,
             file: target.display().to_string(),
             status: LINK_JOB_STATUS_NEEDS_115,
             duplicate: false,
@@ -2664,6 +2679,22 @@ fn unique_target(directory: &Path, name: &str) -> PathBuf {
         }
     }
     directory.join(format!("{stem} ({})", unix_now()))
+}
+
+/// Final job file path for `job_id` in `queue`, plus the id the chosen file
+/// name encodes.
+///
+/// `job_id` is the file name (docs §2.1), so a collision — two links captured in
+/// the same millisecond with the same title slug — renames the *job*, never just
+/// the file: the 202 response, the file name and the state record stay equal.
+fn link_job_target(queue: &Path, job_id: &str) -> (PathBuf, String) {
+    let target = unique_target(queue, &format!("{job_id}.json"));
+    let final_id = target
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| job_id.to_owned());
+    (target, final_id)
 }
 
 fn dir_has_nfo(directory: &Path) -> bool {
@@ -3982,6 +4013,57 @@ mod tests {
             .expect("queued");
         assert!(!other.duplicate);
         assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    /// Ten simultaneous posts of one URL leave exactly one job file: the
+    /// duplicate check and the write are one critical section.
+    #[test]
+    fn concurrent_ingest_of_the_same_url_writes_one_job_file() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = std::sync::Arc::new(ArchiveService::new_for_tests(archive_config(tmp.path())));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let service = std::sync::Arc::clone(&service);
+            handles.push(std::thread::spawn(move || {
+                service
+                    .enqueue_link_job(link_job("https://115.com/s/race"))
+                    .expect("queued")
+            }));
+        }
+        let queued = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued.iter().filter(|queued| !queued.duplicate).count(),
+            1,
+            "exactly one caller writes the job"
+        );
+        assert_eq!(queued.iter().filter(|queued| queued.duplicate).count(), 9);
+        let first = &queued[0];
+        assert!(
+            queued.iter().all(|queued| queued.job_id == first.job_id),
+            "every response names the same job"
+        );
+        assert_eq!(count_link_jobs(&service.config.link_queue_dir()), 1);
+        let file = Path::new(&first.file);
+        assert!(file.exists());
+        assert_eq!(
+            file.file_stem().unwrap().to_string_lossy(),
+            first.job_id,
+            "the job id is the file name"
+        );
+    }
+
+    /// A same-name collision renames the job id together with the file, so the
+    /// 202 response and the state record never disagree with the file name.
+    #[test]
+    fn a_colliding_job_file_takes_its_suffixed_name_as_the_job_id() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(tmp.path().join("1700000000000-demo.json"), b"{}").unwrap();
+        let (target, job_id) = link_job_target(tmp.path(), "1700000000000-demo");
+        assert_eq!(job_id, "1700000000000-demo (2)");
+        assert_eq!(target, tmp.path().join("1700000000000-demo (2).json"));
     }
 
     #[test]
