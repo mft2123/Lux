@@ -301,7 +301,6 @@
 ## 9. 管理接口
 
 - `GET /api/v1/admin/archive/status` — 根目录、各角色目录、链接队列与待消费作业数、TMDB 是否配置、洗版与稳定参数。
-<<<<<<< HEAD
 - `POST /api/v1/admin/archive/run?dry_run=true|false`（也接受 `1|0`）— 预演/执行一次；返回 `archived_to_pending`、`organized`（含 tmdb_id）、`duplicates`、`washed`、`failed`、`skipped` 清单。
 - `POST /api/v1/admin/archive/metadata?dry_run=true|false&overwrite=true|false`（也接受 `1|0`）— 为历史条目补生成镜像元数据。
 - `GET /api/v1/admin/archive/settings` — 返回设置文件内容，凭证打码（前 6 位 + 长度），并附
@@ -309,29 +308,15 @@
 - `PUT /api/v1/admin/archive/settings` — 写入设置文件（0600，进程内串行）。缺省的键保留现值；凭证留空表示不修改；
   只落盘本次改动与文件已有的键（见 §8 保存语义）。校验失败返回 400：容差 0–1、轮询/稳定等待 0–3600、
   镜像库与监听目录必须存在、CD2 挂载点必须是绝对路径；只校验本次更新涉及的字段。
-=======
-- `POST /api/v1/admin/archive/run?dry_run=true|false` — 预演/执行一次；返回 `archived_to_pending`、`organized`（含 tmdb_id）、`duplicates`、`washed`、`failed`、`skipped` 清单。
-- `POST /api/v1/admin/archive/metadata?dry_run=true|false&overwrite=true|false` — 为历史条目补生成镜像元数据。
-  （这两个 query 参数是 `bool`：只接受 `true` / `false`。历史文档写过 `1|0`，当前会被 `400` 拒绝；
-  `1|0` 兼容解析属于 `src/api/admin/admin_jobs.rs`，见 `archive.rs` 顶部的 TODO。）
-- `GET /api/v1/admin/archive/settings` — 返回设置文件内容，凭证打码（前 6 位 + 长度）。
-- `PUT /api/v1/admin/archive/settings` — 整体写入设置文件（0600）。缺省的键保留现值；凭证留空表示不修改；
-  校验失败返回 400：容差 0–1、轮询/稳定等待 0–3600、镜像库与监听目录必须存在、CD2 挂载点必须是绝对路径。
->>>>>>> 76583ad0a7012169a47f5d18627580ade68a9206
   配置优先级：**文件 > 环境变量 > 默认值**（按字段合并，见 §8）。设置文件若是单文件 bind mount，
   `rename` 不可用时退化为原地写（0600）；写入窗口内读到半截 JSON 会回退到环境变量。
 - `POST /api/v1/admin/archive/ingest` — 旁挂交接入口。Body `{"url":"…","title":"…","mode":"…"}`（其余字段可选，
   见 2.1）；返回 `202 {"ok":true,"jobId":"…","file":"…","status":"needs_115_client","duplicate":false}`。
   同一 URL 重复投递时 `duplicate` 为 `true` 且不会再写文件。
-<<<<<<< HEAD
   鉴权同管理接口（`X-Lux-Api-Key` 或 `Bearer`），且**先鉴权再解析 body**：未认证一律 401，
-  body 非法 400（不是 axum 的 422）；URL 非法返回 `400`，队列不可写返回 `500`。
-- `GET /api/v1/admin/archive/lookup?title=<标题>` — 洗版模式用：在 `媒体目录/` 里按目录名找同名条目，
-=======
-  鉴权同管理接口（`X-Lux-Api-Key` 或 `Bearer`）；URL / `mode` 非法返回 `400`，
-  队列不可写或查重所需的 `状态.jsonl` / 队列目录读不出来返回 `500`（拒绝而不是重复排队）。
+  body 非法 400（不是 axum 的 422）；URL / `mode` 非法返回 `400`；
+  队列不可写、或查重所需的 `状态.jsonl` / 队列目录读不出来返回 `500`（拒绝而不是重复排队）。
 - `GET /api/v1/admin/archive/lookup?title=<标题>` — 洗版模式用：在 `媒体目录/` 的**标题层**找同名条目，
->>>>>>> 76583ad0a7012169a47f5d18627580ade68a9206
   返回 `{"title":"…","matched":"某剧 第二季 (2024)","size_bytes":123}`，找不到时 `matched`/`size_bytes`
   为 `null`。只读元数据，不读内容；结果缓存 60 秒（见 §7）。
 
