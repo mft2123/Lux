@@ -26,7 +26,7 @@ sidecar/telegram/
   tools/api_smoke.py # 升级 telethon 后核对 API
   session/           # telethon session（0700 目录 / 0600 文件，不进仓库）
   state/             # SQLite 状态库（0700 目录 / 0600 文件）
-  Dockerfile         # 非 root（10001），healthcheck 会真的失败
+  Dockerfile         # 非 root（10001），healthcheck 走 `check --deep`（掉线即 unhealthy）
   compose.fragment.yml
 ```
 
@@ -42,6 +42,15 @@ sidecar/telegram/
 
 判定只有三种结果：`deliver` / `hold`（留库等放行）/ `skip`（记原因）。
 洗版只要有一项不确定就 `hold`：体积读不出、Lux 查询失败，都不投。
+
+### 一条消息多个链接（SC7）
+
+标题与洗版查询都是**逐链接**的：每个链接只用它**自己的锚文本**当标题，洗版模式也按
+各自的标题分别查库（同一标题命中缓存，不会重复请求 Lux）。
+
+同一条消息里有多条链接、而某个链接没有独立锚文本时**不猜标题**：该链接记 `held`
+（`reason=title_ambiguous`，日志里点名具体 URL），同一条消息里其它有标题的链接照常
+投递/判定。整段正文首行只在**单链接**消息里当兜底标题。
 
 逐频道覆盖：`listen_channels` 的字符串沿用全局 `listen_mode`，对象可写
 `{"channel": "@b", "mode": "追更", "follow_list": ["某剧", "/S0[12]E/"]}`。
@@ -149,11 +158,22 @@ docker compose up -d telegram && docker logs -f lux-telegram
 ## 运维命令
 
 ```bash
-docker exec -u 10001 lux-telegram python main.py status      # 配置（打码）+ session 权限 + inbox
-docker exec -u 10001 lux-telegram python main.py check       # 校验（无 session 时返回 1，healthcheck 用）
+docker exec -u 10001 lux-telegram python main.py status       # 配置（打码）+ session 权限 + inbox
+docker exec -u 10001 lux-telegram python main.py check        # 只验配置就绪（不联网）
+docker exec -u 10001 lux-telegram python main.py check --deep # 再连一次 Telegram 验登录态
 docker exec -u 10001 lux-telegram python main.py held --limit 50
 docker exec -u 10001 lux-telegram python main.py replay --all
 ```
+
+### `check` 与 `check --deep` 的区别（SC9）
+
+| 命令 | 检查什么 | 用在哪 |
+| --- | --- | --- |
+| `main.py check` | 只看**配置就绪**：设置文件能读、`listen_channels` 非空、session 文件存在、`sink=http` 时 `api_key` 非空。**不联网**。 | 部署检查清单第 5 步、改配置后快速自检 |
+| `main.py check --deep` | 在上面基础上真的连一次 Telegram，用 `is_user_authorized()` 确认 session 还有登录态（10s 超时）。无 session、未授权、连不上都返回非零。 | `Dockerfile` 的 `HEALTHCHECK` |
+
+session 过期但文件还在时 `check` 仍然通过——这是它「只验配置就绪」的边界。容器健康状态
+由 `check --deep` 决定：掉线即 unhealthy；容器内没有网络时也会失败，这是期望行为（不是误报）。
 
 ## 下游契约
 
@@ -215,22 +235,52 @@ docker exec -u 10001 lux-telegram python main.py replay --id 42   # 看清原因
 `LUX_TG_SINK=inbox` 时写 `/watch-inbox/<ts>-<slug>.txt`，首行链接、其余 `#` 注释、`0644`。
 注意：Lux 的 `ingest_watch_dirs` 只接受视频，`.txt` 进去会被判「不是视频文件」，**不要**拿它当正式通道。
 
+## 依赖锁定（SC10）
+
+`requirements.txt` 把直接依赖与关键传递依赖**全部钉死成 `name==version`**：
+
+```
+telethon==1.45.0  pyaes==1.6.1  rsa==4.9.1  pyasn1==0.6.4  python-socks==2.8.2
+```
+
+版本来自 `/vol5/1000/build/tgvenv` 的实际安装结果（`pip freeze`），文件头写明了来源与升级
+方法（改版本 → 干净 venv 重装 → 抄回 `pip freeze` → 跑 `tools/api_smoke.py` 与单测 →
+`docker build` 后用 `check --deep` 验登录态）。`tests/test_requirements.py` 会拒绝任何
+`~=` / 范围 / 未钉版本 / 行尾注释，并检查 telethon、pyaes、rsa、python-socks 四项都在。
+
+`python-socks` 是 telethon 的**可选**代理后端（不传 `proxy=` 就不会 import 它），钉住是为了
+以后真挂代理时版本也不漂。
+
 ## 测试
 
 ```bash
 cd sidecar/telegram
-python -m unittest discover -s tests -t .    # 184 个用例，全部离线
-python tools/api_smoke.py                    # 升级 telethon 后核对 API（21 项，需要 telethon）
+python -m unittest discover -s tests -t .    # 207 个用例，全部离线
+python tools/api_smoke.py                    # 升级 telethon 后核对 API（24 项，需要 telethon）
 ```
 
 权限类用例（session / 设置文件的 `chmod`）在 root 或「不校验 chmod」的文件系统上会自动
-`skip`，不会假装通过；正常情况下 184 条全跑。
+`skip`，不会假装通过；没装 telethon 时「真 session 文件」那条也会 skip，正常情况下 207 条全跑
+（装了 telethon 的环境会多跑一条真 `TelegramClient` 用例）。
 
 覆盖：UTF-16 锚文本切片、隐藏链接、类型判定、体积解析（`4K/8K/8M` 不算体积）、五模式、
 洗版容差与「未知就挂起」、配置优先级/打码/硬错误、`other` 默认不放行、HTML 实体反转义、
 SQLite 去重与频道游标、inbox 与 HTTP 契约（完整 payload）、`X-Lux-Api-Key`、lookup 失败降级、
 死信与重试上限/退避、日志脱敏、登录验证码两条路径与首登 phone 校验、回填取最新 / 按游标补拉、
-session 权限加固、sqlite 错误分类（损坏 vs 权限/磁盘）、关停前收尾后台任务、部署片段静态检查。
+session 权限加固、sqlite 错误分类（损坏 vs 权限/磁盘）、关停前收尾后台任务、部署片段静态检查、
+逐链接标题与 `title_ambiguous` 挂起、`check --deep` 三种登录态结果、requirements 版本锁定、
+`channel:msg_id` 去重键在 backfill/handler 一致、垃圾 session 走真 `TelegramClient`。
+
+## 升级注意：去重键语义（SC12）
+
+消息去重键是 **`channel:msg_id`**（如 `somechannel:4321`，`channel` 取 `channel.key()`
+规范化后的标识，`@` 已被去掉）——频道标识在 handler 与 backfill 两条路径上都拿得到。
+老版本用 `chat_id:msg_id`，而 backfill 拿到的消息没有 `chat_id`，会退化成 `0:4321`，
+同一条消息于是有两个键、可能被投递两次。
+
+**升级到本版后旧键不再命中**：重启时回填窗口内的消息可能被**再投递一次**，最坏情况是
+Lux 侧多一条 `duplicate`（`POST /archive/ingest` 按 URL 幂等，返回 `duplicate:true`），
+不会重复转存。**没有数据迁移脚本**：旧键里的 chat_id 当时就没落库，无法可靠还原。
 
 ## 已知边界
 

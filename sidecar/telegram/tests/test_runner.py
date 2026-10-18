@@ -326,6 +326,175 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(store.stats()["by_status"].get(store_mod.STATUS_DELIVERED), 1)
 
 
+class PerLinkTitleTest(unittest.TestCase):
+    """review SC7：一条消息多个链接时，每个链接用自己的标题；拿不到就挂起不猜。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def build(self, config, lookup=None, sink=None):
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        watcher = runner.Watcher(config, store, sink or FakeSink(), lookup or FakeLookup())
+        return watcher, store
+
+    # 「第一集」挂隐藏链接，另一个链接只有明文 URL（没有锚文本）
+    ONE_ANCHOR_TEXT = "第一集 https://115.com/s/two"
+    ONE_ANCHOR_ENTITIES = [
+        {"type": "MessageEntityTextUrl", "offset": 0, "length": 3, "url": "https://115.com/s/one"}
+    ]
+
+    def test_link_without_own_title_is_held_not_guessed(self):
+        config = make_config(self.tmp)
+        sink = FakeSink()
+        watcher, store = self.build(config, sink=sink)
+        asyncio.run(
+            watcher.process(message(self.ONE_ANCHOR_TEXT, self.ONE_ANCHOR_ENTITIES), config.channels[0])
+        )
+
+        # 有锚文本的那条正常投递，标题就是它自己的锚文本
+        self.assertEqual(len(sink.sent), 1)
+        self.assertEqual(sink.sent[0]["url"], "https://115.com/s/one")
+        self.assertEqual(sink.sent[0]["title"], "第一集")
+        # 没有独立标题的那条挂起，原因可见、且没有拿整段正文当标题
+        held = store.items_by_status((store_mod.STATUS_HELD,))
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["url"], "https://115.com/s/two")
+        self.assertEqual(held[0]["reason"], "title_ambiguous")
+        self.assertEqual(held[0]["title"], "")
+        self.assertNotEqual(held[0]["title"], self.ONE_ANCHOR_TEXT)
+        # 一条消息一行留痕，两个条目
+        self.assertEqual(store.stats()["messages"], 1)
+        self.assertEqual(store.stats()["items"], 2)
+        self.assertEqual(watcher.counts["delivered"], 1)
+        self.assertEqual(watcher.counts["held"], 1)
+
+    def test_single_link_still_falls_back_to_first_line(self):
+        """单链接消息没有锚文本时，首行正文就是它的标题（保持老行为）。"""
+        config = make_config(self.tmp)
+        sink = FakeSink()
+        watcher, _ = self.build(config, sink=sink)
+        asyncio.run(
+            watcher.process(
+                message(text="沙丘2 2024 https://115.com/s/plain 12G"), config.channels[0]
+            )
+        )
+        self.assertEqual(len(sink.sent), 1)
+        self.assertTrue(sink.sent[0]["title"])
+        self.assertIn("沙丘2 2024", sink.sent[0]["title"])
+
+    # 两个链接各自有锚文本
+    TWO_ANCHORS_TEXT = "某剧A 某剧B 12G"
+    TWO_ANCHORS_ENTITIES = [
+        {"type": "MessageEntityTextUrl", "offset": 0, "length": 3, "url": "https://115.com/s/a"},
+        {"type": "MessageEntityTextUrl", "offset": 4, "length": 3, "url": "https://115.com/s/b"},
+    ]
+
+    def test_wash_looks_up_each_link_by_its_own_title(self):
+        config = make_config(
+            self.tmp,
+            channels=(config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_WASH),),
+        )
+        lookup = FakeLookup(size_bytes=5 * 1024**3)
+        sink = FakeSink()
+        watcher, _ = self.build(config, lookup=lookup, sink=sink)
+
+        asyncio.run(
+            watcher.process(message(self.TWO_ANCHORS_TEXT, self.TWO_ANCHORS_ENTITIES), config.channels[0])
+        )
+
+        # 两条链接各查各的标题，不再用「整条消息一个标题」查一次
+        self.assertEqual(lookup.calls, ["某剧A", "某剧B"])
+        self.assertEqual(len(sink.sent), 2)
+        self.assertEqual([item["title"] for item in sink.sent], ["某剧A", "某剧B"])
+
+    def test_wash_holds_untitled_link_without_querying_the_library(self):
+        config = make_config(
+            self.tmp,
+            channels=(config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_WASH),),
+        )
+        lookup = FakeLookup(size_bytes=5 * 1024**3)
+        sink = FakeSink()
+        watcher, store = self.build(config, lookup=lookup, sink=sink)
+
+        asyncio.run(
+            watcher.process(message(self.ONE_ANCHOR_TEXT + " 12G", self.ONE_ANCHOR_ENTITIES), config.channels[0])
+        )
+
+        # 只按有标题的那条查库；缺标题的那条不查、不猜
+        self.assertEqual(lookup.calls, ["第一集"])
+        self.assertEqual([item["url"] for item in sink.sent], ["https://115.com/s/one"])
+        held = store.items_by_status((store_mod.STATUS_HELD,))
+        self.assertEqual([item["reason"] for item in held], ["title_ambiguous"])
+
+
+class MessageKeyTest(unittest.TestCase):
+    """review SC12：去重键统一成 `channel:msg_id`，backfill 与 handler 必须一致。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def test_backfill_and_handler_produce_the_same_key(self):
+        channel = config_mod.ChannelConfig(channel="@chan")
+        # backfill：`iter_messages` 拿到的消息没有 chat_id 属性 → 老代码造出 0:42
+        backfill_message = FakeMessage(42, "某剧", HIDDEN, chat_id=None)
+        # handler：`event.chat_id` 是 -100… → 老代码造出 -100123:42
+        handler_message = FakeMessage(42, "某剧", HIDDEN, chat_id=-100123)
+
+        backfill = runner.incoming_from_message(backfill_message, channel.key())
+        handler = runner.incoming_from_message(handler_message, channel.key(), -100123)
+
+        # channel.key() 会把 `@` 去掉，所以键是 `chan:42`
+        self.assertEqual(backfill.key, "chan:42")
+        self.assertEqual(backfill.key, f"{channel.key()}:42")
+        self.assertEqual(handler.key, "chan:42")
+        self.assertEqual(backfill.key, handler.key)
+        # 旧格式（chat_id:msg_id、0:msg_id）不再生成
+        self.assertNotEqual(backfill.key, f"{backfill.chat_id}:{backfill.msg_id}")
+        self.assertNotEqual(handler.key, f"{handler.chat_id}:{handler.msg_id}")
+        self.assertFalse(backfill.key.startswith("0:"))
+        self.assertNotIn(str(-100123), handler.key)
+
+    def test_key_uses_the_normalized_channel_label(self):
+        channel = config_mod.ChannelConfig(channel="https://t.me/chan")
+        self.assertEqual(channel.key(), "chan")
+        incoming = runner.IncomingMessage(channel=channel.key(), chat_id=0, msg_id=7, date="")
+        self.assertEqual(incoming.key, "chan:7")
+
+    def test_same_message_from_backfill_then_handler_is_delivered_once(self):
+        config = make_config(self.tmp)
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        sink = FakeSink()
+        watcher = runner.Watcher(config, store, sink, FakeLookup())
+        channel = config.channels[0]
+
+        async def scenario():
+            await watcher.process(
+                runner.incoming_from_message(FakeMessage(42, "某剧", HIDDEN, chat_id=None), channel.key()),
+                channel,
+            )
+            # 同一条消息随后又从 handler 进来（event.chat_id 是 -100…）
+            await watcher.process(
+                runner.incoming_from_message(
+                    FakeMessage(42, "某剧", HIDDEN, chat_id=-100123), channel.key(), -100123
+                ),
+                channel,
+            )
+
+        asyncio.run(scenario())
+        self.assertEqual(len(sink.sent), 1, "同一 channel/msg_id 只能投递一次")
+        stats = store.stats()
+        self.assertEqual(stats["messages"], 1)
+        self.assertEqual(stats["items"], 1)
+
+
 class DeadLetterTest(unittest.TestCase):
     """review SC4：400/403 只尝试一次就落死信；其余错误重试到上限后落死信。"""
 
@@ -694,6 +863,51 @@ class SessionErrorClassificationTest(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("disk I/O error", message)
         self.assertIn("errno 28", message)
+
+
+try:  # 只有装了 telethon 的环境才跑「真 client」用例（容器里装了，开发机常常没装）
+    from telethon import TelegramClient as _RealTelegramClient
+except ImportError:  # pragma: no cover - 取决于环境
+    _RealTelegramClient = None
+
+
+@unittest.skipUnless(_RealTelegramClient is not None, "需要 telethon：pip install -r requirements.txt")
+class RealSessionCorruptionTest(unittest.TestCase):
+    """review SC13：垃圾 session 文件走**真的** `TelegramClient`，不手工 raise。
+
+    老用例是 `raise sqlite3.DatabaseError("file is not a database")`——它只测了
+    `session_errors` 的分类表，并没有证明 telethon 真的会抛这个异常、也没有证明
+    我们的 with 块罩得住构造/连接阶段。这里把垃圾字节写进 session 路径，让
+    telethon 自己去读它。
+    """
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+        self.config = make_config(self.tmp)
+        self.config.session_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def test_garbage_session_becomes_runner_error(self):
+        self.config.session_path.write_bytes(b"\x00\x01this is not a database" * 64)
+
+        def open_client() -> None:
+            # telethon 1.45 的 SQLiteSession 在构造时就 `select ... from sqlite_master`，
+            # 所以垃圾文件在这里就炸；万一某个版本改成延迟读取，下面 connect() 之前
+            # 读 auth key 也会先碰到 sqlite（不会真连网）。
+            client = _RealTelegramClient(
+                str(self.config.session_path), 123456, "0123456789abcdef0123456789abcdef"
+            )
+            asyncio.run(client.connect())
+
+        with self.assertRaises(runner.RunnerError) as ctx:
+            with runner.session_errors(self.config):
+                open_client()
+        message = str(ctx.exception)
+        self.assertIn("session 文件损坏", message)
+        self.assertIn(str(self.config.session_path), message)
+        self.assertIn("not a database", message.lower())
 
 
 class PhoneValidationTest(unittest.TestCase):

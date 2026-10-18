@@ -26,9 +26,11 @@ USER 10001:10001
 
 VOLUME ["/app/session", "/app/state"]
 
-# 没 session 时 check 返回非零 → 容器明确 unhealthy，而不是假装活着
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python main.py check > /dev/null || exit 1
+# check --deep 会真的连一次 Telegram：session 过期、掉线、容器内没网络都返回非零
+# → 容器明确 unhealthy，而不是「session 文件还在就算健康」（review SC9）。
+# --timeout 要大于 tgwatch.runner.DEEP_CHECK_TIMEOUT（10s），否则 docker 先杀进程。
+HEALTHCHECK --interval=60s --timeout=15s --start-period=30s --retries=3 \
+    CMD python main.py check --deep > /dev/null || exit 1
 
 ENTRYPOINT ["python", "main.py"]
 CMD ["run"]

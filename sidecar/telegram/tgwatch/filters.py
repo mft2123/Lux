@@ -66,6 +66,9 @@ HOLD_MANUAL = Decision(STATUS_HOLD, "manual_mode")
 HOLD_NO_LINK = Decision(STATUS_HOLD, "no_link")
 HOLD_SIZE_UNKNOWN = Decision(STATUS_HOLD, "size_unknown")
 HOLD_LIBRARY_UNKNOWN = Decision(STATUS_HOLD, "library_size_unknown")
+# 一条消息里有多条链接时，某个链接拿不到自己的标题（没有锚文本）：不猜，挂起等人工。
+# 由 runner 逐链接判定时使用，`decide()` 本身不会返回它（review SC7）。
+HOLD_TITLE_AMBIGUOUS = Decision(STATUS_HOLD, "title_ambiguous")
 SKIP_FOLLOW_MISS = Decision(STATUS_SKIP, "follow_miss")
 SKIP_DUPLICATE = Decision(STATUS_SKIP, "wash_not_bigger")
 

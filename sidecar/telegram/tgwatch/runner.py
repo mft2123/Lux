@@ -45,6 +45,33 @@ class RunnerError(RuntimeError):
     """启动前置条件不满足（未登录、session 损坏、频道解析不到、未装 telethon）。"""
 
 
+# 判定结果 → 条目初始状态（逐链接判定，一条消息里可以有不同结果）
+_ITEM_STATUS = {
+    filters.STATUS_DELIVER: store_mod.STATUS_PENDING,
+    filters.STATUS_HOLD: store_mod.STATUS_HELD,
+    filters.STATUS_SKIP: store_mod.STATUS_SKIPPED,
+}
+
+
+def _message_outcome(decisions: list[filters.Decision]) -> tuple[str, str]:
+    """消息级留痕（去重行，不决定投递）：有链接要投递就 pending，否则 held/skipped。
+
+    逐链接判定后一条消息可能「一半投递一半挂起」，消息行只记最能代表这条消息的
+    那个结果；每条链接的真实状态在 items 表中（review SC7）。
+    """
+    for decision in decisions:
+        if decision.deliver:
+            return store_mod.STATUS_PENDING, decision.reason
+    for decision in decisions:
+        if decision.status == filters.STATUS_HOLD:
+            return store_mod.STATUS_HELD, decision.reason
+    return store_mod.STATUS_SKIPPED, decisions[0].reason
+
+
+def _short_url(url: str, limit: int = 80) -> str:
+    return url if len(url) <= limit else url[: limit - 3] + "..."
+
+
 def backoff_seconds(base: int, consecutive_failures: int) -> int:
     """连续失败时的重试间隔：base → 2*base → 4*base… 封顶 MAX_BACKOFF_SECONDS。
 
@@ -69,7 +96,7 @@ class IncomingMessage:
     """一条待判定消息的纯数据视图（测试里直接造这个）。"""
 
     channel: str  # 配置里的频道标识，用于日志与 DB
-    chat_id: int
+    chat_id: int  # 只用于溯源；**不参与去重键**（review SC12）
     msg_id: int
     date: str
     text: str = ""
@@ -77,7 +104,19 @@ class IncomingMessage:
 
     @property
     def key(self) -> str:
-        return f"{self.chat_id}:{self.msg_id}"
+        """去重键：`channel:msg_id`（review SC12）。
+
+        老实现用 `chat_id:msg_id`：handler 路径有 `event.chat_id`（`-100…`），而
+        backfill 路径的消息没有这个属性、退化成 `0:<id>`，同一条消息于是有两个键，
+        可能被投递两次。频道标识（`@name` / `id:-100…`）在两条路径上都拿得到，
+        是唯一稳定的部分。
+
+        升级提示：键语义变了，旧状态库里的旧键不再命中。**最坏情况是重启后把回填
+        窗口里的消息再投递一次**；Lux 侧 ingest 按 URL 幂等（返回 `duplicate`），
+        不会产生第二条转存任务。不做数据迁移——旧键里的 chat_id 当时就没落库，
+        无法可靠还原。
+        """
+        return f"{self.channel}:{self.msg_id}"
 
 
 def entities_to_dicts(message) -> list[dict]:
@@ -281,6 +320,60 @@ def session_errors(config: config_mod.SidecarConfig):
         ) from error
 
 
+# ---------------------------------------------------------------- 登录态自检（check --deep）
+
+
+# `check --deep` 连一次 Telegram 的等待上限（秒）。Dockerfile 的 HEALTHCHECK
+# `--timeout` 必须比它大，否则 docker 会先杀掉进程、报不出「超时」的原因。
+DEEP_CHECK_TIMEOUT = 10.0
+
+
+def _new_client(config: config_mod.SidecarConfig):
+    """按配置造一个 TelegramClient；测试里替换掉它来注入假 client。"""
+    TelegramClient, _events, _utils = _telethon()
+    return TelegramClient(str(config.session_path), config.api_id, config.api_hash)
+
+
+async def _probe_authorized(factory, config: config_mod.SidecarConfig) -> bool:
+    client = factory(config)
+    try:
+        await client.connect()
+        return bool(await client.is_user_authorized())
+    finally:
+        # 连不上/超时也要断开，别在 healthcheck 里泄漏连接
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+
+async def check_session(
+    config: config_mod.SidecarConfig,
+    *,
+    client_factory=None,
+    timeout: float = DEEP_CHECK_TIMEOUT,
+) -> tuple[bool, str]:
+    """`check --deep`：真的连一次 Telegram，确认 session 还有登录态（review SC9）。
+
+    `check` 只证明「文件在、字段不空」；session 过期但文件还在时它照样说健康。
+    这里用 `is_user_authorized()` 问一次服务端（带 10s 超时）：无 session、未授权、
+    连不上都返回 `(False, 原因)`。**不抛异常**——healthcheck 只看退出码。
+    """
+    if not config.session_path.exists():
+        return False, f"session 不存在（{config.session_path}）：先跑 `main.py run` 完成首次登录"
+    factory = client_factory or _new_client
+    try:
+        with session_errors(config):
+            authorized = await asyncio.wait_for(_probe_authorized(factory, config), timeout)
+    except RunnerError as error:
+        return False, str(error)
+    except asyncio.TimeoutError:
+        return False, f"连接 Telegram 超时（{timeout:g}s）：检查容器网络/代理后重试"
+    except Exception as error:  # noqa: BLE001 - healthcheck 不能因为异常类型而崩
+        return False, f"连接 Telegram 失败：{type(error).__name__}: {error}"
+    if not authorized:
+        return False, "session 未登录或已失效（is_user_authorized=False）：删掉 session 后重新登录"
+    return True, "session 已登录（is_user_authorized=True）"
+
+
 # ---------------------------------------------------------------- 洗版查询
 
 
@@ -341,7 +434,6 @@ class Watcher:
         found = links_mod.extract_links(incoming.text, incoming.entities)
         accepted = links_mod.split_kinds(found, self.config.allowed_kinds)
         mode = channel.mode
-        title = links_mod.title_from(incoming.text, accepted or found)
         size_bytes = links_mod.parse_size(incoming.text)
 
         if not accepted:
@@ -360,27 +452,16 @@ class Watcher:
             log.debug("%s 无可用链接（提取到 %d 条），跳过", incoming.key, len(found))
             return
 
-        library: dict = {"ok": True, "size_bytes": None, "matched": None}
-        if mode == filters.MODE_WASH and size_bytes is not None:
-            library = await self.lookup.lookup(title)
+        # review SC7：逐链接判定。每个链接只用自己的锚文本当标题；一条消息里有多个
+        # 链接时，缺标题的那个不许拿整段正文兜底（那等于把别人的标题套给它），
+        # 记 held/title_ambiguous，其余链接照常投递。
+        allow_text_fallback = len(accepted) == 1
+        outcomes: list[tuple[links_mod.Link, str, filters.Decision]] = []
+        for link in accepted:
+            title = links_mod.link_title(link, incoming.text, fallback_to_text=allow_text_fallback)
+            outcomes.append((link, title, await self._decide_link(channel, mode, title, size_bytes)))
 
-        decision = filters.decide(
-            mode,
-            title=title,
-            follow_list=self.config.follow_for(channel.key()),
-            size_bytes=size_bytes,
-            library_size=library.get("size_bytes"),
-            library_known=bool(library.get("ok", True)),
-            wash_tolerance=self.config.wash_tolerance,
-            link_count=len(accepted),
-        )
-
-        initial_status = {
-            filters.STATUS_DELIVER: store_mod.STATUS_PENDING,
-            filters.STATUS_HOLD: store_mod.STATUS_HELD,
-            filters.STATUS_SKIP: store_mod.STATUS_SKIPPED,
-        }[decision.status]
-
+        msg_status, msg_reason = _message_outcome([decision for _, _, decision in outcomes])
         self.store.record_message(
             msg_key=incoming.key,
             channel=incoming.channel,
@@ -388,13 +469,16 @@ class Watcher:
             msg_date=incoming.date,
             mode=mode,
             link_count=len(accepted),
-            status=initial_status,
-            reason=decision.reason,
+            status=msg_status,
+            reason=msg_reason,
         )
         self.store.advance_message_id(incoming.channel, incoming.msg_id)
 
-        item_ids: list[int] = []
-        for link in accepted:
+        deliver_ids: list[int] = []
+        held: dict[str, int] = {}
+        skipped: dict[str, int] = {}
+        for link, title, decision in outcomes:
+            item_status = _ITEM_STATUS[decision.status]
             item_id = self.store.add_item(
                 msg_key=incoming.key,
                 channel=incoming.channel,
@@ -406,33 +490,66 @@ class Watcher:
                 title=title,
                 size_bytes=size_bytes,
                 mode=mode,
-                status=initial_status,
+                status=item_status,
                 reason=decision.reason,
             )
-            if item_id:
-                item_ids.append(item_id)
+            if decision.deliver:
+                if item_id:
+                    deliver_ids.append(item_id)
+                continue
+            if decision.reason == filters.HOLD_TITLE_AMBIGUOUS.reason:
+                # 日志点名具体链接：不然运维只看到「有一条被挂起」，不知道该补哪条的标题
+                log.info(
+                    "%s %s 链接 %s 没有独立标题（title_ambiguous）：挂起不猜，其余链接照常处理",
+                    incoming.channel,
+                    incoming.msg_id,
+                    _short_url(link.url),
+                )
+            bucket = held if decision.status == filters.STATUS_HOLD else skipped
+            bucket[decision.reason] = bucket.get(decision.reason, 0) + 1
 
-        if not decision.deliver:
-            self.counts["held" if decision.status == filters.STATUS_HOLD else "skipped"] += 1
-            log.info(
-                "%s %s %s：%s（%d 条链接）",
-                incoming.channel,
-                incoming.msg_id,
-                "挂起" if decision.status == filters.STATUS_HOLD else "不投递",
-                decision.reason,
-                len(item_ids),
-            )
+        self.counts["held"] += sum(held.values())
+        self.counts["skipped"] += sum(skipped.values())
+        for reason, count in held.items():
+            log.info("%s %s 挂起 %d 条链接：%s", incoming.channel, incoming.msg_id, count, reason)
+        for reason, count in skipped.items():
+            log.info("%s %s 不投递 %d 条链接：%s", incoming.channel, incoming.msg_id, count, reason)
+        if not deliver_ids:
             return
 
         log.info(
             "%s %s 投递 %d 条链接（%s / %s）",
             incoming.channel,
             incoming.msg_id,
-            len(item_ids),
+            len(deliver_ids),
             mode,
-            decision.reason,
+            msg_reason,
         )
-        await self.deliver(item_ids)
+        await self.deliver(deliver_ids)
+
+    async def _decide_link(
+        self,
+        channel: config_mod.ChannelConfig,
+        mode: str,
+        title: str,
+        size_bytes: int | None,
+    ) -> filters.Decision:
+        """单个链接的判定；洗版按**这个链接自己的标题**查库（同标题走缓存）。"""
+        if not title:
+            return filters.HOLD_TITLE_AMBIGUOUS
+        library: dict = {"ok": True, "size_bytes": None, "matched": None}
+        if mode == filters.MODE_WASH and size_bytes is not None:
+            library = await self.lookup.lookup(title)
+        return filters.decide(
+            mode,
+            title=title,
+            follow_list=self.config.follow_for(channel.key()),
+            size_bytes=size_bytes,
+            library_size=library.get("size_bytes"),
+            library_known=bool(library.get("ok", True)),
+            wash_tolerance=self.config.wash_tolerance,
+            link_count=1,
+        )
 
     async def deliver(self, item_ids: list[int]) -> int:
         """逐条投递；返回本轮失败（含落死信）的条数。"""

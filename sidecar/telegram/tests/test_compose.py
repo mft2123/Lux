@@ -44,6 +44,12 @@ class DockerfileTest(unittest.TestCase):
     def test_healthcheck_uses_check_command(self):
         self.assertIn("main.py check", self.text)
 
+    def test_healthcheck_deep_checks_the_login(self):
+        """review SC9：healthcheck 不能只验「文件在、字段不空」，要真的问登录态。"""
+        self.assertIn("main.py check --deep", self.text)
+        # 内部超时 10s，docker 侧必须留出余量
+        self.assertIn("--timeout=15s", self.text)
+
 
 if __name__ == "__main__":
     unittest.main()

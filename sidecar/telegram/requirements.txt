@@ -1,2 +1,24 @@
-# Telethon 是唯一的外部依赖：旁挂只用标准库（sqlite3 / urllib / asyncio / logging）
+# 旁挂只用标准库 + telethon：直接依赖与关键传递依赖全部钉死（review SC10），
+# 不让 pip 在每次 docker build 时重新解析出不同版本（传递依赖漂移会让你在没有
+# 改过任何代码的情况下换掉 crypto/网络实现）。
+#
+# 版本来源（2026-10-18 在 NAS 上实际核对，不是抄文档）：
+#   /vol5/1000/build/tgvenv 的 `pip freeze` = pyaes 1.6.1 / rsa 4.9.1 / Telethon 1.45.0，
+#   另有 pyasn1 0.6.4（rsa 的依赖）。telethon 1.45.0 自己的 METADATA 只声明
+#   pyaes、rsa 两条硬依赖（cryptg / proxy 都是可选 extra）。
+#   python-socks 是 telethon 的可选代理后端（telethon/client/telegrambaseclient.py 里
+#   `import python_socks` 失败只打 warning）：本服务不传 proxy=，所以不会真的用到它，
+#   钉住是为了「以后要挂代理」时版本也不漂；取 2.x 末版以匹配 telethon 1.45.0 的
+#   `python_socks.async_.asyncio` 导入路径（3.x 换了包内布局）。
+#
+# 升级方法：
+#   1. 改 telethon 版本，在干净 venv 里 `pip install -r requirements.txt`；
+#   2. `pip freeze` 把 pyaes / rsa / pyasn1 / python-socks 的实际版本抄回本文件；
+#   3. 跑 `python tools/api_smoke.py`（用到的 API 与签名没变）与
+#      `python -m unittest discover -s tests -t .`（全绿）；
+#   4. 再 docker build，并用 `python main.py check --deep` 验一次真实登录态。
 telethon==1.45.0
+pyaes==1.6.1
+rsa==4.9.1
+pyasn1==0.6.4
+python-socks==2.8.2

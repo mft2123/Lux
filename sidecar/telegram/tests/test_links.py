@@ -151,6 +151,29 @@ class TitleTest(unittest.TestCase):
         self.assertEqual(links.title_from(None), "")
 
 
+class LinkTitleTest(unittest.TestCase):
+    """review SC7：每个链接只认自己的锚文本，多链接消息不拿正文兜底。"""
+
+    def test_uses_own_anchor(self):
+        link = links.Link(url="https://115.com/s/1", kind=links.KIND_115, anchor="某剧 S01")
+        self.assertEqual(links.link_title(link, "整条消息的第一行"), "某剧 S01")
+
+    def test_no_anchor_without_fallback_is_empty(self):
+        link = links.Link(url="https://115.com/s/1", kind=links.KIND_115, anchor="")
+        self.assertEqual(links.link_title(link, "整条消息的第一行"), "")
+        self.assertEqual(links.link_title(link, "整条消息的第一行", fallback_to_text=False), "")
+
+    def test_text_fallback_only_when_asked(self):
+        link = links.Link(url="https://115.com/s/1", kind=links.KIND_115, anchor="")
+        self.assertEqual(
+            links.link_title(link, "\n  沙丘2 2024  \n更多", fallback_to_text=True), "沙丘2 2024"
+        )
+
+    def test_anchor_that_is_just_a_link_is_not_a_title(self):
+        link = links.Link(url="https://115.com/s/1", kind=links.KIND_115, anchor="https://115.com/s/2")
+        self.assertEqual(links.link_title(link, ""), "")
+
+
 class SlugTest(unittest.TestCase):
     def test_slug(self):
         self.assertEqual(links.slugify("沙丘 2 (2024)"), "沙丘-2-2024")

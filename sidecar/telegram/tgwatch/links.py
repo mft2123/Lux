@@ -248,16 +248,50 @@ def parse_size(text: str | None) -> int | None:
 _LINE_JUNK = " \t\u3000|·•-—"
 
 
-def title_from(text: str | None, links: list[Link] | None = None) -> str:
-    """给「追更 / 洗版」判定用的标题：优先隐藏链接的锚文本，其次首行正文。"""
-    for link in links or ():
-        anchor = (link.anchor or "").strip()
-        if anchor and not _looks_like_link(anchor) and len(anchor) >= 2:
-            return _clean_title(anchor)
+def _anchor_title(link: Link) -> str:
+    """链接自己的锚文本（隐藏链接的文字）；锚文本本身就是链接时不认。"""
+    anchor = (link.anchor or "").strip()
+    if anchor and not _looks_like_link(anchor) and len(anchor) >= 2:
+        return _clean_title(anchor)
+    return ""
+
+
+def _first_line_title(text: str | None) -> str:
     for raw_line in (text or "").splitlines():
         line = raw_line.strip(_LINE_JUNK)
         if line:
             return _clean_title(line)
+    return ""
+
+
+def title_from(text: str | None, links: list[Link] | None = None) -> str:
+    """给「追更 / 洗版」判定用的标题：优先隐藏链接的锚文本，其次首行正文。
+
+    这是「一条消息一个标题」的老语义，只适合**单链接**消息；一条消息里有多条
+    链接时请逐个用 `link_title`，否则第一个链接的标题会被套给所有链接（SC7）。
+    """
+    for link in links or ():
+        title = _anchor_title(link)
+        if title:
+            return title
+    return _first_line_title(text)
+
+
+def link_title(link: Link, text: str | None, *, fallback_to_text: bool = False) -> str:
+    """**单个**链接自己的标题（review SC7）。
+
+    一条消息里常有多个链接，各自挂着不同的锚文本。这里只认该链接自己的锚文本，
+    不拿同一条消息里别的链接、也不拿整段正文去凑。
+
+    拿不到独立标题时返回空串。`fallback_to_text=True` 只给**单链接**消息用——
+    那种情况下正文首行确实就是这条链接的标题；多链接消息绝不能兜底，调用方
+    应当把该链接记 `held`（原因 `title_ambiguous`），不要猜。
+    """
+    title = _anchor_title(link)
+    if title:
+        return title
+    if fallback_to_text:
+        return _first_line_title(text)
     return ""
 
 

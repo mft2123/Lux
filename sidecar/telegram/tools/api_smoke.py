@@ -28,17 +28,22 @@ def check(name: str, condition) -> None:
 
 
 def main_checks() -> None:
-    check("iter_messages(limit)", "limit" in inspect.signature(TelegramClient.iter_messages).parameters)
-    check("iter_messages(reverse)", "reverse" in inspect.signature(TelegramClient.iter_messages).parameters)
+    iter_params = inspect.signature(TelegramClient.iter_messages).parameters
+    check("iter_messages(limit)", "limit" in iter_params)
+    check("iter_messages(reverse)", "reverse" in iter_params)
+    # review SC13：宕机窗口靠 `iter_messages(min_id=…)` 补拉（runner._gap_backfill）
+    check("iter_messages(min_id)", "min_id" in iter_params)
     check("NewMessage(chats)", "chats" in inspect.signature(events.NewMessage.__init__).parameters)
     check("NewMessage(incoming)", "incoming" in inspect.signature(events.NewMessage.__init__).parameters)
     start_params = inspect.signature(TelegramClient.start).parameters
     for param in ("phone", "password", "code_callback"):
         check(f"start({param})", param in start_params)
-    for attr in ("get_entity", "run_until_disconnected", "add_event_handler", "is_user_authorized"):
+    for attr in ("get_entity", "run_until_disconnected", "add_event_handler", "is_user_authorized", "catch_up"):
         check(attr, hasattr(TelegramClient, attr))
     check("utils.get_peer_id", hasattr(utils, "get_peer_id"))
     check("is_user_authorized coroutine", inspect.iscoroutinefunction(TelegramClient.is_user_authorized))
+    # review SC13：run() 启动时先 catch_up 收差量更新，再由游标补拉兜底
+    check("catch_up coroutine", inspect.iscoroutinefunction(TelegramClient.catch_up))
 
     session_dir = tempfile.mkdtemp()
     client = TelegramClient(os.path.join(session_dir, "lux-telegram"), 123456, "aa" * 16)
