@@ -32,6 +32,7 @@ const DEFAULT_MIRROR_ROOT: &str = "/vol5/1000/docker/lux-library";
 const DEFAULT_CD2_CONTAINER_MOUNT: &str = "/media/cloud";
 pub(crate) const ARCHIVE_POLL_SECONDS_ENV: &str = "LUX_ARCHIVE_POLL_SECONDS";
 pub(crate) const ARCHIVE_MIRROR_ROOT_ENV: &str = "LUX_ARCHIVE_MIRROR_ROOT";
+pub(crate) const ARCHIVE_WATCH_DIRS_ENV: &str = "LUX_ARCHIVE_WATCH_DIRS";
 pub(crate) const ARCHIVE_CD2_PREFIX_ENV: &str = "LUX_ARCHIVE_CD2_PREFIX";
 pub(crate) const ARCHIVE_CD2_MOUNT_ENV: &str = "LUX_ARCHIVE_CD2_MOUNT";
 pub(crate) const ARCHIVE_WASH_ENABLED_ENV: &str = "LUX_ARCHIVE_WASH_ENABLED";
@@ -62,6 +63,9 @@ pub(crate) struct ArchiveConfig {
     pub(crate) root: PathBuf,
     pub(crate) tmdb_api_key: Option<String>,
     pub(crate) tmdb_language: String,
+    /// Extra 115 directories (on the CD2 mount) watched for new uploads; their
+    /// entries are moved into 转存目录 so the normal pipeline takes over.
+    pub(crate) watch_dirs: Vec<PathBuf>,
     /// Local mirror that the media server scans: strm + NFO + images only.
     pub(crate) mirror_root: PathBuf,
     /// Path of the archive root inside the CloudDrive2 mount (for example
@@ -95,6 +99,17 @@ impl ArchiveConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "zh-CN".to_owned());
+        let watch_dirs = std::env::var(ARCHIVE_WATCH_DIRS_ENV)
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mirror_root = std::env::var(ARCHIVE_MIRROR_ROOT_ENV)
             .ok()
             .map(|value| value.trim().to_string())
@@ -129,6 +144,7 @@ impl ArchiveConfig {
             root,
             tmdb_api_key,
             tmdb_language,
+            watch_dirs,
             mirror_root,
             cd2_prefix,
             cd2_container_mount,
@@ -360,6 +376,14 @@ impl ArchiveService {
             ..ArchiveReport::default()
         };
 
+        let ingested = self.ingest_watch_dirs(dry_run).await?;
+        if !ingested.is_empty() {
+            tracing::info!(
+                count = ingested.len(),
+                entries = ?ingested,
+                "watch directories fed the transfer directory"
+            );
+        }
         self.archive_transfer_entries(&mut report).await?;
         self.organize_pending_entries(&mut report).await?;
         Ok(report)
@@ -1178,6 +1202,48 @@ impl ArchiveService {
         }
     }
 
+    /// Move new uploads from the watched 115 directories into 转存目录.
+    /// Returns the moved names (or the planned names in a dry run).
+    async fn ingest_watch_dirs(&self, dry_run: bool) -> Result<Vec<String>, String> {
+        let mut moved = Vec::new();
+        let transfer = self.config.transfer_dir();
+        for watch in &self.config.watch_dirs {
+            let entries = match read_dir_entries(watch) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries {
+                let name = entry
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if is_ignored_entry(&name) || !entry_is_settled(&entry, self.config.settle_seconds) {
+                    continue;
+                }
+                if is_dir_empty(&entry) {
+                    continue;
+                }
+                let target = unique_target(&transfer, &name);
+                if dry_run {
+                    moved.push(format!("{name} -> {}", target.display()));
+                    continue;
+                }
+                if let Err(error) = std::fs::create_dir_all(&transfer) {
+                    return Err(format!("无法创建转存目录: {error}"));
+                }
+                match move_entry(&entry, &target) {
+                    Ok(()) => moved.push(name),
+                    Err(error) => tracing::warn!(
+                        entry = %entry.display(),
+                        %error,
+                        "failed to move a watched entry into 转存目录"
+                    ),
+                }
+            }
+        }
+        Ok(moved)
+    }
+
     pub(crate) fn status(&self) -> ArchiveStatus {
         ArchiveStatus {
             root: self.config.root.display().to_string(),
@@ -1190,6 +1256,11 @@ impl ArchiveService {
             settle_seconds: self.config.settle_seconds,
             wash_enabled: self.config.wash_enabled,
             wash_tolerance_ratio: self.config.wash_tolerance_ratio,
+            watch_dirs: self.config
+                .watch_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
             tmdb_configured: self.config.tmdb_api_key.is_some(),
         }
     }
@@ -1595,6 +1666,38 @@ pub(crate) fn contains_cjk(value: &str) -> bool {
     })
 }
 
+fn is_dir_empty(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut reader| reader.next().is_none())
+        .unwrap_or(false)
+}
+
+/// Keep the release name but avoid overwriting an existing entry.
+fn unique_target(directory: &Path, name: &str) -> PathBuf {
+    let candidate = directory.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_owned());
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_string());
+    for index in 2..1000 {
+        let candidate = match &extension {
+            Some(extension) => directory.join(format!("{stem} ({index}).{extension}")),
+            None => directory.join(format!("{name} ({index})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    directory.join(format!("{stem} ({})", unix_now()))
+}
+
 fn dir_has_nfo(directory: &Path) -> bool {
     let Ok(reader) = std::fs::read_dir(directory) else {
         return false;
@@ -1994,6 +2097,7 @@ pub(crate) struct ArchiveStatus {
     pub(crate) settle_seconds: u64,
     pub(crate) wash_enabled: bool,
     pub(crate) wash_tolerance_ratio: f64,
+    pub(crate) watch_dirs: Vec<String>,
     pub(crate) tmdb_configured: bool,
 }
 
@@ -2178,6 +2282,23 @@ mod tests {
             ..movie
         };
         assert!(!movie.is_domestic());
+    }
+
+    #[test]
+    fn unique_target_avoids_collisions() {
+        let base = std::env::temp_dir().join(format!("lux-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(
+            unique_target(&base, "Movie.2020.1080p"),
+            base.join("Movie.2020.1080p")
+        );
+        std::fs::write(base.join("Movie.2020.1080p"), b"x").unwrap();
+        assert_eq!(
+            unique_target(&base, "Movie.2020.1080p"),
+            base.join("Movie.2020 (2).1080p")
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

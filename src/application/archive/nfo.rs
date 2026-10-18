@@ -913,6 +913,7 @@ mod tests {
             settle_seconds: 3,
             wash_enabled: true,
             wash_tolerance_ratio: 0.02,
+            watch_dirs: Vec::new(),
             mirror_root: PathBuf::from("/library"),
             cd2_prefix: "测试库".to_owned(),
             cd2_container_mount: "/media/cloud".to_owned(),
