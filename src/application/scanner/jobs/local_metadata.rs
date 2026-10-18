@@ -103,29 +103,84 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
             }
         };
 
+    // Items already excluded by a previous pass never enter the image phase
+    // again. A deterministic image-root rejection (media paths containing `*` /
+    // `[` and similar) otherwise retried the same batch hundreds of times and
+    // starved every local metadata worker at 182k items.
+    let retryable_source_ids = retryable_local_metadata_source_ids(&source_ids, &non_retryable_item_ids);
+
+    if batch.images_completed_at.is_none() && retryable_source_ids.is_empty() {
+        let issue = format!(
+            "{} local image item(s) skipped as non-retryable",
+            non_retryable_item_ids.len()
+        );
+        tracing::warn!(batch_id, %issue, "local metadata batch has no retryable image items");
+        if let Err(error) = database
+            .complete_scan_local_metadata_batch_with_outcome(
+                &batch_id,
+                Some(&issue),
+                &non_retryable_item_ids,
+            )
+            .await
+        {
+            tracing::warn!(batch_id, %error, "local metadata batch completion could not be saved");
+        }
+        if let Some(home) = home {
+            home.invalidate();
+        }
+        user_events.publish_home_coalesced().await;
+        return None;
+    }
+
+    enum LocalImageOutcome {
+        Retry {
+            error: String,
+            excluded: Option<Vec<String>>,
+        },
+    }
     let result = if batch.images_completed_at.is_some() {
         database
             .list_scan_local_metadata_sources(&source_ids)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| LocalImageOutcome::Retry {
+                error: error.to_string(),
+                excluded: None,
+            })
     } else {
         match enricher
-            .index_scan_local_metadata_batch_images(&source_ids)
+            .index_scan_local_metadata_batch_images(&retryable_source_ids)
             .await
         {
-            Ok(batch) if !batch.report.failed_item_ids.is_empty() => Err(format!(
-                "{} local image item(s) failed",
-                batch.report.failed_item_ids.len()
-            )),
+            Ok(batch) if !batch.report.failed_item_ids.is_empty() => {
+                let excluded =
+                    merge_failed_local_metadata_items(&non_retryable_item_ids, &batch.report.failed_item_ids);
+                let error = format!(
+                    "{} local image item(s) failed; retrying the remaining items",
+                    batch.report.failed_item_ids.len()
+                );
+                Err(LocalImageOutcome::Retry {
+                    error,
+                    excluded: Some(excluded),
+                })
+            }
             Ok(batch) => match database
                 .mark_scan_local_metadata_images_complete(&batch_id)
                 .await
             {
                 Ok(true) => Ok(batch.sources),
-                Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
-                Err(error) => Err(error.to_string()),
+                Ok(false) => Err(LocalImageOutcome::Retry {
+                    error: "local metadata batch stopped before image completion".to_owned(),
+                    excluded: None,
+                }),
+                Err(error) => Err(LocalImageOutcome::Retry {
+                    error: error.to_string(),
+                    excluded: None,
+                }),
             },
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(LocalImageOutcome::Retry {
+                error: error.to_string(),
+                excluded: None,
+            }),
         }
     };
     if let Some(home) = home {
@@ -140,12 +195,52 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
             source_snapshot,
             non_retryable_item_ids,
         )),
-        Err(error) => {
+        Err(LocalImageOutcome::Retry {
+            error,
+            excluded: Some(excluded),
+        }) => {
+            tracing::warn!(
+                batch_id,
+                %error,
+                excluded = excluded.len(),
+                "local image batch retries without its failed items"
+            );
+            fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+                database,
+                &batch_id,
+                &error,
+                &excluded,
+            )
+            .await;
+            None
+        }
+        Err(LocalImageOutcome::Retry {
+            error,
+            excluded: None,
+        }) => {
             tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
             fail_scan_local_metadata_batch(database, &batch_id, &error).await;
             None
         }
     }
+}
+
+fn retryable_local_metadata_source_ids(source_ids: &[String], non_retryable: &[String]) -> Vec<String> {
+    source_ids
+        .iter()
+        .filter(|source_id| !non_retryable.contains(source_id))
+        .cloned()
+        .collect()
+}
+
+fn merge_failed_local_metadata_items(non_retryable: &[String], failed: &[String]) -> Vec<String> {
+    let mut merged = non_retryable.to_vec();
+    for item_id in failed {
+        if !merged.contains(item_id) {
+            merged.push(item_id.clone());
+        }
+    }
+    merged
 }
 
 pub(in crate::application::scanner) async fn finish_scan_local_metadata_batch(
@@ -286,8 +381,13 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_backfil
     user_events: &UserEventHub,
     page: &StoredScanLocalMetadataBackfillPage,
 ) -> Result<Vec<StoredScanLocalMetadataSource>, String> {
+    let retryable_entry_ids =
+        retryable_local_metadata_source_ids(&page.entry_ids, &page.non_retryable_item_ids);
+    if retryable_entry_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let result = enricher
-        .index_scan_local_metadata_batch_images(&page.entry_ids)
+        .index_scan_local_metadata_batch_images(&retryable_entry_ids)
         .await;
     if let Some(home) = home {
         home.invalidate();
@@ -1519,5 +1619,30 @@ impl ScanJobService {
         };
         tokio::spawn(run_scan_local_metadata_outbox_worker(worker_context));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_failed_local_metadata_items, retryable_local_metadata_source_ids};
+
+    #[test]
+    fn image_phase_skips_non_retryable_sources() {
+        let sources = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let excluded = vec!["b".to_owned()];
+        assert_eq!(
+            retryable_local_metadata_source_ids(&sources, &excluded),
+            vec!["a".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn failed_image_items_merge_into_the_exclusion_list() {
+        let excluded = vec!["a".to_owned()];
+        let failed = vec!["b".to_owned(), "a".to_owned(), "c".to_owned()];
+        assert_eq!(
+            merge_failed_local_metadata_items(&excluded, &failed),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
     }
 }
