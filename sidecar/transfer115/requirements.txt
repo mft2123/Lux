@@ -1,0 +1,5 @@
+# The sidecar deliberately depends on exactly one runtime library: p115client
+# carries the 115 web API (cookie login, share snap/receive, folder listing and
+# creation). Its own transitive dependencies are resolved by pip at build time;
+# the pin below is the API surface this sidecar is written against.
+p115client==0.0.9.4
