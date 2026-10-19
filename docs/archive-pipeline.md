@@ -77,17 +77,22 @@
   再写第二个文件，而是返回已有作业并带 `"duplicate": true`。查重与写盘在进程内串行（`Mutex`），
   并发投递同一 URL 只会落一个作业文件。`状态.jsonl` 或队列目录读不出来时返回 `500` 而不是
   "当作没有重复"——宁可拒绝，也不重复交给转存客户端。
-- **115 转存客户端（计划 U11）尚未实现**：合法作业不会下载任何内容，而是
-  写入 `状态.jsonl`（`status: needs_115_client`）+ WARN 日志，并把作业文件移入 `已处理/`。
-  即"登记待转存"，不产生 `转存目录/` 条目。
+- **115 分享链接转存**：配置了 `transfer115.sidecar_base` 时，`115.com/s/<code>` 形式的作业在记账前
+  交给 transfer115 侧车（`POST {sidecar}/transfer`），由它用设置文件里的 cookie 登录 115 并转存到
+  `<cd2_prefix>/<target_dir>`；结果按 `transferred` / `failed` / `unsupported` 记账并移入 `已处理/`。
+  `auth_required`（cookie 失效）与侧车不可达都**不记账、不移文件**：本轮消费中断（`dry_run` 除外），
+  作业留在队列，换 cookie 后下一轮重试——只暂停队列阶段，归档流水线其余部分照常跑。
+  magnet / ed2k 不走侧车，直接记 `unsupported`（115 云下载是后续切片）。
+  未配置 `sidecar_base` 时退回旧行为：记 `needs_115_client`，不产生 `转存目录/` 条目。
 - **逐条失败隔离**：消费是 best effort，单条作业写状态或移动失败只记 `failed` 并继续下一条，
   不会中断整轮 `run_once`（否则磁盘满、`已处理/` 撞名会让整个归档永久卡死）。
   每条的步骤是"先写状态、再移动"：状态已写但移动失败的作业下一轮只重试移动，
   `状态.jsonl` 里不会出现第二条记账。
   `已处理/<作业名>` 被同名目录占用视为需要人工处理的异常（记 `failed`、作业留在队列），
   不会偷偷改名绕过；同名文件属于**另一个**作业时才加后缀。
-- 状态文件目前只有两种状态：`needs_115_client`（合法、等 115 客户端）与 `invalid`（被隔离）；
-  接上转存客户端后再加 `pending` / `transferred`。
+- 状态文件的状态：`transferred`（已转存/已提交）、`failed`（分享失效、接口报错、或非 115 链接的
+  `unsupported`）、`needs_115_client`（未配置侧车时的合法作业）、`invalid`（被隔离）。
+  每条记录带 `transfer` 字段（转存结果或条目名）与 `reason`，便于排查。
 - 日志脱敏：链接只打印 `scheme://host`，magnet 只打印 `magnet:?xt=urn:btih:<前8位>…`；
   完整链接与 `password=` 不进日志。
 - 干跑（`dry_run`）只统计与报告，不移动文件、不写状态文件。
@@ -312,7 +317,8 @@
   `rename` 不可用时退化为原地写（0600）；写入窗口内读到半截 JSON 会回退到环境变量。
 - `POST /api/v1/admin/archive/ingest` — 旁挂交接入口。Body `{"url":"…","title":"…","mode":"…"}`（其余字段可选，
   见 2.1）；返回 `202 {"ok":true,"jobId":"…","file":"…","status":"queued","duplicate":false}`。
-  202 的 `status` 是**入队态** `queued`：消费者下一轮才写 `needs_115_client`。
+  202 的 `status` 是**入队态** `queued`：消费者下一轮才写转存结果（`transferred` / `failed` /
+  `unsupported`）或 `needs_115_client`；重复投递时响应里的 `transfer` 带上一条作业已记录的结果。
   同一 URL 重复投递时 `duplicate` 为 `true` 且不会再写文件；需要重新投递已消费的链接时，
   body 加 `"force": true`（跳过 URL 幂等检查、重新入队并分配新 jobId）。
   鉴权同管理接口（`X-Lux-Api-Key` 或 `Bearer`），且**先鉴权再解析 body**：未认证一律 401，
@@ -335,8 +341,11 @@
 
 ## 10. 已知限制
 
-- **115 链接转存（U11）未实现**：`链接队列/` 的作业目前只登记为 `needs_115_client`，不下载、不转存；
-  转存客户端接上后，这一步才真正产出 `转存目录/` 条目。
+- **115 转存只做了分享链接**：`115.com/s/<code>` 走 transfer115 侧车；magnet / ed2k 记 `unsupported`
+  （115 云下载是后续切片）。侧车与真实 cookie 的端到端验收尚未进行（离线 21 条用例已过）。
+- **侧车串行转存**：同一个 115 会话一次只处理一个作业，队列积压时逐个消费。
+- **侧车超时**：Lux 侧 `transfer115.timeout_seconds`（默认 120s，上限 600s）到点即中断，
+  作业留在队列下一轮重试；115 侧的大分享可能在 Lux 超时后仍在处理，文件落盘后照常被流水线接走。
 - 洗版的"库中体积"来自目录名启发式（第 9 节 lookup），不是数据库查询；命中不了的条目在旁挂侧挂起。
 - 目录包内部的文件名与结构不改写（保留原始发布文件）。
 - TMDB 没有按国家的剧集发行日期，剧集的国内/国外只能按首播国判定。

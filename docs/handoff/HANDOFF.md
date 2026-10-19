@@ -7,8 +7,9 @@
 
 ## 1. 一句话现状
 
-归档流水线、设置页、Telegram 通知、Telegram 旁挂（代码层）、链接队列、运维修复工具都已完成并合并；
-**唯一的功能缺口是「把一条 115 分享链接真正转存进 115 网盘」这一步（脚本里叫 U11）**——其余剩下的是联调、部署和存量迁移。
+归档流水线、设置页、Telegram 通知、Telegram 旁挂（代码层）、链接队列、运维修复工具、以及
+**115 转存（U11：Lux 侧转存阶段 + transfer115 侧车）** 都已实现并合并；侧车 21 条离线用例通过。
+剩下的是**真实 115 cookie 的端到端验收**、生产编排、存量迁移与 chill 退役。
 
 ---
 
@@ -151,6 +152,13 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 
 ---
 
+### 6.7 115 转存（U11，本轮完成）
+
+- Lux 侧转存阶段：`archive.rs` 的 `transfer_115_share_link` + 设置项 `transfer115`，提交 `570ccb19`。
+- 侧车 `sidecar/transfer115/`：p115client + cookie，`POST /transfer` 契约见其 README，提交 `f7d460dd`。
+- 文档：`archive-pipeline.md` §2（队列状态）与 §10（已知限制）已同步；总线/PROGRESS 已记录。
+- 唯一未做的验证：真实 cookie 的端到端（见 §8.1 剩余 1）。
+
 ## 7. 关键决策与约定（不要推翻，除非有理由）
 
 | 编号 | 决定 |
@@ -170,31 +178,28 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 
 ## 8. 待办（按优先级）
 
-### 8.1 ★ U11：115 转存（唯一的功能缺口）
+### 8.1 ✅ U11：115 转存（已实现，待真机验收）
 
-**目标**：把链接队列里的 115 分享链接真正转存进 115 网盘的目标目录，文件经 CD2 挂载出现在
-`<archive_root>/转存目录`，之后现有的 `watch_dirs → 待整理 → …` 流水线原样接管。
+**已完成**：
 
-**已确认的技术路线**（来自 chill 实现调研）：
+- Lux 侧（`570ccb19`）：配置项 `transfer115`（`cookie` / `target_dir` / `sidecar_base` / `timeout_seconds`），
+  队列消费器在记账前把 `115.com/s/<code>` 交给侧车，按 `transferred` / `failed` / `unsupported` 记账并移入
+  `已处理/`；`auth_required` 与侧车不可达都**不记账、不移文件**，本轮消费中断、作业留在队列等下一轮。
+  magnet / ed2k 直接记 `unsupported`（115 云下载是后续切片）。`cargo test --lib archive` = 83 passed。
+- 侧车（`f7d460dd`，`sidecar/transfer115/`）：Python + `p115client==0.0.9.4`，cookie 从共享设置文件读
+  （请求体不带 cookie）；流程 `login_status → share_snap → 解析/创建 <cd2_prefix>/<target_dir> 的 cid →
+  share_receive → 短暂确认`；日志只打 job_id 与 URL host；串行转存。21 条离线用例通过
+  （链接解析、cookie 读取/打码、目标目录创建、多条目、四种状态、HTTP 往返、参数校验）。
 
-- chill 用 **`p115client`**（版本 0.0.9.4）+ 网页 cookie 登录。chill 的 115 模块在容器内
-  `/app/core/monitor115/`（`client.so`/`models.so`/`monitor.pyc`，**编译过，读不到源码**），
-  配置目录里有 `115_file_path_map.json`、`115_life_actions.db`、`drive115_upload_state.json`。
-- `p115client` 关键 API：
-  - `P115Client(cookies="UID=…; CID=…; SEID=…; KID=…")`，`login_status()` / `user_my()` 验证登录态，
-    失效抛 `P115AuthenticationError`；
-  - `share_snap({share_code, receive_code})` → `GET https://webapi.115.com/share/snap` 拿 file_id；
-  - `share_receive({share_code, receive_code, file_id, cid})` → `POST https://webapi.115.com/share/receive` 转存；
-  - `fs_mkdir(name, pid)` 建目标目录；`fs_move` / `fs_copy` 备用；
-  - 磁力/ed2k：`clouddownload_task_add_urls(...)`（115 云下载）。
-- 建议实现形态：**新 Python 侧车 `sidecar/transfer115/`**（与 Telegram 旁挂同模式，用 p115client），
-  Lux 链接队列消费到 `needs_115_client` 时 HTTP 调它；侧车返回 `transferred`/`failed`/`auth_required`，
-  Lux 写回 `状态.jsonl`。目标目录按配置的 115 路径解析 cid（如 `测试库/转存目录`），不存在就创建。
-  幂等：URL 幂等 + 转存前查目标目录同名。
-- 待用户确认的参数（开工前问一次）：cookie 的提供方式（F12 四个值 vs 整串）、目标目录规则（固定 vs 按来源分）、
-  是否把 magnet/ed2k 一起做。
-- 侧车写好后：离线单测（mock 115 响应）→ 测试库真链接验收 → 更新 `archive-pipeline.md` 队列状态机
-  （加 `transferred`/`failed`/`auth_required`）→ 更新总线/PROGRESS。
+**剩余**：
+
+1. 用真实 cookie 跑一次端到端：`链接队列` 投一条真实 115 分享 → 侧车转存 → CD2 挂载出现文件 →
+   `转存目录 → 待整理 → 媒体目录 → 镜像` 全通。需要用户提供 115 cookie。
+2. 生产编排：侧车容器 + 配置目录 `0750 root:<group>` / 设置文件 `0640 root:<group>` + `group_add`（README 有片段）。
+3. 磁力/ed2k 走 115 云下载（`clouddownload_task_add_urls`）——后续切片，不在本轮。
+
+**开工前不需要再问参数**：cookie 提供方式是「浏览器 F12 复制整串」，目标目录默认 `转存目录`
+（相对 `cd2_prefix`），都可以在设置文件里改。
 
 ### 8.2 端到端联调（依赖 8.1）
 
@@ -284,7 +289,7 @@ csrf=$(awk '$6=="lux_csrf" {print $7}' /tmp/c.jar)
 ## 11. 未验证 / 风险
 
 - 旁挂从未真机登录、从未真正投递过（只有 stub 契约 + 207 条离线用例）。
-- 链接队列从未和真实 115 转存串起来（U11 未实现）。
+- 115 转存（U11）只做了离线验收：侧车 21 条用例通过，但没有用真实 cookie 跑过真实分享。
 - 生产环境从未跑过（只有测试容器）；大库（18 万条目）性能只有外推，没有实测。
 - 上游三份 issue 未提交。
 - `re-enrich` 会把整库 NFO 重读一遍，大库上要挑空闲时段；以后可以改成只处理指定 item ids。

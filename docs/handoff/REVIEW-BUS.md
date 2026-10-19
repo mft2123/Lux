@@ -13,6 +13,19 @@
 
 ---
 
+## 交接（2026-10-19 · 接收方）
+
+Lux 项目由新对话框接手（原总控/审核组的上下文已用尽，交接文档见 `HANDOFF.md`）。
+第一件事是把 U11 补完：
+
+- `feat/transfer115`（`570ccb19`）：Lux 侧转存阶段 + `transfer115` 设置段，archive 测试 83 passed。
+- `feat/transfer115-sidecar`（`f7d460dd`）：`sidecar/transfer115/`，p115client + cookie，
+  21 条离线用例通过。
+- 已 fast-forward 到 `fork/phase-a`；`docs/archive-pipeline.md` 的队列状态与已知限制已同步。
+- 未验证：真实 cookie 的端到端（需要用户提供 cookie）；magnet/ed2k 云下载未做。
+
+---
+
 ## 本轮审核（2026-10-18 第二轮 · 审核组）
 
 范围：设置 / 通知 / 旁挂 / Rust 侧 ingest 四个在飞模块，外加归档核心的 F1。
