@@ -191,6 +191,16 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
   share_receive → 短暂确认`；日志只打 job_id 与 URL host；串行转存。21 条离线用例通过
   （链接解析、cookie 读取/打码、目标目录创建、多条目、四种状态、HTTP 往返、参数校验）。
 
+**已在测试实例验证（2026-10-19，镜像 `ac86c13c76e0`）**：
+
+- `GET /archive/settings` 返回 `transfer115`（cookie 打码 `UID=1;…(27)`）；
+  `PUT` 落盘后文件里是真的 cookie、其余键按 provenance 规则写（`target_dir` 等于默认值时不重复写）。
+- 投一条 `115.com/s/...` → `POST /archive/run` → Lux 真的调到了侧车（侧车日志 `POST /transfer`），
+  侧车返回 `failed`（本机无外网，`share_snap` 读不到内容），Lux 记 `failed` 并把作业移入 `已处理/`。
+- 把 `sidecar_base` 指到一个死端口再投一条 → 作业**留在队列**、`状态.jsonl` 不增行、`run` 仍返回 200
+  （只暂停队列阶段），证明不会丢作业、也不会重复记账。
+- 测试痕迹已清理（设置文件里的 `transfer115` 段、残留作业、测试侧车容器）。
+
 **剩余**：
 
 1. 用真实 cookie 跑一次端到端：`链接队列` 投一条真实 115 分享 → 侧车转存 → CD2 挂载出现文件 →
