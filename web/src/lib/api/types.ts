@@ -1157,6 +1157,17 @@ export type ArchiveTelegramSettings = {
   timezone_offset_hours?: number | null;
 };
 
+export type ArchiveTransfer115Settings = {
+  /** 115 web cookie; masked on read, blank on write keeps the stored value. */
+  cookie: string;
+  /** Target directory relative to the archive root (resolved to a 115 cid). */
+  target_dir: string;
+  /** Sidecar base URL; empty disables the transfer stage. */
+  sidecar_base: string;
+  /** Request timeout in seconds (0–600). */
+  timeout_seconds: number;
+};
+
 export type ArchiveNotifyCategory = { key: string; label: string; emoji: string };
 
 export type ArchiveSettings = {
@@ -1170,12 +1181,17 @@ export type ArchiveSettings = {
   wash_enabled: boolean;
   wash_tolerance_ratio: number;
   telegram: ArchiveTelegramSettings;
+  /** The 115 transfer sidecar; absent on servers older than this stage. */
+  transfer115?: ArchiveTransfer115Settings;
   /** Server-owned list of notification categories (absent on older servers). */
   known_categories?: ArchiveNotifyCategory[];
 };
 
-export type ArchiveSettingsPatch = Partial<Omit<ArchiveSettings, "telegram">> & {
+export type ArchiveSettingsPatch = Partial<
+  Omit<ArchiveSettings, "telegram" | "transfer115">
+> & {
   telegram?: Partial<ArchiveTelegramSettings>;
+  transfer115?: Partial<ArchiveTransfer115Settings>;
 };
 
 export type ArchiveStatus = {

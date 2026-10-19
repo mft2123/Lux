@@ -8,6 +8,7 @@ import type {
   ArchiveSettings,
   ArchiveSettingsPatch,
   ArchiveTelegramSettings,
+  ArchiveTransfer115Settings,
 } from "../../lib/api/types";
 import "./archive-settings.css";
 
@@ -99,6 +100,10 @@ type ArchiveSettingsDraft = {
   /** The value as stored, so an untouched save keeps `null`/object shape. */
   notifyOriginal: ArchiveNotifySelection;
   notifyTouched: boolean;
+  transferCookie: string;
+  transferTarget: string;
+  transferSidecar: string;
+  transferTimeout: string;
 };
 
 const EMPTY_DRAFT: ArchiveSettingsDraft = {
@@ -124,6 +129,10 @@ const EMPTY_DRAFT: ArchiveSettingsDraft = {
   notify: FALLBACK_NOTIFY_VALUES,
   notifyOriginal: null,
   notifyTouched: false,
+  transferCookie: "",
+  transferTarget: "转存目录",
+  transferSidecar: "",
+  transferTimeout: "120",
 };
 
 export function ArchiveSettingsSection() {
@@ -398,6 +407,63 @@ export function ArchiveSettingsSection() {
         </div>
 
         <div className="lux-archive-settings-group">
+          <h3>115 转存</h3>
+          <p>
+            链接队列里的 115 分享链接由 transfer115 侧车用这里的 cookie 登录后转存到目标目录；
+            侧车读取同一份设置文件。留空表示不修改已保存的值。
+          </p>
+          <div className="lux-archive-settings-grid">
+            <label>
+              <span>115 Cookie</span>
+              <small>浏览器登录 115 后复制的整串 cookie（UID/CID/SEID/KID）。打码返回，留空表示不修改。</small>
+              <input
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                value={draft.transferCookie}
+                placeholder={loaded.transfer115?.cookie || "未配置"}
+                onChange={(event) => update("transferCookie", event.target.value)}
+              />
+            </label>
+            <label>
+              <span>转存目标目录</span>
+              <small>相对归档根的目录，侧车会解析成 115 的目录；不存在时自动创建。</small>
+              <input
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={draft.transferTarget}
+                placeholder="转存目录"
+                onChange={(event) => update("transferTarget", event.target.value)}
+              />
+            </label>
+            <label>
+              <span>侧车地址</span>
+              <small>例如 http://transfer115:8098；留空表示关闭转存阶段（作业只记 needs_115_client）。</small>
+              <input
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={draft.transferSidecar}
+                placeholder="http://transfer115:8098"
+                onChange={(event) => update("transferSidecar", event.target.value)}
+              />
+            </label>
+            <label>
+              <span>转存超时（秒）</span>
+              <small>0–600；到点即中断，作业留在队列下一轮重试。</small>
+              <input
+                type="number"
+                min={0}
+                max={600}
+                value={draft.transferTimeout}
+                onChange={(event) => update("transferTimeout", event.target.value)}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div className="lux-archive-settings-group">
           <h3>Telegram 频道监听（Userbot）</h3>
           <p>旁挂的 Telethon 服务读取同一份设置；登录 session 由旁挂服务保存。</p>
           <div className="lux-archive-settings-grid">
@@ -561,6 +627,10 @@ function draftFromSettings(settings: ArchiveSettings): ArchiveSettingsDraft {
     notify: selectedNotifyCategories(settings.telegram.notify, categories),
     notifyOriginal: settings.telegram.notify,
     notifyTouched: false,
+    transferCookie: "",
+    transferTarget: settings.transfer115?.target_dir || "转存目录",
+    transferSidecar: settings.transfer115?.sidecar_base || "",
+    transferTimeout: String(settings.transfer115?.timeout_seconds ?? 120),
   };
 }
 
@@ -583,6 +653,17 @@ function payloadFromDraft(draft: ArchiveSettingsDraft): ArchiveSettingsPatch {
   if (draft.apiHash.trim()) telegram.api_hash = draft.apiHash.trim();
   if (draft.phone.trim()) telegram.phone = draft.phone.trim();
 
+  const transfer115: Partial<ArchiveTransfer115Settings> = {
+    target_dir: draft.transferTarget.trim(),
+    sidecar_base: draft.transferSidecar.trim(),
+  };
+  const transferTimeout = parseNumber(draft.transferTimeout);
+  if (transferTimeout !== undefined) {
+    transfer115.timeout_seconds = Math.trunc(transferTimeout);
+  }
+  // Same rule as the other secrets: blank means "keep the stored cookie".
+  if (draft.transferCookie.trim()) transfer115.cookie = draft.transferCookie.trim();
+
   const payload: ArchiveSettingsPatch = {
     watch_dirs: splitLines(draft.watchDirs),
     mirror_root: draft.mirrorRoot.trim(),
@@ -590,6 +671,7 @@ function payloadFromDraft(draft: ArchiveSettingsDraft): ArchiveSettingsPatch {
     cd2_mount: draft.cd2Mount.trim(),
     wash_enabled: draft.washEnabled,
     telegram,
+    transfer115,
   };
   if (draft.tmdbApiKey.trim()) payload.tmdb_api_key = draft.tmdbApiKey.trim();
   const poll = parseNumber(draft.pollSeconds);
