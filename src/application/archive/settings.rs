@@ -28,7 +28,8 @@ use super::{
     ARCHIVE_CD2_MOUNT_ENV, ARCHIVE_CD2_PREFIX_ENV, ARCHIVE_MIRROR_ROOT_ENV, ARCHIVE_POLL_SECONDS_ENV,
     ARCHIVE_SETTLE_SECONDS_ENV, ARCHIVE_TMDB_KEY_ENV, ARCHIVE_WASH_ENABLED_ENV,
     ARCHIVE_WASH_TOLERANCE_ENV, ARCHIVE_WATCH_DIRS_ENV, DEFAULT_CD2_CONTAINER_MOUNT,
-    DEFAULT_MIRROR_ROOT, DEFAULT_SETTLE_SECONDS,
+    DEFAULT_MIRROR_ROOT, DEFAULT_SETTLE_SECONDS, TRANSFER115_COOKIE_ENV,
+    TRANSFER115_SIDECAR_BASE_ENV, TRANSFER115_TARGET_DIR_ENV, TRANSFER115_TIMEOUT_ENV,
 };
 
 /// Where the settings file lives when the environment does not say otherwise.
@@ -47,6 +48,13 @@ const DEFAULT_WASH_TOLERANCE_RATIO: f64 = 0.02;
 pub(crate) const LISTEN_MODES: [&str; 5] = ["手动", "上新", "追更", "洗版", "全量"];
 const LISTEN_MODE_ALIASES: [&str; 5] = ["manual", "new", "follow", "wash", "all"];
 pub(crate) const DEFAULT_LISTEN_MODE: &str = "手动";
+
+/// Default fixed target for 115 share-link transfers, relative to the archive
+/// root: the pipeline's own transfer directory, which the archive stage feeds
+/// into 待整理 exactly like a manual upload.
+pub(crate) const DEFAULT_TRANSFER115_TARGET_DIR: &str = "转存目录";
+pub(crate) const DEFAULT_TRANSFER115_TIMEOUT_SECONDS: u64 = 120;
+const MAX_TRANSFER115_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ArchiveSettings {
@@ -70,6 +78,26 @@ pub(crate) struct ArchiveSettings {
     pub(crate) wash_tolerance_ratio: f64,
     /// Bot and userbot credentials, notification selection and listening mode.
     pub(crate) telegram: TelegramSettings,
+    /// The 115 transfer client (U11): web cookie, the fixed target directory
+    /// inside the archive root, and where the sidecar listens.
+    pub(crate) transfer115: Transfer115Settings,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Transfer115Settings {
+    /// Web cookie of the 115 account, the whole string from the browser
+    /// (`UID=…; CID=…; SEID=…; KID=…` and whatever else the browser carries).
+    /// Masked in every API response; blank in an update keeps the stored value.
+    pub(crate) cookie: String,
+    /// Fixed target directory for share-link transfers, relative to the archive
+    /// root (for example `转存目录`). The sidecar resolves it to a 115 `cid` and
+    /// creates it when missing.
+    pub(crate) target_dir: String,
+    /// Base URL of the transfer115 sidecar; empty disables the transfer stage
+    /// and jobs stay `needs_115_client`.
+    pub(crate) sidecar_base: String,
+    /// Request timeout in seconds.
+    pub(crate) timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -129,6 +157,18 @@ impl Default for ArchiveSettings {
             wash_enabled: true,
             wash_tolerance_ratio: DEFAULT_WASH_TOLERANCE_RATIO,
             telegram: TelegramSettings::default(),
+            transfer115: Transfer115Settings::default(),
+        }
+    }
+}
+
+impl Default for Transfer115Settings {
+    fn default() -> Self {
+        Self {
+            cookie: String::new(),
+            target_dir: DEFAULT_TRANSFER115_TARGET_DIR.to_owned(),
+            sidecar_base: String::new(),
+            timeout_seconds: DEFAULT_TRANSFER115_TIMEOUT_SECONDS,
         }
     }
 }
@@ -242,6 +282,18 @@ impl ArchiveSettings {
         if let Some(value) = env_f64(ARCHIVE_WASH_TOLERANCE_ENV) {
             settings.wash_tolerance_ratio = value;
         }
+        if let Some(value) = env_non_empty(TRANSFER115_COOKIE_ENV) {
+            settings.transfer115.cookie = value;
+        }
+        if let Some(value) = env_non_empty(TRANSFER115_TARGET_DIR_ENV) {
+            settings.transfer115.target_dir = value;
+        }
+        if let Some(value) = env_non_empty(TRANSFER115_SIDECAR_BASE_ENV) {
+            settings.transfer115.sidecar_base = value;
+        }
+        if let Some(value) = env_u64(TRANSFER115_TIMEOUT_ENV) {
+            settings.transfer115.timeout_seconds = value;
+        }
         settings.sanitized()
     }
 
@@ -283,7 +335,7 @@ impl ArchiveSettings {
         // know survive the rewrite.
         let mut document = existing_object.clone();
         for (key, value) in &current_object {
-            if key == "telegram" {
+            if key == "telegram" || key == "transfer115" {
                 continue;
             }
             if key_is_owned(&existing_object, &env_object, key, value) {
@@ -314,6 +366,32 @@ impl ArchiveSettings {
         if !telegram.is_empty() {
             document.insert("telegram".to_owned(), Value::Object(telegram));
         }
+        // The transfer115 section follows the same provenance rule: start from
+        // what the file holds, write only owned keys, so the 115 cookie is not
+        // frozen in when it merely mirrors `LUX_115_COOKIE`.
+        let current_transfer = current_object
+            .get("transfer115")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let env_transfer = env_object
+            .get("transfer115")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut transfer = existing_object
+            .get("transfer115")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in &current_transfer {
+            if key_is_owned(&transfer, &env_transfer, key, value) {
+                transfer.insert(key.clone(), value.clone());
+            }
+        }
+        if !transfer.is_empty() {
+            document.insert("transfer115".to_owned(), Value::Object(transfer));
+        }
         let mut text = serde_json::to_string_pretty(&Value::Object(document))
             .map_err(|error| format!("无法序列化归档设置: {error}"))?;
         text.push('\n');
@@ -333,6 +411,7 @@ impl ArchiveSettings {
         if let Some(api_base) = masked.telegram.api_base.as_mut() {
             *api_base = mask_api_base(api_base);
         }
+        masked.transfer115.cookie = mask_secret(&self.transfer115.cookie);
         masked
     }
 
@@ -353,6 +432,9 @@ impl ArchiveSettings {
             keep_stored_secret(telegram, "api_hash", &self.telegram.api_hash);
             keep_stored_secret(telegram, "phone", &self.telegram.phone);
             keep_stored_secret(telegram, "api_key", &self.telegram.api_key);
+        }
+        if let Some(Value::Object(transfer)) = document.get_mut("transfer115") {
+            keep_stored_secret(transfer, "cookie", &self.transfer115.cookie);
         }
         let merged = Self::from_document(self, &Value::Object(document));
         // Validate the values this update actually sets: an invalid directory in
@@ -412,6 +494,21 @@ impl ArchiveSettings {
                 LISTEN_MODES.join(" / ")
             ));
         }
+        if let Some(Value::Object(transfer)) = document.get("transfer115") {
+            if transfer.contains_key("timeout_seconds")
+                && self.transfer115.timeout_seconds > MAX_TRANSFER115_TIMEOUT_SECONDS
+            {
+                return Err(format!(
+                    "转存超时必须在 0 到 {MAX_TRANSFER115_TIMEOUT_SECONDS} 秒之间"
+                ));
+            }
+            if transfer.contains_key("sidecar_base") {
+                validate_sidecar_base(&self.transfer115.sidecar_base)?;
+            }
+            if transfer.contains_key("target_dir") {
+                validate_transfer_target_dir(&self.transfer115.target_dir)?;
+            }
+        }
         Ok(())
     }
 
@@ -448,6 +545,13 @@ impl ArchiveSettings {
                 LISTEN_MODES.join(" / ")
             ));
         }
+        if self.transfer115.timeout_seconds > MAX_TRANSFER115_TIMEOUT_SECONDS {
+            return Err(format!(
+                "转存超时必须在 0 到 {MAX_TRANSFER115_TIMEOUT_SECONDS} 秒之间"
+            ));
+        }
+        validate_sidecar_base(&self.transfer115.sidecar_base)?;
+        validate_transfer_target_dir(&self.transfer115.target_dir)?;
         Ok(())
     }
 
@@ -469,6 +573,12 @@ impl ArchiveSettings {
         if !self.wash_tolerance_ratio.is_finite() || !(0.0..=1.0).contains(&self.wash_tolerance_ratio)
         {
             self.wash_tolerance_ratio = DEFAULT_WASH_TOLERANCE_RATIO;
+        }
+        if self.transfer115.timeout_seconds > MAX_TRANSFER115_TIMEOUT_SECONDS {
+            self.transfer115.timeout_seconds = DEFAULT_TRANSFER115_TIMEOUT_SECONDS;
+        }
+        if self.transfer115.target_dir.trim().is_empty() {
+            self.transfer115.target_dir = DEFAULT_TRANSFER115_TARGET_DIR.to_owned();
         }
         self
     }
@@ -509,6 +619,29 @@ impl ArchiveSettings {
         }
         if let Some(Value::Object(telegram)) = document.get("telegram") {
             settings.telegram = TelegramSettings::from_document(&settings.telegram, telegram);
+        }
+        if let Some(Value::Object(transfer)) = document.get("transfer115") {
+            settings.transfer115 =
+                Transfer115Settings::from_document(&settings.transfer115, transfer);
+        }
+        settings
+    }
+}
+
+impl Transfer115Settings {
+    fn from_document(base: &Self, document: &Map<String, Value>) -> Self {
+        let mut settings = base.clone();
+        if let Some(value) = string_field(document, "cookie") {
+            settings.cookie = value;
+        }
+        if let Some(value) = string_field(document, "target_dir") {
+            settings.target_dir = value;
+        }
+        if let Some(value) = string_field(document, "sidecar_base") {
+            settings.sidecar_base = value;
+        }
+        if let Some(value) = u64_field(document, "timeout_seconds") {
+            settings.timeout_seconds = value;
         }
         settings
     }
@@ -616,6 +749,11 @@ fn reject_unparsable_values(document: &Map<String, Value>) -> Result<(), String>
     if document.contains_key("wash_enabled") && !bool_field_ok(document, "wash_enabled") {
         return Err("洗版开关必须是 true 或 false".to_owned());
     }
+    if let Some(Value::Object(transfer)) = document.get("transfer115") {
+        if transfer.contains_key("timeout_seconds") && !number_field_ok(transfer, "timeout_seconds", true) {
+            return Err("转存超时必须是整数".to_owned());
+        }
+    }
     if let Some(Value::Object(telegram)) = document.get("telegram") {
         for (key, label) in [
             ("min_interval_ms", "通知最小间隔"),
@@ -709,6 +847,45 @@ fn validate_api_base(value: &str) -> Result<(), String> {
     let rest = value.split_once("://").map(|(_, rest)| rest).unwrap_or_default();
     if rest.trim_matches('/').is_empty() {
         return Err("通知 API 地址缺少主机名".to_owned());
+    }
+    Ok(())
+}
+
+/// The transfer115 sidecar base is a plain origin like the notify one: no
+/// path, query or fragment, so credentials cannot be smuggled into a URL that
+/// ends up in a log line.
+fn validate_sidecar_base(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let lowered = value.to_ascii_lowercase();
+    if !(lowered.starts_with("https://") || lowered.starts_with("http://")) {
+        return Err("转存侧车地址必须以 http:// 或 https:// 开头".to_owned());
+    }
+    if value.contains(['?', '#']) {
+        return Err("转存侧车地址不能带查询串或锚点（凭据不应出现在 URL 里）".to_owned());
+    }
+    let rest = value.split_once("://").map(|(_, rest)| rest).unwrap_or_default();
+    if rest.trim_matches('/').is_empty() {
+        return Err("转存侧车地址缺少主机名".to_owned());
+    }
+    Ok(())
+}
+
+/// The transfer target is one path segment under the archive root: no
+/// absolute path, no traversal, no empty name. The sidecar resolves it to a
+/// 115 cid and creates it when missing.
+fn validate_transfer_target_dir(value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("转存目标目录不能为空".to_owned());
+    }
+    if value.starts_with('/') || value.contains("/./") || value.contains("/../") {
+        return Err(format!("转存目标目录必须是归档根下的相对路径: {value}"));
+    }
+    if value.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+        return Err(format!("转存目标目录必须是归档根下的相对路径: {value}"));
     }
     Ok(())
 }
@@ -1131,6 +1308,12 @@ mod tests {
                 "listen_mode": "上新",
                 "listen_channels": [],
                 "follow_list": []
+            },
+            "transfer115": {
+                "cookie": "UID=1; CID=2; SEID=3; KID=4",
+                "target_dir": "转存目录",
+                "sidecar_base": "http://transfer115:8098",
+                "timeout_seconds": "120"
             }
         });
         let settings = ArchiveSettings::from_document(&ArchiveSettings::default(), &document);
@@ -1141,6 +1324,9 @@ mod tests {
         assert_eq!(settings.poll_seconds, 10);
         assert_eq!(settings.settle_seconds, 3);
         assert!(settings.telegram.listen_channels.is_empty());
+        assert_eq!(settings.transfer115.cookie, "UID=1; CID=2; SEID=3; KID=4");
+        assert_eq!(settings.transfer115.sidecar_base, "http://transfer115:8098");
+        assert_eq!(settings.transfer115.timeout_seconds, 120);
         // Everything the template sets survives a save/reload cycle.
         let saved = serde_json::to_string(&settings).expect("json");
         let reloaded = ArchiveSettings::from_document(
@@ -1163,7 +1349,8 @@ mod tests {
                 "poll_seconds": "later",
                 "wash_enabled": { "nested": true },
                 "watch_dirs": 7,
-                "telegram": "not an object"
+                "telegram": "not an object",
+                "transfer115": "not an object"
             }),
         );
         assert_eq!(settings.tmdb_api_key, "keep");
@@ -1171,18 +1358,26 @@ mod tests {
         assert!(settings.wash_enabled);
         assert!(settings.watch_dirs.is_empty());
         assert_eq!(settings.telegram.listen_mode, DEFAULT_LISTEN_MODE);
+        assert_eq!(settings.transfer115.target_dir, DEFAULT_TRANSFER115_TARGET_DIR);
     }
 
     #[test]
     fn sanitizes_out_of_range_values_on_load() {
         let settings = ArchiveSettings::from_document(
             &ArchiveSettings::default(),
-            &json!({ "poll_seconds": 999_999, "settle_seconds": 999_999, "wash_tolerance_ratio": 4.0 }),
+            &json!({
+                "poll_seconds": 999_999,
+                "settle_seconds": 999_999,
+                "wash_tolerance_ratio": 4.0,
+                "transfer115": { "timeout_seconds": 999_999, "target_dir": "  " }
+            }),
         )
         .sanitized();
         assert_eq!(settings.poll_seconds, 0);
         assert_eq!(settings.settle_seconds, MAX_SETTLE_SECONDS);
         assert_eq!(settings.wash_tolerance_ratio, DEFAULT_WASH_TOLERANCE_RATIO);
+        assert_eq!(settings.transfer115.timeout_seconds, DEFAULT_TRANSFER115_TIMEOUT_SECONDS);
+        assert_eq!(settings.transfer115.target_dir, DEFAULT_TRANSFER115_TARGET_DIR);
         assert!(settings.poll_interval().is_none());
     }
 
@@ -1199,6 +1394,11 @@ mod tests {
                 notify: json!(["入库"]),
                 min_interval_ms: Some(900),
                 ..TelegramSettings::default()
+            },
+            transfer115: Transfer115Settings {
+                cookie: "UID=1; CID=2; SEID=3; KID=4".to_owned(),
+                sidecar_base: "http://transfer115:8098".to_owned(),
+                ..Transfer115Settings::default()
             },
             ..ArchiveSettings::default()
         };
@@ -1230,6 +1430,10 @@ mod tests {
         let path = directory.join("archive-settings.json");
         let base = ArchiveSettings {
             watch_dirs: vec![directory.display().to_string()],
+            transfer115: Transfer115Settings {
+                cookie: "env-cookie".to_owned(),
+                ..Transfer115Settings::default()
+            },
             ..ArchiveSettings::default()
         };
         let settings = ArchiveSettings::from_document(&base, &json!({ "poll_seconds": 30 }));
@@ -1245,6 +1449,15 @@ mod tests {
             written.get("watch_dirs").is_none(),
             "environment value was pinned: {written}"
         );
+        // The same provenance rule covers the transfer115 section: an
+        // environment-only cookie must not be frozen into the file.
+        assert!(
+            written
+                .get("transfer115")
+                .and_then(|value| value.get("cookie"))
+                .is_none(),
+            "environment cookie was pinned: {written}"
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -1254,7 +1467,7 @@ mod tests {
         let path = directory.join("archive-settings.json");
         fs::write(
             &path,
-            r#"{"telegram":{"api_key":"sidecar-key"},"future_key":{"a":1}}"#,
+            r#"{"telegram":{"api_key":"sidecar-key"},"transfer115":{"cookie":"stored-115-cookie","future_115_key":{"a":1}},"future_key":{"a":1}}"#,
         )
         .expect("seed");
         let mut settings = ArchiveSettings::load_from_with_base(&path, &ArchiveSettings::default());
@@ -1268,6 +1481,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
         assert_eq!(written["poll_seconds"], 5);
         assert_eq!(written["telegram"]["api_key"], "sidecar-key");
+        assert_eq!(written["transfer115"]["cookie"], "stored-115-cookie");
+        assert_eq!(written["transfer115"]["future_115_key"]["a"], 1);
         assert_eq!(written["future_key"]["a"], 1);
         let _ = fs::remove_dir_all(&directory);
     }
@@ -1289,6 +1504,78 @@ mod tests {
             .apply_update(&json!({ "telegram": { "api_key": mask_secret("abcd1234efgh") } }))
             .expect("update");
         assert_eq!(settings.telegram.api_key, "abcd1234efgh");
+    }
+
+    /// The 115 web cookie is a secret like the others: masked in responses,
+    /// blank or echoed-mask updates keep the stored value.
+    #[test]
+    fn the_115_cookie_is_masked_and_kept() {
+        let mut settings = ArchiveSettings::default();
+        settings
+            .apply_update(&json!({ "transfer115": { "cookie": "UID=1; CID=2; SEID=3; KID=4" } }))
+            .expect("update");
+        assert_eq!(settings.transfer115.cookie, "UID=1; CID=2; SEID=3; KID=4");
+        let masked = settings.masked();
+        assert_eq!(masked.transfer115.cookie, "UID=1;…(27)");
+        let rendered = serde_json::to_string(&masked).expect("json");
+        assert!(!rendered.contains("SEID=3"));
+        assert!(!rendered.contains("KID=4"));
+        // Echoing the mask back, or sending a blank, keeps the stored cookie.
+        settings
+            .apply_update(&json!({ "transfer115": { "cookie": mask_secret("UID=1; CID=2; SEID=3; KID=4") } }))
+            .expect("update");
+        settings
+            .apply_update(&json!({ "transfer115": { "cookie": "" } }))
+            .expect("update");
+        assert_eq!(settings.transfer115.cookie, "UID=1; CID=2; SEID=3; KID=4");
+        // A real new cookie replaces the stored one.
+        settings
+            .apply_update(&json!({ "transfer115": { "cookie": "UID=9; CID=9" } }))
+            .expect("update");
+        assert_eq!(settings.transfer115.cookie, "UID=9; CID=9");
+    }
+
+    /// The transfer stage is off until the sidecar base is configured; a PUT
+    /// that sets it must be a plain origin, and the target directory must stay
+    /// under the archive root.
+    #[test]
+    fn the_transfer_stage_is_off_until_the_sidecar_is_configured() {
+        let mut settings = ArchiveSettings::default();
+        assert!(settings.transfer115.sidecar_base.is_empty());
+        for bad in ["ftp://x", "http://", "http://h/?token=1", "http://h/#x"] {
+            assert!(
+                settings
+                    .apply_update(&json!({ "transfer115": { "sidecar_base": bad } }))
+                    .is_err(),
+                "accepted {bad}"
+            );
+        }
+        for bad in ["/转存目录", "转存目录/../逃逸", "转存目录/./x", ""] {
+            assert!(
+                settings
+                    .apply_update(&json!({ "transfer115": { "target_dir": bad } }))
+                    .is_err(),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(settings
+            .apply_update(&json!({ "transfer115": { "timeout_seconds": 3_600 } }))
+            .expect_err("timeout")
+            .contains("转存超时"));
+        assert!(settings
+            .apply_update(&json!({ "transfer115": { "timeout_seconds": "later" } }))
+            .is_err());
+        settings
+            .apply_update(&json!({
+                "transfer115": {
+                    "sidecar_base": "http://transfer115:8098",
+                    "target_dir": "转存目录",
+                    "timeout_seconds": 90
+                }
+            }))
+            .expect("update");
+        assert_eq!(settings.transfer115.sidecar_base, "http://transfer115:8098");
+        assert_eq!(settings.transfer115.timeout_seconds, 90);
     }
 
     #[test]
@@ -1552,6 +1839,16 @@ mod tests {
         assert!(settings.validate().expect_err("mode").contains("监听模式"));
         settings.telegram.listen_mode = "manual".to_owned();
         assert!(settings.validate().is_ok());
+
+        settings.transfer115.timeout_seconds = 3_600;
+        assert!(settings.validate().expect_err("timeout").contains("转存超时"));
+        settings.transfer115.timeout_seconds = 120;
+        settings.transfer115.sidecar_base = "ftp://x".to_owned();
+        assert!(settings.validate().expect_err("sidecar").contains("转存侧车"));
+        settings.transfer115.sidecar_base = String::new();
+        settings.transfer115.target_dir = "/转存目录".to_owned();
+        assert!(settings.validate().expect_err("target").contains("转存目标目录"));
+        settings.transfer115.target_dir = DEFAULT_TRANSFER115_TARGET_DIR.to_owned();
 
         let _ = fs::remove_dir_all(&directory);
     }

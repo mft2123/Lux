@@ -917,6 +917,10 @@ mod tests {
             mirror_root: PathBuf::from("/library"),
             cd2_prefix: "测试库".to_owned(),
             cd2_container_mount: "/media/cloud".to_owned(),
+            transfer115_base: String::new(),
+            transfer115_cookie: String::new(),
+            transfer115_target_dir: "转存目录".to_owned(),
+            transfer115_timeout: std::time::Duration::from_secs(5),
         };
         let service = ArchiveService::new_for_tests(config);
         let url = service

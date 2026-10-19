@@ -52,6 +52,14 @@ pub(crate) const ARCHIVE_WASH_TOLERANCE_ENV: &str = "LUX_ARCHIVE_WASH_TOLERANCE"
 /// half-written pack gains.
 const DEFAULT_SETTLE_SECONDS: u64 = 5;
 pub(crate) const ARCHIVE_SETTLE_SECONDS_ENV: &str = "LUX_ARCHIVE_SETTLE_SECONDS";
+/// Fallback sources for the 115 transfer client (U11). The settings file wins
+/// (D1); these envs only fill keys the file does not set. The cookie is a
+/// secret: it may only ever appear in the settings file or this process's
+/// environment, never in a log line or an API response.
+pub(crate) const TRANSFER115_COOKIE_ENV: &str = "LUX_115_COOKIE";
+pub(crate) const TRANSFER115_TARGET_DIR_ENV: &str = "LUX_115_TARGET_DIR";
+pub(crate) const TRANSFER115_SIDECAR_BASE_ENV: &str = "LUX_115_SIDECAR_BASE";
+pub(crate) const TRANSFER115_TIMEOUT_ENV: &str = "LUX_115_TIMEOUT_SECONDS";
 /// Metadata lookups run concurrently; moves stay sequential so duplicate and
 /// wash decisions see the batch in name order.
 const METADATA_RESOLVE_CONCURRENCY: usize = 8;
@@ -79,8 +87,23 @@ const LINK_QUEUE_INVALID_DIR: &str = "无效";
 /// transfer client (plan U11) does not exist yet, so nothing is downloaded.
 pub(crate) const LINK_JOB_STATUS_NEEDS_115: &str = "needs_115_client";
 pub(crate) const LINK_JOB_STATUS_INVALID: &str = "invalid";
+/// U11: the job was handed to the transfer115 sidecar and the share was saved
+/// into the target directory (it lands in 转存目录 through CD2 like any upload).
+pub(crate) const LINK_JOB_STATUS_TRANSFERRED: &str = "transferred";
+/// U11: the sidecar answered `auth_required` — the stored 115 cookie is dead or
+/// missing. The job stays queued (no state line, no move) and retries after
+/// the operator refreshes the cookie in the settings file.
+pub(crate) const LINK_JOB_STATUS_AUTH_REQUIRED: &str = "auth_required";
+/// U11: the sidecar answered `failed` (or was unreachable). Recorded and moved
+/// to 已处理/ like any consumed job; re-deliver with `force: true`.
+pub(crate) const LINK_JOB_STATUS_FAILED: &str = "failed";
 pub(crate) const LINK_JOB_NEEDS_115_REASON: &str =
     "115 转存客户端未实现（U11）：链接已登记，未下载任何内容";
+/// U11: the transfer stage is configured but this link kind is not handled by
+/// the transfer115 sidecar (magnet / ed2k go to 115 cloud download, a later
+/// slice). Recorded and moved to 已处理/; the link is not lost, just parked.
+pub(crate) const LINK_JOB_UNSUPPORTED_REASON: &str =
+    "转存侧车不支持该链接类型（magnet/ed2k 走 115 云下载，尚未实现）";
 /// Longest accepted link; share links are far shorter, the cap only stops
 /// junk from filling the queue.
 const LINK_JOB_MAX_URL_CHARS: usize = 2048;
@@ -103,6 +126,13 @@ pub(crate) struct ArchiveConfig {
     /// Path of the archive root inside the CloudDrive2 mount (for example
     /// `测试库`); the strm URL is built from it.
     pub(crate) cd2_prefix: String,
+    /// U11: the 115 transfer client. `transfer115_base` empty means the
+    /// transfer stage is off and jobs stay `needs_115_client`.
+    pub(crate) transfer115_base: String,
+    pub(crate) transfer115_cookie: String,
+    /// Target directory for share transfers, relative to `root` (fixed rule).
+    pub(crate) transfer115_target_dir: String,
+    pub(crate) transfer115_timeout: Duration,
     /// Where the CD2 mount is visible inside the media server container.
     pub(crate) cd2_container_mount: String,
     /// How long a freshly written entry waits before it is claimed.
@@ -142,6 +172,10 @@ impl ArchiveConfig {
             mirror_root: PathBuf::from(&settings.mirror_root),
             cd2_prefix: settings.cd2_prefix.clone(),
             cd2_container_mount: settings.cd2_mount.clone(),
+            transfer115_base: settings.transfer115.sidecar_base.clone(),
+            transfer115_cookie: settings.transfer115.cookie.clone(),
+            transfer115_target_dir: settings.transfer115.target_dir.clone(),
+            transfer115_timeout: Duration::from_secs(settings.transfer115.timeout_seconds),
             settle_seconds: settings.settle_seconds,
             wash_enabled: settings.wash_enabled,
             wash_tolerance_ratio: settings.wash_tolerance_ratio,
@@ -335,6 +369,10 @@ pub(crate) struct AcceptedLinkJob {
     pub(crate) url: String,
     pub(crate) file: String,
     pub(crate) status: &'static str,
+    /// U11: what the transfer115 sidecar reported for this job (empty when the
+    /// stage is off or the job was not a 115 share link).
+    #[serde(default)]
+    pub(crate) transfer: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -369,6 +407,10 @@ pub(crate) struct LinkJobStateRecord {
 struct LinkStateLine {
     #[serde(default)]
     status: String,
+    /// U11: the transfer outcome the sidecar reported, kept so the ingest
+    /// response can tell a failed transfer apart from a transferred one.
+    #[serde(default)]
+    transfer: String,
     #[serde(default)]
     job_id: String,
     #[serde(default)]
@@ -387,6 +429,10 @@ pub(crate) struct QueuedLinkJob {
     /// which case nothing new was written (the ingest endpoint is idempotent
     /// on the URL).
     pub(crate) duplicate: bool,
+    /// U11: for a duplicate of an already-consumed job, what the transfer
+    /// stage recorded for it (`transferred` / `failed` / …); empty when the
+    /// job is still waiting or the stage is off.
+    pub(crate) transfer: String,
 }
 
 /// Transport-agnostic ingest failure: `Invalid` is the caller's fault (400),
@@ -587,7 +633,7 @@ impl ArchiveService {
         // that cannot be read skips that stage for this round (WARN) and lets
         // watch dirs, transfer and pending still run; otherwise one broken
         // file would freeze the whole archive for every poll.
-        let link_queue = match self.ingest_link_queue(dry_run) {
+        let link_queue = match self.ingest_link_queue(dry_run).await {
             Ok(report) => report,
             Err(error) => {
                 tracing::warn!(
@@ -608,7 +654,7 @@ impl ArchiveService {
                 invalid = link_queue.invalid.len(),
                 failed = link_queue.failed.len(),
                 incomplete = link_queue.skipped_incomplete.len(),
-                "link queue consumed; accepted links wait for the 115 transfer client"
+                "link queue consumed"
             );
         }
         let ingested = self.ingest_watch_dirs(dry_run).await?;
@@ -1788,6 +1834,7 @@ impl ArchiveService {
                 file: existing.file,
                 status: LINK_JOB_STATUS_NEEDS_115,
                 duplicate: true,
+                transfer: existing.transfer,
             });
         }
         // `job_id` is the file name (docs §2.1). A same-millisecond job that
@@ -1821,6 +1868,7 @@ impl ArchiveService {
             file: target.display().to_string(),
             status: LINK_JOB_STATUS_NEEDS_115,
             duplicate: false,
+            transfer: String::new(),
         })
     }
 
@@ -1857,6 +1905,7 @@ impl ArchiveService {
                     file: entry.display().to_string(),
                     status: LINK_JOB_STATUS_NEEDS_115,
                     duplicate: true,
+                    transfer: String::new(),
                 }));
             }
         }
@@ -1874,6 +1923,7 @@ impl ArchiveService {
                         .to_string(),
                     status: LINK_JOB_STATUS_NEEDS_115,
                     duplicate: true,
+                    transfer: record.transfer.clone(),
                 }));
             }
         }
@@ -1895,7 +1945,10 @@ impl ArchiveService {
     /// state line is appended before the file is moved, and the job id is
     /// remembered in `状态.jsonl`, so a job whose move failed is retried
     /// without being accounted for twice.
-    pub(crate) fn ingest_link_queue(&self, dry_run: bool) -> Result<LinkQueueReport, String> {
+    pub(crate) async fn ingest_link_queue(
+        &self,
+        dry_run: bool,
+    ) -> Result<LinkQueueReport, String> {
         let queue = self.config.link_queue_dir();
         let entries = read_dir_entries(&queue)?;
         let mut report = LinkQueueReport {
@@ -1904,6 +1957,12 @@ impl ArchiveService {
         };
         // What an earlier round already recorded: read once up front instead of
         // once per job, because the queue can hold thousands of files.
+        // U11: a job whose transfer failed is *not* accounted — the state line
+        // exists but the link never made it into 转存目录, so the operator's
+        // retry path is `force: true` (a fresh job id), not a move retry.
+        // `needs_115_client` lines from before the transfer stage are still
+        // accounted: re-handing a link to a now-configured sidecar would
+        // double-record them; the explicit retry path there is `force` too.
         let mut accounted: HashSet<String> = HashSet::new();
         if !dry_run {
             for record in read_link_state(&self.config.link_state_file())? {
@@ -1954,11 +2013,19 @@ impl ArchiveService {
                 }
             };
             if dry_run {
+                let status = if self.transfer115_configured() && is_115_share_link(&job.url) {
+                    LINK_JOB_STATUS_TRANSFERRED
+                } else if self.transfer115_configured() {
+                    LINK_JOB_STATUS_FAILED
+                } else {
+                    LINK_JOB_STATUS_NEEDS_115
+                };
                 report.accepted.push(AcceptedLinkJob {
                     job_id: job.job_id,
                     url: job.url,
                     file: name,
-                    status: LINK_JOB_STATUS_NEEDS_115,
+                    status,
+                    transfer: String::new(),
                 });
                 continue;
             }
@@ -2013,17 +2080,48 @@ impl ArchiveService {
                     .unwrap_or_else(|| name.clone()),
                 None => name.clone(),
             };
+            // U11: hand 115 share links to the transfer115 sidecar before the
+            // job is accounted and parked. The outcome decides the recorded
+            // status; an auth failure records nothing and leaves the job
+            // queued, so a refreshed cookie retries it on the next round.
+            let transfer = if self.transfer115_configured() && is_115_share_link(&job.url) {
+                match self.transfer_115_share_link(&job).await {
+                    Ok(outcome) => outcome,
+                    Err(pause) => {
+                        // The sidecar is not usable (cookie dead, or the
+                        // request itself failed): stop consuming this round.
+                        // The job was neither recorded nor moved, so the next
+                        // round retries it; the rest of the pipeline still
+                        // runs (the caller treats this as a skipped stage).
+                        return Err(pause);
+                    }
+                }
+            } else if self.transfer115_configured() {
+                // magnet / ed2k: the queue accepts them, but the transfer
+                // sidecar only does 115 share links this slice.
+                TransferOutcome {
+                    status: LINK_JOB_STATUS_FAILED,
+                    transfer: "unsupported".to_owned(),
+                    reason: LINK_JOB_UNSUPPORTED_REASON.to_owned(),
+                }
+            } else {
+                TransferOutcome {
+                    status: LINK_JOB_STATUS_NEEDS_115,
+                    transfer: String::new(),
+                    reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+                }
+            };
             let state_path = self.config.link_state_file();
             if !accounted.contains(&job.job_id) {
                 let record = LinkJobStateRecord {
                     recorded_at_unix: unix_now(),
-                    status: LINK_JOB_STATUS_NEEDS_115,
+                    status: transfer.status,
                     job_id: job.job_id.clone(),
                     url: job.url.clone(),
                     title: job.title.clone().unwrap_or_default(),
                     mode: job.mode.clone().unwrap_or_default(),
                     source: job.source.clone().unwrap_or_default(),
-                    reason: LINK_JOB_NEEDS_115_REASON.to_owned(),
+                    reason: transfer.reason.clone(),
                     job_file,
                 };
                 if let Err(error) = append_link_state(&state_path, &record) {
@@ -2060,6 +2158,7 @@ impl ArchiveService {
                             url: job.url,
                             file: done_dir.join(&name).display().to_string(),
                             status: LINK_JOB_STATUS_NEEDS_115,
+                            transfer: String::new(),
                         });
                     }
                     Err(error) => {
@@ -2092,21 +2191,162 @@ impl ArchiveService {
                 });
                 continue;
             }
-            tracing::warn!(
-                job_id = %job.job_id,
-                url = %mask_link_for_log(&job.url),
-                title = job.title.as_deref().unwrap_or(""),
-                mode = job.mode.as_deref().unwrap_or(""),
-                "link job needs the 115 transfer client (not implemented): recorded, nothing downloaded"
-            );
+            match transfer.status {
+                LINK_JOB_STATUS_TRANSFERRED => {
+                    tracing::info!(
+                        job_id = %job.job_id,
+                        url = %mask_link_for_log(&job.url),
+                        title = job.title.as_deref().unwrap_or(""),
+                        mode = job.mode.as_deref().unwrap_or(""),
+                        target = %transfer.transfer,
+                        "115 share link transferred into the transfer directory"
+                    );
+                }
+                LINK_JOB_STATUS_FAILED => {
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        url = %mask_link_for_log(&job.url),
+                        title = job.title.as_deref().unwrap_or(""),
+                        reason = %transfer.reason,
+                        "115 transfer failed: recorded and parked; re-deliver with force"
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        job_id = %job.job_id,
+                        url = %mask_link_for_log(&job.url),
+                        title = job.title.as_deref().unwrap_or(""),
+                        mode = job.mode.as_deref().unwrap_or(""),
+                        "link job needs the 115 transfer client (not configured): recorded, nothing downloaded"
+                    );
+                }
+            }
             report.accepted.push(AcceptedLinkJob {
                 job_id: job.job_id,
                 url: job.url,
                 file: target.display().to_string(),
-                status: LINK_JOB_STATUS_NEEDS_115,
+                status: transfer.status,
+                transfer: transfer.transfer,
             });
         }
         Ok(report)
+    }
+
+    /// Whether the transfer115 sidecar is configured for this run.
+    fn transfer115_configured(&self) -> bool {
+        !self.config.transfer115_base.trim().is_empty()
+    }
+
+    /// U11: hand one 115 share link to the transfer115 sidecar
+    /// (`POST {base}/transfer`). The sidecar owns the 115 login (p115client +
+    /// the web cookie), resolves the fixed target directory to a 115 cid
+    /// (creating it when missing) and saves the share. The saved files land
+    /// in the CD2-mounted 转存目录, where the existing pipeline takes over —
+    /// Lux never touches the 115 API itself.
+    ///
+    /// Returns the outcome to record, or `Err` when the whole stage must pause
+    /// (cookie dead, or the request itself failed): the caller leaves the job
+    /// unrecorded and unmoved so the next round retries it.
+    async fn transfer_115_share_link(
+        &self,
+        job: &LinkJob,
+    ) -> Result<TransferOutcome, String> {
+        let base = self.config.transfer115_base.trim().trim_end_matches('/');
+        let body = serde_json::json!({
+            "job_id": job.job_id,
+            "url": job.url,
+            "title": job.title,
+            // The sidecar resolves the target relative to the archive root it
+            // shares with Lux (the CD2 mount), so it gets the root path, the
+            // relative target directory, and the CD2 prefix of the root.
+            "archive_root": self.config.root.display().to_string(),
+            "target_dir": self.config.transfer115_target_dir,
+            "cd2_prefix": self.config.cd2_prefix,
+        });
+        let request = self
+            .http
+            .post(format!("{base}/transfer"))
+            .json(&body)
+            .timeout(self.config.transfer115_timeout);
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(format!(
+                    "转存侧车 {} 请求失败: {}",
+                    mask_link_for_log(&format!("{base}/transfer")),
+                    describe_sidecar_error(&error)
+                ));
+            }
+        };
+        let status = response.status();
+        let payload: serde_json::Value = match response.json().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Err(format!("转存侧车响应不是 JSON（HTTP {status}）: {error}"));
+            }
+        };
+        let answer = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let detail = payload
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let saved = payload
+            .get("saved")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        match answer.as_str() {
+            "transferred" => Ok(TransferOutcome {
+                status: LINK_JOB_STATUS_TRANSFERRED,
+                transfer: if saved.is_empty() {
+                    "transferred".to_owned()
+                } else {
+                    saved.join(", ")
+                },
+                reason: if detail.is_empty() {
+                    "115 分享已转存到转存目标目录".to_owned()
+                } else {
+                    detail
+                },
+            }),
+            "auth_required" => Err(format!(
+                "115 cookie 无效或已过期（{}）：请在设置里更新 cookie，作业留在队列等待重试",
+                if detail.is_empty() { "auth_required" } else { &detail }
+            )),
+            "failed" => Ok(TransferOutcome {
+                status: LINK_JOB_STATUS_FAILED,
+                transfer: "failed".to_owned(),
+                reason: if detail.is_empty() {
+                    "转存侧车报告转存失败".to_owned()
+                } else {
+                    detail
+                },
+            }),
+            "unsupported" => Ok(TransferOutcome {
+                status: LINK_JOB_STATUS_FAILED,
+                transfer: "unsupported".to_owned(),
+                reason: if detail.is_empty() {
+                    LINK_JOB_UNSUPPORTED_REASON.to_owned()
+                } else {
+                    detail
+                },
+            }),
+            _ => Err(format!(
+                "转存侧车返回了无法理解的状态 {answer:?}（HTTP {status}）"
+            )),
+        }
     }
 
     fn reject_link_job(
@@ -2184,6 +2424,7 @@ impl ArchiveService {
     }
 
     pub(crate) fn status(&self) -> ArchiveStatus {
+        let transfer115_ready = !self.config.transfer115_base.trim().is_empty();
         ArchiveStatus {
             root: self.config.root.display().to_string(),
             transfer_dir: self.config.transfer_dir().display().to_string(),
@@ -2195,6 +2436,8 @@ impl ArchiveService {
             link_queue_dir: self.config.link_queue_dir().display().to_string(),
             link_state_file: self.config.link_state_file().display().to_string(),
             pending_link_jobs: count_link_jobs(&self.config.link_queue_dir()),
+            transfer115_configured: transfer115_ready,
+            transfer115_target_dir: self.config.transfer115_target_dir.clone(),
             settle_seconds: self.config.settle_seconds,
             wash_enabled: self.config.wash_enabled,
             wash_tolerance_ratio: self.config.wash_tolerance_ratio,
@@ -3223,6 +3466,14 @@ pub(crate) struct ArchiveStatus {
     /// `<root>/链接队列/状态.jsonl`: append-only job audit trail.
     #[serde(default)]
     pub(crate) link_state_file: String,
+    /// U11: whether the transfer115 sidecar is configured (empty base = the
+    /// transfer stage is off and jobs stay `needs_115_client`).
+    #[serde(default)]
+    pub(crate) transfer115_configured: bool,
+    /// U11: the fixed target directory for share transfers, relative to the
+    /// archive root.
+    #[serde(default)]
+    pub(crate) transfer115_target_dir: String,
     /// Job files waiting in the queue right now.
     #[serde(default)]
     pub(crate) pending_link_jobs: usize,
@@ -3549,6 +3800,48 @@ fn read_link_state(path: &Path) -> Result<Vec<LinkStateLine>, String> {
         );
     }
     Ok(records)
+}
+
+/// What the transfer115 sidecar answered for one job, in the shape the
+/// consumer records into `状态.jsonl`.
+#[derive(Clone, Debug)]
+struct TransferOutcome {
+    status: &'static str,
+    transfer: String,
+    reason: String,
+}
+
+/// Only 115 share links go to the transfer sidecar; magnet / ed2k are queued
+/// but parked as `unsupported` until 115 cloud download lands.
+fn is_115_share_link(url: &str) -> bool {
+    let lowered = url.trim().to_ascii_lowercase();
+    if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+        return false;
+    }
+    let rest = lowered.split_once("://").map_or("", |(_, rest)| rest);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    host == "115.com" || host.ends_with(".115.com")
+}
+
+/// One-line description of a reqwest failure for the pause reason. The URL is
+/// already masked by the caller; the error text never carries the share link.
+fn describe_sidecar_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "请求超时".to_owned()
+    } else if error.is_connect() {
+        "无法连接".to_owned()
+    } else if error.is_request() {
+        "请求构造失败".to_owned()
+    } else {
+        "网络错误".to_owned()
+    }
 }
 
 /// `job_id` stored inside a job file, if `path` is one.
@@ -4134,6 +4427,10 @@ mod tests {
             mirror_root: root.join("镜像库"),
             cd2_prefix: String::new(),
             cd2_container_mount: "/media/cloud".to_owned(),
+            transfer115_base: String::new(),
+            transfer115_cookie: String::new(),
+            transfer115_target_dir: "转存目录".to_owned(),
+            transfer115_timeout: Duration::from_secs(5),
             settle_seconds: 0,
             wash_enabled: true,
             wash_tolerance_ratio: 0.02,
@@ -4150,6 +4447,140 @@ mod tests {
             ..LinkJob::default()
         }
     }
+
+    /// U11 test helper: a one-shot HTTP stub for the transfer115 sidecar.
+    /// Listens on an ephemeral port, answers `POST /transfer` with the given
+    /// status (`transferred` / `auth_required` / `failed`), and remembers the
+    /// last request body.
+    /// U11 test helper: a one-shot HTTP stub for the transfer115 sidecar.
+    /// Listens on an ephemeral port, answers `POST /transfer` with the given
+    /// status (`transferred` / `auth_required` / `failed`), and remembers the
+    /// last request body. Dropping the stub closes the listener and joins the
+    /// worker thread.
+    struct StubSidecar {
+        address: std::net::SocketAddr,
+        listener: std::net::TcpListener,
+        thread: Option<std::thread::JoinHandle<()>>,
+        log: std::sync::Arc<std::sync::Mutex<StubLog>>,
+    }
+
+    #[derive(Default)]
+    struct StubLog {
+        hits: usize,
+        last_body: serde_json::Value,
+    }
+
+    impl StubSidecar {
+        fn start(answer: &str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("stub bind");
+            let address = listener.local_addr().expect("addr");
+            let answer = answer.to_owned();
+            let log = std::sync::Arc::new(std::sync::Mutex::new(StubLog::default()));
+            let worker_log = std::sync::Arc::clone(&log);
+            let thread = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    use std::io::{Read, Write};
+                    let mut buffer = [0u8; 8192];
+                    let mut received = String::new();
+                    loop {
+                        let read = match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        };
+                        received.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                        if received.contains("\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let header_end = received.find("\r\n\r\n").unwrap_or(0);
+                    let headers = received[..header_end].to_ascii_lowercase();
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|line| line.trim().strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    let mut body = received[header_end + 4..].to_owned();
+                    while body.len() < content_length {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => body.push_str(&String::from_utf8_lossy(&buffer[..read])),
+                        }
+                    }
+                    let payload = match answer.as_str() {
+                        "transferred" => serde_json::json!({
+                            "status": "transferred",
+                            "saved": ["某剧 第二季 4K"],
+                            "detail": "已转存 1 个条目",
+                        }),
+                        "auth_required" => serde_json::json!({
+                            "status": "auth_required",
+                            "detail": "cookie 已过期",
+                        }),
+                        "failed" => serde_json::json!({
+                            "status": "failed",
+                            "detail": "分享链接无效或需要密码",
+                        }),
+                        _ => serde_json::json!({"status": answer}),
+                    };
+                    let text = payload.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        text.len(),
+                        text
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    let mut slot = worker_log
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    slot.hits += 1;
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        slot.last_body = parsed;
+                    }
+                }
+            });
+            Self {
+                address,
+                // The listener moved into the worker closure; keep a closed
+                // placeholder so `Drop` has a harmless value to hold.
+                listener: std::net::TcpListener::bind("127.0.0.1:0")
+                    .expect("stub placeholder bind"),
+                thread: Some(thread),
+                log,
+            }
+        }
+
+        fn base(&self) -> String {
+            format!("http://{}", self.address)
+        }
+
+        fn last_body(&self) -> serde_json::Value {
+            let slot = self
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.last_body.clone()
+        }
+
+        fn hits(&self) -> usize {
+            let slot = self
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.hits
+        }
+    }
+
+    impl Drop for StubSidecar {
+        fn drop(&mut self) {
+            // Detach, do not join: the worker's `incoming()` loop never ends
+            // (the listener lives inside it), so joining here would deadlock
+            // the test thread. The thread is reaped when the process exits.
+            let _ = self.thread.take();
+        }
+    }
+
 
     #[test]
     fn accepts_only_real_share_links() {
@@ -4217,8 +4648,8 @@ mod tests {
 
     /// `mode` is one of the five listening modes; anything else is rejected on
     /// ingest and quarantined when a hand-written file carries it.
-    #[test]
-    fn rejects_unknown_link_modes() {
+    #[tokio::test]
+    async fn rejects_unknown_link_modes() {
         let job = LinkJob {
             url: "https://115.com/s/abc".to_owned(),
             mode: Some("随便".to_owned()),
@@ -4257,7 +4688,7 @@ mod tests {
             r#"{"job_id":"1700000000003-bad-mode","url":"https://115.com/s/bad","mode":"乱写"}"#,
         )
         .unwrap();
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.invalid.len(), 1);
         assert!(report.accepted.is_empty());
         assert_eq!(
@@ -4307,8 +4738,8 @@ mod tests {
         assert!(untitled.job_id.ends_with("-magnet-xt-urn-btih-abc"));
     }
 
-    #[test]
-    fn queues_and_consumes_link_jobs() {
+    #[tokio::test]
+    async fn queues_and_consumes_link_jobs() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let queued = service
@@ -4324,7 +4755,7 @@ mod tests {
             queued.file
         );
 
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.examined, 1);
         assert_eq!(report.accepted.len(), 1);
         assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_NEEDS_115);
@@ -4351,7 +4782,7 @@ mod tests {
         );
 
         // Consuming twice is a no-op: the file moved into 已处理/.
-        let again = service.ingest_link_queue(false).expect("consumed");
+        let again = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(again.examined, 0);
         assert_eq!(
             std::fs::read_dir(service.config.link_done_dir())
@@ -4361,8 +4792,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn link_ingest_is_idempotent_on_the_url() {
+    #[tokio::test]
+    async fn link_ingest_is_idempotent_on_the_url() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
 
@@ -4377,7 +4808,7 @@ mod tests {
         assert_eq!(again.job_id, first.job_id);
         assert_eq!(service.status().pending_link_jobs, 1);
 
-        service.ingest_link_queue(false).expect("consumed");
+        service.ingest_link_queue(false).await.expect("consumed");
         // Same link after consumption -> still no second file.
         let third = service
             .enqueue_link_job(link_job("https://115.com/s/abc"))
@@ -4396,14 +4827,14 @@ mod tests {
 
     /// The URL idempotency key never expires, so `force` is the explicit retry
     /// path: it queues the link again instead of answering `duplicate`.
-    #[test]
-    fn a_forced_link_job_is_queued_again() {
+    #[tokio::test]
+    async fn a_forced_link_job_is_queued_again() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let first = service
             .enqueue_link_job(link_job("https://115.com/s/abc"))
             .expect("queued");
-        service.ingest_link_queue(false).expect("consumed");
+        service.ingest_link_queue(false).await.expect("consumed");
         let duplicate = service
             .enqueue_link_job(link_job("https://115.com/s/abc"))
             .expect("queued");
@@ -4470,8 +4901,8 @@ mod tests {
         assert_eq!(target, tmp.path().join("1700000000000-demo (2).json"));
     }
 
-    #[test]
-    fn quarantines_unusable_link_jobs() {
+    #[tokio::test]
+    async fn quarantines_unusable_link_jobs() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let queue = service.config.link_queue_dir();
@@ -4481,7 +4912,7 @@ mod tests {
         // `状态.jsonl` shares the directory but is not a job.
         std::fs::write(queue.join(LINK_QUEUE_STATE_FILE), b"{}\n").unwrap();
 
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.examined, 2);
         assert_eq!(report.invalid.len(), 2);
         assert!(report.accepted.is_empty());
@@ -4501,8 +4932,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn link_queue_keeps_unsettled_junk_for_the_next_run() {
+    #[tokio::test]
+    async fn link_queue_keeps_unsettled_junk_for_the_next_run() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let mut config = archive_config(tmp.path());
         config.settle_seconds = 3600;
@@ -4511,7 +4942,7 @@ mod tests {
         std::fs::create_dir_all(&queue).expect("queue");
         std::fs::write(queue.join("writing.json"), b"{\"url\":").unwrap();
 
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.examined, 1);
         assert_eq!(report.skipped_incomplete.len(), 1);
         assert!(report.invalid.is_empty());
@@ -4520,8 +4951,8 @@ mod tests {
 
     /// One stuck job must not block the others: the healthy job is archived
     /// and recorded, the blocked one is counted once and retried next round.
-    #[test]
-    fn an_unmovable_link_job_does_not_stop_the_round() {
+    #[tokio::test]
+    async fn an_unmovable_link_job_does_not_stop_the_round() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let queue = service.config.link_queue_dir();
@@ -4546,7 +4977,7 @@ mod tests {
         std::fs::create_dir_all(blocker.join("keep")).expect("blocker dir");
         std::fs::write(blocker.join("keep").join("note.txt"), b"x").unwrap();
 
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.examined, 2);
         assert_eq!(report.accepted.len(), 1);
         assert_eq!(report.accepted[0].job_id, healthy.job_id);
@@ -4565,7 +4996,7 @@ mod tests {
         assert!(blocker.is_dir());
 
         // The next round retries the blocked job and still accounts it once.
-        let again = service.ingest_link_queue(false).expect("consumed");
+        let again = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(again.failed.len(), 1);
         assert!(again.accepted.is_empty());
         let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
@@ -4574,8 +5005,8 @@ mod tests {
 
     /// State write and file move are two steps: a job recorded last round but
     /// not moved is retried without a second state line.
-    #[test]
-    fn a_recorded_link_job_is_not_accounted_twice() {
+    #[tokio::test]
+    async fn a_recorded_link_job_is_not_accounted_twice() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let queue = service.config.link_queue_dir();
@@ -4600,7 +5031,7 @@ mod tests {
         };
         append_link_state(&service.config.link_state_file(), &record).expect("state");
 
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.accepted.len(), 1);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
         assert!(service.config.link_done_dir().join("retry.json").exists());
@@ -4615,8 +5046,8 @@ mod tests {
     /// Job files carry share links (possibly `?password=`), so they are as
     /// private as `状态.jsonl` — before and after the move into 已处理/.
     #[cfg(unix)]
-    #[test]
-    fn link_job_files_are_private() {
+    #[tokio::test]
+    async fn link_job_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
 
         fn mode_of(path: &Path) -> u32 {
@@ -4634,7 +5065,7 @@ mod tests {
             .expect("queued");
         assert_eq!(mode_of(Path::new(&queued.file)), 0o600, "job file");
 
-        service.ingest_link_queue(false).expect("consumed");
+        service.ingest_link_queue(false).await.expect("consumed");
         let done = service.config.link_done_dir().join(
             Path::new(&queued.file)
                 .file_name()
@@ -4642,6 +5073,235 @@ mod tests {
         );
         assert_eq!(mode_of(&done), 0o600, "已处理/ keeps the mode");
         assert_eq!(mode_of(&service.config.link_state_file()), 0o600, "状态.jsonl");
+    }
+
+    /// U11 test helper: a config with the transfer115 sidecar pointed at a
+    /// local stub server.
+    fn transfer_config(root: &std::path::Path, base: &str) -> ArchiveConfig {
+        let mut config = archive_config(root);
+        config.transfer115_base = base.to_owned();
+        config.transfer115_cookie = "UID=1; CID=2; SEID=3; KID=4".to_owned();
+        config
+    }
+
+    /// U11: a 115 share link is handed to the sidecar and recorded
+    /// `transferred`; the job moves to 已处理/ and the state line carries what
+    /// the sidecar saved.
+    #[tokio::test]
+    async fn a_115_share_link_is_transferred_by_the_sidecar() {
+        let server = StubSidecar::start("transferred");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
+        let queued = service
+            .enqueue_link_job(link_job("https://115.com/s/abc"))
+            .expect("queued");
+
+        let report = service.ingest_link_queue(false).await.expect("consumed");
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_TRANSFERRED);
+        assert_eq!(report.accepted[0].transfer, "某剧 第二季 4K");
+
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(state.lines().count(), 1);
+        assert!(state.contains(LINK_JOB_STATUS_TRANSFERRED), "{state}");
+        assert!(state.contains("某剧 第二季 4K"), "{state}");
+        assert!(!state.contains(LINK_JOB_NEEDS_115_REASON), "{state}");
+        assert_eq!(service.status().pending_link_jobs, 0);
+        // The sidecar saw the job: the fixed target directory and the archive
+        // root travel with the request.
+        let seen = server.last_body();
+        assert_eq!(seen["job_id"], queued.job_id);
+        assert_eq!(seen["url"], "https://115.com/s/abc");
+        assert_eq!(seen["target_dir"], "转存目录");
+        assert_eq!(seen["archive_root"], tmp.path().display().to_string());
+        // The cookie never travels in the request body: the sidecar reads it
+        // from the shared settings file.
+        assert!(
+            !seen.to_string().contains("SEID=3"),
+            "cookie leaked into the request: {seen}"
+        );
+    }
+
+    /// U11: `auth_required` records nothing and leaves the job queued — the
+    /// operator refreshes the cookie and the next round retries the same job.
+    #[tokio::test]
+    async fn an_expired_115_cookie_pauses_the_stage_without_losing_the_job() {
+        let server = StubSidecar::start("auth_required");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
+        let queued = service
+            .enqueue_link_job(link_job("https://115.com/s/dead-cookie"))
+            .expect("queued");
+
+        let error = service
+            .ingest_link_queue(false)
+            .await
+            .expect_err("the stage pauses on a dead cookie");
+        assert!(error.contains("cookie"), "{error}");
+
+        let state = std::fs::read_to_string(service.config.link_state_file())
+            .unwrap_or_default();
+        assert!(!state.contains(LINK_JOB_STATUS_AUTH_REQUIRED), "{state}");
+        assert!(!state.contains(&queued.job_id), "{state}");
+        assert_eq!(service.status().pending_link_jobs, 1, "the job stays queued");
+    }
+
+    /// U11: a sidecar `failed` answer is recorded and parked like any consumed
+    /// job; the operator re-delivers with `force: true`.
+    #[tokio::test]
+    async fn a_failed_transfer_is_recorded_and_parked() {
+        let server = StubSidecar::start("failed");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
+        service
+            .enqueue_link_job(link_job("https://115.com/s/gone"))
+            .expect("queued");
+
+        let report = service.ingest_link_queue(false).await.expect("consumed");
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_FAILED);
+        assert_eq!(report.accepted[0].transfer, "failed");
+
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert_eq!(state.lines().count(), 1);
+        assert!(state.contains(LINK_JOB_STATUS_FAILED), "{state}");
+        assert_eq!(service.status().pending_link_jobs, 0);
+        // The duplicate answer for a consumed-but-failed link carries the
+        // recorded status, so the producer knows a `force` re-delivery is in
+        // order. (The state line's `transfer` field holds the sidecar's saved
+        // list — empty for a failure — so the status is what tells the story.)
+        let again = service
+            .enqueue_link_job(link_job("https://115.com/s/gone"))
+            .expect("queued");
+        assert!(again.duplicate);
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state");
+        assert!(
+            state.lines().any(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).expect("line");
+                record["job_id"] == again.job_id
+                    && record["status"] == LINK_JOB_STATUS_FAILED
+            }),
+            "the duplicate must point at the failed record: {state}"
+        );
+    }
+
+    /// U11: magnet / ed2k links stay accepted by the queue but the transfer
+    /// sidecar only does 115 share links this slice: they are recorded
+    /// `failed` with the `unsupported` marker, not silently dropped.
+    #[tokio::test]
+    async fn a_magnet_link_is_parked_as_unsupported() {
+        let server = StubSidecar::start("transferred");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
+        service
+            .enqueue_link_job(link_job("magnet:?xt=urn:btih:abc"))
+            .expect("queued");
+
+        let report = service.ingest_link_queue(false).await.expect("consumed");
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_FAILED);
+        assert_eq!(report.accepted[0].transfer, "unsupported");
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert!(state.contains(LINK_JOB_UNSUPPORTED_REASON), "{state}");
+        assert_eq!(
+            server.hits(),
+            0,
+            "the sidecar is never asked about a magnet link"
+        );
+    }
+
+    /// U11: an unreachable sidecar pauses the stage: the job is neither
+    /// recorded nor moved, so the next round retries it.
+    #[tokio::test]
+    async fn an_unreachable_sidecar_pauses_the_stage() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(
+            tmp.path(),
+            "http://127.0.0.1:1", // nothing listens here
+        ));
+        service
+            .enqueue_link_job(link_job("https://115.com/s/wait"))
+            .expect("queued");
+
+        let error = service
+            .ingest_link_queue(false)
+            .await
+            .expect_err("the stage pauses when the sidecar is down");
+        assert!(error.contains("转存侧车"), "{error}");
+        assert_eq!(service.status().pending_link_jobs, 1);
+        let state = std::fs::read_to_string(service.config.link_state_file())
+            .unwrap_or_default();
+        assert!(!state.contains("https://115.com/s/wait"), "{state}");
+    }
+
+    /// U11: with the stage configured, a dry run reports what *would* happen
+    /// (transferred for a 115 link, unsupported for a magnet) without calling
+    /// the sidecar, recording anything, or moving files.
+    #[tokio::test]
+    async fn a_dry_run_reports_the_transfer_without_calling_the_sidecar() {
+        let server = StubSidecar::start("transferred");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
+        service
+            .enqueue_link_job(link_job("https://115.com/s/dry"))
+            .expect("queued");
+        service
+            .enqueue_link_job(link_job("magnet:?xt=urn:btih:dry"))
+            .expect("queued");
+
+        let report = service.ingest_link_queue(true).await.expect("dry run");
+        assert_eq!(report.accepted.len(), 2);
+        let statuses: std::collections::BTreeMap<_, _> = report
+            .accepted
+            .iter()
+            .map(|job| (job.url.clone(), job.status))
+            .collect();
+        assert_eq!(
+            statuses.get("https://115.com/s/dry"),
+            Some(&LINK_JOB_STATUS_TRANSFERRED)
+        );
+        assert_eq!(
+            statuses.get("magnet:?xt=urn:btih:dry"),
+            Some(&LINK_JOB_STATUS_FAILED)
+        );
+        assert_eq!(server.hits(), 0, "a dry run never calls the sidecar");
+        assert_eq!(service.status().pending_link_jobs, 2);
+        assert!(!service.config.link_state_file().exists());
+    }
+
+    /// U11: the transfer stage is part of the link-queue stage: a sidecar that
+    /// is down skips the queue stage for the round but the rest of the
+    /// pipeline still runs.
+    #[tokio::test]
+    async fn a_down_sidecar_does_not_stop_the_run() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = transfer_config(tmp.path(), "http://127.0.0.1:1");
+        config.transfer115_timeout = Duration::from_millis(300);
+        let service = ArchiveService::new_for_tests(config);
+        service
+            .enqueue_link_job(link_job("https://115.com/s/run"))
+            .expect("queued");
+
+        let report = service
+            .run_once(false)
+            .await
+            .expect("the rest of the pipeline still runs");
+        assert!(report.organized.is_empty());
+        assert_eq!(service.status().pending_link_jobs, 1);
+    }
+
+    /// U11: only 115 hosts go to the transfer sidecar.
+    #[test]
+    fn only_115_hosts_are_share_links() {
+        assert!(is_115_share_link("https://115.com/s/abc"));
+        assert!(is_115_share_link("https://115.com/s/abc?password=1"));
+        assert!(is_115_share_link("http://115.com/s/abc"));
+        assert!(is_115_share_link("https://user:pass@115.com/s/abc"));
+        assert!(is_115_share_link("https://sub.115.com/s/abc"));
+        assert!(!is_115_share_link("https://evil.com/115.com/s/abc"));
+        assert!(!is_115_share_link("https://115.com.evil.com/x"));
+        assert!(!is_115_share_link("magnet:?xt=urn:btih:abc"));
+        assert!(!is_115_share_link("ed2k://|file|a.mkv|1|HASH|/"));
     }
 
     /// Full-width forms (common in hand-typed and IME titles) fold to ASCII
@@ -4783,8 +5443,8 @@ mod tests {
     /// `X.JSON` vs dotfiles vs `状态.jsonl` vs symlinks.
     /// A read failure is not "no duplicate": ingest refuses instead of writing a
     /// second job, and the consumer skips the round instead of consuming blindly.
-    #[test]
-    fn an_unreadable_state_file_is_not_no_duplicate() {
+    #[tokio::test]
+    async fn an_unreadable_state_file_is_not_no_duplicate() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let queue = service.config.link_queue_dir();
@@ -4805,7 +5465,7 @@ mod tests {
             serde_json::to_vec(&link_job("https://115.com/s/def")).unwrap(),
         )
         .unwrap();
-        assert!(service.ingest_link_queue(false).is_err());
+        assert!(service.ingest_link_queue(false).await.is_err());
         assert_eq!(count_link_jobs(&queue), 1);
     }
 
@@ -4827,8 +5487,8 @@ mod tests {
         assert!(report.organized.is_empty());
     }
 
-    #[test]
-    fn count_and_consume_agree_on_what_a_job_is() {
+    #[tokio::test]
+    async fn count_and_consume_agree_on_what_a_job_is() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let service = ArchiveService::new_for_tests(archive_config(tmp.path()));
         let queue = service.config.link_queue_dir();
@@ -4855,7 +5515,7 @@ mod tests {
             .expect("symlink");
 
         assert_eq!(count_link_jobs(&queue), 1, "only UPPER.JSON is a job");
-        let report = service.ingest_link_queue(false).expect("consumed");
+        let report = service.ingest_link_queue(false).await.expect("consumed");
         assert_eq!(report.examined, 1);
         assert_eq!(report.accepted.len(), 1);
         assert_eq!(report.accepted[0].job_id, "upper");

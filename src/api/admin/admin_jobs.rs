@@ -1451,9 +1451,11 @@ pub(crate) async fn admin_archive_metadata(
 /// `POST /api/v1/admin/archive/ingest` — accept one link from a sidecar
 /// (today: the Telegram watcher) and write it into `<archive_root>/链接队列/`.
 ///
-/// The 115 share-link transfer client (plan U11) is not implemented yet, so the
-/// endpoint only validates and queues the link: the pipeline records it with the
-/// `needs_115_client` status and downloads nothing.
+/// The pipeline consumes the queue each round; when the transfer115 sidecar is
+/// configured, 115 share links are transferred into the target directory and
+/// recorded `transferred`/`failed`. Until then (or without a sidecar) the
+/// endpoint only validates and queues the link: the pipeline records it with
+/// the `needs_115_client` status and downloads nothing.
 pub(crate) async fn admin_archive_ingest(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -1498,11 +1500,19 @@ pub(crate) async fn admin_archive_ingest(
                 "ok": true,
                 "jobId": queued.job_id,
                 "file": queued.file,
-                // The job is queued, not transferred: `needs_115_client` is
-                // what the consumer will record, the response describes now.
+                // The job is queued, not transferred: the consumer transfers
+                // (or records) it on the next round, the response describes now.
                 "status": "queued",
                 "duplicate": queued.duplicate,
-                "note": crate::application::archive::LINK_JOB_NEEDS_115_REASON,
+                // For a duplicate of an already-consumed job this carries what
+                // the transfer stage recorded (`transferred` / `failed` / …),
+                // so the producer knows whether a `force` re-delivery is due.
+                "transfer": queued.transfer,
+                "note": if queued.transfer.is_empty() {
+                    crate::application::archive::LINK_JOB_NEEDS_115_REASON.to_owned()
+                } else {
+                    String::new()
+                },
             })),
         )
             .into_response(),
