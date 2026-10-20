@@ -5,13 +5,27 @@
 
 ---
 
-## 1. 一句话现状
+## 1. 交接状态（2026-10-20）
 
-归档流水线、设置页、Telegram 通知、Telegram 旁挂（代码层）、链接队列、运维修复工具、以及
-**115 转存（U11：Lux 侧转存阶段 + transfer115 侧车）** 都已实现并合并；侧车 21 条离线用例通过。
-剩下的是**真实 115 cookie 的端到端验收**、生产编排、存量迁移与 chill 退役。
+**主干 `fork/phase-a` = `db715202`，镜像 `lux:phase-a` = `ac86c13c76e0`，测试容器 `lux-testlib`（8099）healthy。**
 
----
+已完成并合并：归档流水线（含剧集按季）、设置页、Telegram 通知、Telegram 旁挂（代码层）、链接队列、
+运维修复工具、**115 转存（U11：Lux 转存阶段 + `sidecar/transfer115` 侧车 + 设置页分组）**。
+
+验证状态：
+
+| 项 | 结果 |
+| --- | --- |
+| Rust 全量 | `cargo test --locked --lib` → 1090 passed / 0 failed / 26 ignored（曾出现 1 次 flaky，重跑全绿） |
+| 侧车离线 | 21 条用例通过（Python 3.12 + p115client 0.0.9.4） |
+| 前端 | 镜像构建里的 `pnpm build`（tsc + vite）通过 |
+| 测试实例 | 设置读写、侧车被调用 + `failed` 记账、侧车不可达不丢作业，三条路径都验过 |
+
+**下一步就三件**（细节见 §8）：
+
+1. 用**真实 115 cookie** 跑一次端到端（唯一没验的关键路径；本机没外网，必须在能上网的环境做）；
+2. 构建 `sidecar/transfer115` 镜像 + 写生产 compose（设置文件权限/属组）；
+3. magnet/ed2k 走 115 云下载（后续切片，可选）。
 
 ## 2. 项目目标
 
@@ -60,10 +74,10 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 | 项 | 值 |
 | --- | --- |
 | 仓库 | `qiangli@192.168.8.8:/vol5/1000/build/lux`（主 checkout，当前在 `feat/telegram-ingest`，**不是主干**） |
-| 主干分支 | `fork/phase-a`（当前 `7c4dffca`） |
+| 主干分支 | `fork/phase-a`（当前 `db715202`） |
 | 集成分支 | `integration/round2`（= 主干，工作流用干净克隆 `/tmp/lux-merge`） |
 | SSH | `ssh -p 4888 -i "$HOME\.ssh\id_ed25519_feiniu" -o BatchMode=yes qiangli@192.168.8.8 "<cmd>"`；大于几 KB 的文件先本地写再 `scp` |
-| 镜像 | `lux:phase-a` = `4813a0cb967b`（只能由总控/交接者构建，模块方不得覆盖） |
+| 镜像 | `lux:phase-a` = `ac86c13c76e0`（只能由总控/交接者构建，模块方不得覆盖） |
 | 测试容器 | `lux-testlib`（8099:8097，admin/`Test@12345a`，healthy） |
 | 测试配置 | `/vol5/1000/build/archive-test-config`（`lux.db`、`metadata/`，属 root） |
 | 测试库 | `/vol5/1000/docker/clouddrive2/CloudNAS/115open/测试库`（唯一允许写的网盘位置） |
@@ -71,6 +85,8 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 | CD2 | 容器 `clouddrive2`（`cloudnas/clouddrive2`），web/API 在 **19798**，挂载点在 `/vol5/1000/docker/clouddrive2/CloudNAS` |
 | chill | 容器 `cinechill`，配置 `/vol5/1000/docker/chillposter/config`；**闭源**（`.so`/`.pyc`），用 `p115client 0.0.9.4` |
 | 设置模板 | `/vol5/1000/build/archive-settings.json`（含 chill 的 TG 凭证，权限 600，**不在 git 里**） |
+| 外网 | **NAS 没有外网**：pip / PyPI / 拉镜像都不通；但 docker build 走镜像里的 npm/cargo 镜像源，能构建 |
+| 离线 Python 3.12 | `chillne/cinechill:latest` 里自带 Python 3.12 + `p115client 0.0.9.4`，可当转存侧车的离线测试运行时 |
 
 硬约束：生产媒体库只读；chill/Emby/CD2 不做任何修改；不启用 Lux 的 STRM 远程探测。
 
@@ -80,10 +96,13 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 
 - 主干 `fork/phase-a`；每个模块历史上有独立分支/worktree（`lux-notify-settings`、`lux-telegram-sidecar`、`lux-settings`），
   现在都并入了主干。
-- 这一轮的实现分支是 `integration/round2`，等于主干（fast-forward 合并）。
+- 这一轮的实现分支：`feat/transfer115`（Lux 转存阶段，`570ccb19`）+ `feat/transfer115-sidecar`
+  （侧车、设置页、文档，`db715202`），都已 fast-forward 到 `fork/phase-a`；`integration/round2` = 主干。
+- 老 worktree 还挂在 `/vol5/1000/build/lux-*`（`lux-transfer115` 停在 `570ccb19`，可以删）；
+  新对话建议自己开干净克隆/工作树，不要改别人的 worktree。
 - 提交规范：`type(scope): 描述`，带编号的整改用 `fix(settings): S1 …` 这种形式；
   总线/文档提交用 `bus(...)`、`docs(...)`。
-- 合并门禁：`cargo test --locked --lib` 全绿（当前 **1080 passed / 0 failed / 26 ignored**）、
+- 合并门禁：`cargo test --locked --lib` 全绿（当前 **1090 passed / 0 failed / 26 ignored**）、
   `pnpm build` 通过（前端改动时）、旁挂 `python -m unittest discover -s tests -t .` 全绿（**207 OK**，ZFS 上 3 skip）、
   全仓 grep 真实手机号/api_id/token 0 命中。
 - 总控规则见 `WORKFLOW.md`；评审状态机见 `REVIEW-BUS.md`。
@@ -152,13 +171,6 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 
 ---
 
-### 6.7 115 转存（U11，本轮完成）
-
-- Lux 侧转存阶段：`archive.rs` 的 `transfer_115_share_link` + 设置项 `transfer115`，提交 `570ccb19`。
-- 侧车 `sidecar/transfer115/`：p115client + cookie，`POST /transfer` 契约见其 README，提交 `f7d460dd`。
-- 文档：`archive-pipeline.md` §2（队列状态）与 §10（已知限制）已同步；总线/PROGRESS 已记录。
-- 唯一未做的验证：真实 cookie 的端到端（见 §8.1 剩余 1）。
-
 ## 7. 关键决策与约定（不要推翻，除非有理由）
 
 | 编号 | 决定 |
@@ -178,58 +190,68 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
 
 ## 8. 待办（按优先级）
 
-### 8.1 ✅ U11：115 转存（已实现，待真机验收）
+### 8.1 ✅ U11：115 转存（已实现，仅差真机 cookie 验收）
 
-**已完成**：
+已完成的三块：
 
-- Lux 侧（`570ccb19`）：配置项 `transfer115`（`cookie` / `target_dir` / `sidecar_base` / `timeout_seconds`），
-  队列消费器在记账前把 `115.com/s/<code>` 交给侧车，按 `transferred` / `failed` / `unsupported` 记账并移入
-  `已处理/`；`auth_required` 与侧车不可达都**不记账、不移文件**，本轮消费中断、作业留在队列等下一轮。
-  magnet / ed2k 直接记 `unsupported`（115 云下载是后续切片）。`cargo test --lib archive` = 83 passed。
-- 侧车（`f7d460dd`，`sidecar/transfer115/`）：Python + `p115client==0.0.9.4`，cookie 从共享设置文件读
+- **Lux 侧转存阶段**（`570ccb19`）：`transfer115` 配置段（`cookie` / `target_dir` / `sidecar_base` /
+  `timeout_seconds`），队列消费器在记账前把 `115.com/s/<code>` 交给侧车，按 `transferred` / `failed` /
+  `unsupported` 记账并移入 `已处理/`；`auth_required` 与侧车不可达都**不记账、不移文件**，本轮消费中断、
+  作业留在队列等下一轮。magnet / ed2k 直接记 `unsupported`。`cargo test --lib archive` = 83 passed。
+- **侧车**（`f7d460dd`，`sidecar/transfer115/`）：Python + `p115client==0.0.9.4`，cookie 从共享设置文件读
   （请求体不带 cookie）；流程 `login_status → share_snap → 解析/创建 <cd2_prefix>/<target_dir> 的 cid →
-  share_receive → 短暂确认`；日志只打 job_id 与 URL host；串行转存。21 条离线用例通过
-  （链接解析、cookie 读取/打码、目标目录创建、多条目、四种状态、HTTP 往返、参数校验）。
+  share_receive → 短暂确认`；日志只打 job_id 与 URL host；串行转存。21 条离线用例。
+- **设置页**（`67393e1a`）：设置 → 归档流水线 → 「115 转存」分组（cookie 打码、目标目录、侧车地址、超时）。
 
-**已在测试实例验证（2026-10-19，镜像 `ac86c13c76e0`）**：
+测试实例上已经验证过（`ac86c13c76e0`）：
 
-- `GET /archive/settings` 返回 `transfer115`（cookie 打码 `UID=1;…(27)`）；
-  `PUT` 落盘后文件里是真的 cookie、其余键按 provenance 规则写（`target_dir` 等于默认值时不重复写）。
-- 投一条 `115.com/s/...` → `POST /archive/run` → Lux 真的调到了侧车（侧车日志 `POST /transfer`），
-  侧车返回 `failed`（本机无外网，`share_snap` 读不到内容），Lux 记 `failed` 并把作业移入 `已处理/`。
-- 把 `sidecar_base` 指到一个死端口再投一条 → 作业**留在队列**、`状态.jsonl` 不增行、`run` 仍返回 200
-  （只暂停队列阶段），证明不会丢作业、也不会重复记账。
-- 测试痕迹已清理（设置文件里的 `transfer115` 段、残留作业、测试侧车容器）。
+- `GET /archive/settings` 返回 `transfer115`（cookie 打码 `UID=1;…(27)`）；`PUT` 落盘正确、按 provenance 规则写；
+- 投 `115.com/s/...` → `POST /archive/run` → 侧车日志出现 `POST /transfer` → 返回 `failed` → Lux 记 `failed`
+  并移入 `已处理/`（本机无外网，`share_snap` 读不到内容，属于预期）；
+- `sidecar_base` 指死端口 → 作业留在队列、`状态.jsonl` 不增行、`run` 仍 200（只暂停队列阶段）。
 
-**剩余**：
+### 8.2 ★ 真实 cookie 的端到端（最高优先，唯一没验的关键路径）
 
-1. 用真实 cookie 跑一次端到端：`链接队列` 投一条真实 115 分享 → 侧车转存 → CD2 挂载出现文件 →
-   `转存目录 → 待整理 → 媒体目录 → 镜像` 全通。需要用户提供 115 cookie。
-2. 生产编排：侧车容器 + 配置目录 `0750 root:<group>` / 设置文件 `0640 root:<group>` + `group_add`（README 有片段）。
-3. 磁力/ed2k 走 115 云下载（`clouddownload_task_add_urls`）——后续切片，不在本轮。
+环境要求：**能访问 115 的机器**（这台 NAS 没外网；测试可以在用户的生产机/能上网的容器里做）。
 
-**开工前不需要再问参数**：cookie 提供方式是「浏览器 F12 复制整串」，目标目录默认 `转存目录`
-（相对 `cd2_prefix`），都可以在设置文件里改。
+步骤：
 
-### 8.2 端到端联调（依赖 8.1）
+1. 浏览器登录 115 → F12 → Network → 任意请求 → Request Headers 里的整串 `Cookie`
+   （`UID=...; CID=...; SEID=...; KID=...`）。
+2. 设置页（或 `PUT /api/v1/admin/archive/settings`）填 `transfer115.cookie`，`sidecar_base` 指向侧车，
+   `target_dir` 用默认 `转存目录`。
+3. 起侧车（需要 `pip install p115client==0.0.9.4`，所以要在能上网的环境构建镜像）：
+   `docker build -t lux-transfer115:latest sidecar/transfer115 && docker run -d -p 8098:8098 -v <config>:/config:ro lux-transfer115:latest`
+4. 投一条真实分享：`POST /api/v1/admin/archive/ingest {"url":"https://115.com/s/xxxx?password=abcd","title":"…","mode":"手动"}`
+   → `POST /api/v1/admin/archive/run` → 看三处：侧车日志 `status=transferred`、`状态.jsonl` 记 `transferred`、
+   CD2 挂载里 `测试库/转存目录/` 出现文件 → 下一轮归档把它搬进 `待整理`。
+5. 失败分支也顺手验一次：把 cookie 改坏 → 期待 `auth_required`，作业留在队列（不移 `已处理`、不写状态）。
 
-旁挂真机登录、真频道发链接、看到 `链接队列 → 转存目录 → 待整理 → 媒体目录 → 镜像` 全通。
-旁挂 207 条离线用例已过，但**从未用真实凭据跑过**。
+### 8.3 侧车镜像与生产编排
 
-### 8.3 生产部署
+- `sidecar/transfer115/Dockerfile` 已就绪，但 **pip 需要外网**，这台 NAS 构建不了；在上网环境构建并推仓库/registry。
+- 生产 compose：Lux + 旁挂 + transfer115；配置目录 `0750 root:<group>`、设置文件 `0640 root:<group>`、
+  侧车 `group_add: ["${LUX_ARCHIVE_SETTINGS_GROUP:-10001}"]`（README 有片段）。
+- 备份与 WAL checkpoint、监控告警（通知模块可直接用）、日志脱敏复查。
 
-compose 编排（Lux + 旁挂 + transfer115）、设置文件权限/属组、备份与 WAL checkpoint、监控告警（通知已可用）、
-日志脱敏复查。
+### 8.4 magnet / ed2k 走 115 云下载（可选切片）
 
-### 8.4 存量迁移 + chill 退役（用户要求先观察几天）
+`p115client.clouddownload_task_add_urls(...)` 已确认存在；Rust 侧现在把 magnet/ed2k 记 `unsupported`，
+要做的话：侧车加 `POST /transfer` 的 magnet 分支 + 侧车状态映射 + Rust 侧放行这两类 URL。
+
+### 8.5 旁挂真机联调
+
+Telethon 旁挂 207 条离线用例已过，但**从未用真实凭据登录/投递**。依赖 8.2 完成后一起验
+（旁挂 → ingest → 侧车 → 转存 → 归档全链路）。
+
+### 8.6 存量迁移 + chill 退役（用户要求先观察几天）
 
 迁移脚本/流程、Emby 库切换、回滚方案、观察期。
 
-### 8.5 收尾小项
+### 8.7 收尾小项
 
-- I7：链接队列幂等没有 TTL/轮转（现在只有 `force` 重投），`状态.jsonl` 只增不减。
-- `lux-bug-reports.md` 里三份上游 issue（首页/latest 超时、NFO 毒批次、has_available_source 不传播）
-  还没提交给上游作者。
+- I7：链接队列幂等没有 TTL/轮转（只有 `force` 重投），`状态.jsonl` 只增不减。
+- `lux-bug-reports.md` 里三份上游 issue 还没提交给上游作者。
 - 大库性能复核：lookup 冷启动 180k 外推约 340ms；首页/latest 的修复需要 18 万条目环境复测。
 
 ---
@@ -245,12 +267,20 @@ compose 编排（Lux + 旁挂 + transfer115）、设置文件权限/属组、备
 4. **单文件 bind mount 上 `rename` 会 EBUSY**，设置写入必须退化原地写（有 `.bak`）。
 5. **ZFS 上 `chmod` 对属主不生效**，旁挂的权限类测试在本机会 skip；真机权限要在容器里验。
 6. **`cargo test --lib archive` 的过滤词会命中 `notify::event` 和 `observability::logs` 的用例**，
-   数量不是「archive 模块」的真实数；看整库 1080 那个数字。
+   数量不是「archive 模块」的真实数；看整库 1090 那个数字。
 7. **CD2 只作为路径来源**（`cd2_prefix`/`cd2_mount` 生成 strm 内容，`watch_dirs` 是挂载点），
    代码里没有任何 CD2 API 调用；不要误以为转存是 CD2 做的。
 8. **chill 闭源**：只有 `.so`/`.pyc`，115 逻辑靠 `p115client` 的行为反推。
 9. **容器日志可能不滚动到 stdout**（`/config/logs` 有文件）；排查时看 `docker logs` 也看配置文件目录。
 10. **测试容器的 DB/元数据属 root**：读写要 `docker run --user 0 -v …:/config`，不要在宿主机直接读。
+11. **NAS 没有外网**：`pip install` / `docker pull` / PyPI 都不通；`docker build` 能成功是因为
+    `Dockerfile.custom` 里写死了 npmmirror 的 npm 源、cargo 走本地缓存。所以侧车镜像只能在上网环境构建。
+12. **宿主 Python 是 3.11，而 `p115client` 要求 ≥3.12**：在 NAS 上跑侧车测试要用 chill 镜像
+    （`docker run --entrypoint python -v … chillne/cinechill:latest -m unittest …`），不要试图用宿主 venv。
+13. **`unittest discover` 要求 `tests/` 是包**：没有 `tests/__init__.py` 会报
+    `Start directory is not importable`。
+14. **链接队列的作业是「一次消费」的**：`transferred`/`failed`/`unsupported` 会移入 `已处理/`，
+    只有 `auth_required` 和侧车不可达才留在队列重试——排查时先看作业在不在 `已处理/`。
 
 ---
 
@@ -296,30 +326,56 @@ csrf=$(awk '$6=="lux_csrf" {print $7}' /tmp/c.jar)
 
 ---
 
+### 115 转存侧车
+
+```bash
+# 离线测试（在有 p115client 的 Python 3.12 环境；本机 NAS 的做法：借 chill 镜像里的运行时）
+docker run --rm --entrypoint python -v "$PWD/sidecar/transfer115:/src" -w /src \
+  chillne/cinechill:latest -m unittest discover -s tests -t .
+
+# 构建（需要外网 pip；NAS 上不可用）
+docker build -t lux-transfer115:latest sidecar/transfer115
+
+# 本地跑（读共享设置文件里的 cookie）
+docker run --rm -p 8098:8098 -v <config>:/config:ro \
+  -e TRANSFER115_CONFIG_DIR=/config lux-transfer115:latest
+
+# 探活
+curl -s http://127.0.0.1:8098/healthz
+curl -s 'http://127.0.0.1:8098/healthz?deep=1'   # 真的拿 cookie 验登录
+```
+
+侧车环境变量：`TRANSFER115_CONFIG_DIR` / `TRANSFER115_HOST` / `TRANSFER115_PORT` /
+`TRANSFER115_CONFIRM_SECONDS` / `TRANSFER115_POLL_INTERVAL` / `TRANSFER115_IS_CHECK`，
+以及调试用的 `LUX_115_COOKIE`（覆盖设置文件）。
+
 ## 11. 未验证 / 风险
 
-- 旁挂从未真机登录、从未真正投递过（只有 stub 契约 + 207 条离线用例）。
-- 115 转存（U11）只做了离线验收：侧车 21 条用例通过，但没有用真实 cookie 跑过真实分享。
-- 生产环境从未跑过（只有测试容器）；大库（18 万条目）性能只有外推，没有实测。
+- **115 转存的真实链路没有验过**：侧车 21 条离线用例 + 假 cookie 的管线验证都过了，但「真 cookie 登录 115、
+  真分享转存成功、文件出现在 CD2 挂载」这一步没做过（这台 NAS 没外网）。
+- **侧车镜像没构建过**：`pip install p115client` 需要外网。
+- 旁挂从未真机登录、从未真正投递过（只有离线用例 + stub 契约）。
+- 生产环境从未跑过（只有测试容器）；大库（18 万条目）性能只有外推。
 - 上游三份 issue 未提交。
-- `re-enrich` 会把整库 NFO 重读一遍，大库上要挑空闲时段；以后可以改成只处理指定 item ids。
+- `re-enrich` 会把整库 NFO 重读一遍，大库上要挑空闲时段。
 
 ---
 
 ## 12. 新对话怎么开场
 
-把下面这段直接粘给新对话即可：
+把下面这段直接粘给新对话：
 
 ```
-接手 Lux 项目。先读 /vol5/1000/build/lux（NAS，ssh -p 4888 -i ~/.ssh/id_ed25519_feiniu qiangli@192.168.8.8）
-里的 docs/handoff/HANDOFF.md，再读 PROGRESS.md 与 REVIEW-BUS.md。
-主干分支 fork/phase-a，镜像 lux:phase-a，测试容器 lux-testlib。
-下一步优先做 HANDOFF 第 8.1 节的 U11（115 转存侧车，p115client + cookie），
-开工前先问我要 cookie 提供方式和目标目录规则。
+接手 Lux 项目（115 转存的收尾阶段）。先读 NAS 上的交接文档：
+ssh -p 4888 -i ~/.ssh/id_ed25519_feiniu qiangli@192.168.8.8 "cat /vol5/1000/build/lux/docs/handoff/HANDOFF.md"
+再读 PROGRESS.md 与 REVIEW-BUS.md。
+主干 fork/phase-a = db715202，镜像 lux:phase-a = ac86c13c76e0，测试容器 lux-testlib。
+U11 已实现（Rust 转存阶段 + sidecar/transfer115 + 设置页），只差真实 115 cookie 的端到端验收；
+按 HANDOFF 第 8.2 节做：先问我要 115 cookie 和一个能上网的构建/运行环境。
 ```
 
 必读文件顺序：`HANDOFF.md` → `PROGRESS.md` → `REVIEW-BUS.md` → `archive-pipeline.md`
-→（做到哪块再看）`module-*.md` / `fix-*-round2.md`。
+→ `sidecar/transfer115/README.md`（做到转存这块时）→ 其它 `module-*.md` / `fix-*-round2.md`。
 
 ---
 
