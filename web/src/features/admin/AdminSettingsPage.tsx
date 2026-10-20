@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Save, Settings2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
@@ -33,23 +33,41 @@ export function AdminSettingsPage() {
   const [forceAdminLibraryOrder, setForceAdminLibraryOrder] = useState(false);
   const [loginBackgroundSource, setLoginBackgroundSource] = useState<LoginBackgroundSource>("STATIC");
   const [proxyUrl, setProxyUrl] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [playbackSaved, setPlaybackSaved] = useState(false);
+  const [libraryDisplaySaved, setLibraryDisplaySaved] = useState(false);
   const [loginBackgroundSaved, setLoginBackgroundSaved] = useState(false);
   const [proxySaved, setProxySaved] = useState(false);
   const [proxyDiagnostics, setProxyDiagnostics] = useState<NetworkProxyDiagnostics | null>(null);
+  // Fill the form once: a refetch after one region saves must not discard edits
+  // that are still pending in another region.
+  const initialized = useRef(false);
 
   useEffect(() => {
-    if (!settings.data) return;
+    if (!settings.data || initialized.current) return;
     setMinimumMinutes(String(Math.round(settings.data.resumeMinTicks / 600000000)));
     setShowMetadataPending(settings.data.mediaStrategy.showMetadataPending ?? true);
     setForceAdminLibraryOrder(settings.data.forceAdminLibraryOrder ?? false);
     setLoginBackgroundSource(settings.data.loginBackgroundSource ?? "STATIC");
     setProxyUrl(settings.data.networkProxy?.url ?? "");
+    initialized.current = true;
   }, [settings.data]);
 
-  const save = useMutation({
+  // One request per region: the server merges the fields it receives, so saving
+  // playback never carries the pending library-display edits with it.
+  const savePlayback = useMutation({
     mutationFn: () => api.updateAdminSettings({
       resumeMinTicks: Number(minimumMinutes) * 600000000,
+    }),
+    onSuccess: (data) => {
+      setMinimumMinutes(String(Math.round(data.resumeMinTicks / 600000000)));
+      setPlaybackSaved(true);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
+    },
+    onError: () => setPlaybackSaved(false),
+  });
+
+  const saveLibraryDisplay = useMutation({
+    mutationFn: () => api.updateAdminSettings({
       forceAdminLibraryOrder,
       mediaStrategy: {
         ...settings.data!.mediaStrategy,
@@ -57,11 +75,12 @@ export function AdminSettingsPage() {
       },
     }),
     onSuccess: (data) => {
-      setMinimumMinutes(String(Math.round(data.resumeMinTicks / 600000000)));
-      setSaved(true);
+      setShowMetadataPending(data.mediaStrategy.showMetadataPending ?? true);
+      setForceAdminLibraryOrder(data.forceAdminLibraryOrder ?? false);
+      setLibraryDisplaySaved(true);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
     },
-    onError: () => setSaved(false),
+    onError: () => setLibraryDisplaySaved(false),
   });
 
   const saveProxy = useMutation({
@@ -130,17 +149,31 @@ export function AdminSettingsPage() {
             <span>继续观看最小进度</span>
             <small>低于此播放时长的记录不会显示在“继续观看”。</small>
             <div className="lux-admin-input-with-suffix">
-              <input type="number" min="0" value={minimumMinutes} onChange={(event) => { setSaved(false); setMinimumMinutes(event.target.value); }} />
+              <input type="number" min="0" value={minimumMinutes} onChange={(event) => { setPlaybackSaved(false); setMinimumMinutes(event.target.value); }} />
               <em>分钟</em>
             </div>
           </label>
+          <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={savePlayback.isPending} onClick={() => savePlayback.mutate()}>
+            <Save size={16} /> {savePlayback.isPending ? "保存中…" : "保存播放行为"}
+          </button>
+        </div>
+        {playbackSaved ? <p className="lux-settings-saved"><Check size={15} /> 播放行为已保存</p> : null}
+        {savePlayback.error ? <p className="lux-error-copy">{savePlayback.error.message}</p> : null}
+      </section>
+
+      <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="library-display-heading">
+        <div className="lux-admin-panel-heading">
+          <div><h2 id="library-display-heading">媒体库显示</h2></div>
+          <Settings2 size={20} className="lux-admin-panel-icon" />
+        </div>
+        <div className="lux-admin-settings-form">
           <label className="lux-admin-toggle">
             <input
               type="checkbox"
               aria-label="显示媒体库待确认标记"
               checked={showMetadataPending}
               onChange={(event) => {
-                setSaved(false);
+                setLibraryDisplaySaved(false);
                 setShowMetadataPending(event.target.checked);
               }}
             />
@@ -153,19 +186,19 @@ export function AdminSettingsPage() {
               aria-label="媒体库顺序强制按照管理员排序"
               checked={forceAdminLibraryOrder}
               onChange={(event) => {
-                setSaved(false);
+                setLibraryDisplaySaved(false);
                 setForceAdminLibraryOrder(event.target.checked);
               }}
             />
             <span>媒体库顺序强制按照管理员排序</span>
           </label>
           <small>开启后，普通用户只能按照管理员保存的媒体库顺序浏览。</small>
-          <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={save.isPending} onClick={() => save.mutate()}>
-            <Save size={16} /> {save.isPending ? "保存中…" : "保存设置"}
+          <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={saveLibraryDisplay.isPending} onClick={() => saveLibraryDisplay.mutate()}>
+            <Save size={16} /> {saveLibraryDisplay.isPending ? "保存中…" : "保存媒体库显示"}
           </button>
         </div>
-        {saved ? <p className="lux-settings-saved"><Check size={15} /> 设置已保存</p> : null}
-        {save.error ? <p className="lux-error-copy">{save.error.message}</p> : null}
+        {libraryDisplaySaved ? <p className="lux-settings-saved"><Check size={15} /> 媒体库显示设置已保存</p> : null}
+        {saveLibraryDisplay.error ? <p className="lux-error-copy">{saveLibraryDisplay.error.message}</p> : null}
       </section>
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="login-background-heading">
