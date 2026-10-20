@@ -1,3 +1,4 @@
+import { GeneratedCover, type GeneratedCoverKind } from "../../components/GeneratedCover";
 import { Folder, LoaderCircle } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
 
@@ -97,16 +98,34 @@ export function EpisodeCount({ item }: { item: MediaItem }) {
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
 }
 
+function generatedCoverKind(item: MediaItem): GeneratedCoverKind {
+  // 动画暂时并入剧集：等有了 TMDB genre 16 的数据再细分。
+  return item.itemType === "MOVIE" ? "movie" : "series";
+}
+
 export function MediaPlaceholder({ item }: { item: MediaItem }) {
   const pending = item.localMetadataPending === true;
+  if (item.itemType === "FOLDER") {
+    return (
+      <div className="lux-media-placeholder">
+        <Folder size={30} aria-hidden="true" />
+        <span>{mediaTitle(item)}</span>
+      </div>
+    );
+  }
+  // 没有海报时画一张：比灰底占位更容易辨认，也不依赖网络。
   return (
-    <div className="lux-media-placeholder">
-      {item.itemType === "FOLDER" ? <Folder size={30} aria-hidden="true" /> : pending ? (
+    <div className="lux-media-placeholder is-generated">
+      <GeneratedCover
+        title={mediaTitle(item)}
+        year={item.productionYear}
+        kind={generatedCoverKind(item)}
+      />
+      {pending ? (
         <span className="lux-media-placeholder-status" role="status" aria-label="正在读取本地海报和元数据">
           <LoaderCircle className="lux-media-placeholder-spinner" size={24} aria-hidden="true" />
         </span>
       ) : null}
-      <span>{mediaTitle(item)}</span>
     </div>
   );
 }

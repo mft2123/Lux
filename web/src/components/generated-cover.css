@@ -75,3 +75,8 @@
   font-size: .62rem;
   line-height: 1.5;
 }
+
+/* 落在原有占位容器里时撑满整块，并把加载指示叠在上面 */
+.lux-media-placeholder.is-generated { position: relative; display: block; padding: 0; background: transparent; }
+.lux-media-placeholder.is-generated > .lux-generated-cover { position: absolute; inset: 0; }
+.lux-media-placeholder.is-generated .lux-media-placeholder-status { position: absolute; inset: 0; display: grid; place-items: center; }
