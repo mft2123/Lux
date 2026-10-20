@@ -7,7 +7,8 @@
 
 ## 1. 交接状态（2026-10-20）
 
-**主干 `fork/phase-a` = `db715202`，镜像 `lux:phase-a` = `ac86c13c76e0`，测试容器 `lux-testlib`（8099）healthy。**
+**主干 `fork/phase-a` 的代码基线 = `db715202`（本文档提交在这之上），镜像 `lux:phase-a` = `ac86c13c76e0`，
+测试容器 `lux-testlib`（8099）healthy。**
 
 已完成并合并：归档流水线（含剧集按季）、设置页、Telegram 通知、Telegram 旁挂（代码层）、链接队列、
 运维修复工具、**115 转存（U11：Lux 转存阶段 + `sidecar/transfer115` 侧车 + 设置页分组）**。
