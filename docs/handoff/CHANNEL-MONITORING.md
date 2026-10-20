@@ -12,7 +12,7 @@
 | `follow` | 追更 | 剧集、已订阅且命中订阅列表时，补入缺季缺集 |
 | `full` | 全量 | **允许入新+追更+洗版全部动作**（不是「无条件全投」） |
 | `remux` | 洗版 | 库里已有，且新版本质量确实更好时才替换 |
-| `manual` | 手动 | 只登记，不自动投递；由管理员 `replay` 触发 |
+| `manual` | 手动 | **派生值，不是独立开关**：其余四个都为 false 时才为 true（daquan `normalizeTelegramChannelModes`） |
 
 ## 2. 数据模型
 
@@ -29,6 +29,23 @@ telegram: {
 - `id` 用 Telethon 的 `dialog.id`（负数），不用标题做键（标题会改）。
 - 旧配置 `listen_channels: ["@x"]` + `listen_mode: "全量"` 迁移为 `channels[{id:"@x", modes:{full:true}}]`；
   `listen_channels` 与 `listen_mode` 保留读取（兼容），写回后以 `channels` 为准。
+
+## 2.1 频道记录（照抄 daquan `channelFromDialog`）
+
+```js
+id:         "telegram:<去掉 -100 前缀的 id>"   // 稳定键，标题可改
+telegramId: entity.id || dialog.id            // 原始负 id
+username:   去掉 @ 的用户名
+title:      dialog.title || name || entity.title || username || "未命名频道"
+enabled:    true                              // 新发现默认监控
+modes:      normalizeTelegramChannelModes()   // 全 false → manual=true
+```
+
+- 只取 `dialog.isChannel && dialog.entity`（**不含群组**）。
+- `getDialogs({})` 必须包 60s 超时；失败即断开重连，否则一次卡死会拖住整个旁挂。
+- 匹配用 `id | telegramId | username` 三者任一（daquan `channelMatches`）。
+- 每频道另有游标状态：`{ initialized, lastMessageId, lastRunAt, lastStatus, lastError, transferredCount }`
+  —— 靠 `lastMessageId` 增量，**不是靠时间戳**，重跑不会重复处理（daquan `normalizeChannelAutomation`）。
 
 ## 3. 判定矩阵（逐个文件决策，不是整条消息）
 
