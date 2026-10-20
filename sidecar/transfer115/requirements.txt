@@ -1,5 +1,11 @@
-# The sidecar deliberately depends on exactly one runtime library: p115client
+﻿# The sidecar deliberately depends on exactly one runtime library: p115client
 # carries the 115 web API (cookie login, share snap/receive, folder listing and
 # creation). Its own transitive dependencies are resolved by pip at build time;
-# the pin below is the API surface this sidecar is written against.
+# the pins below are the API surface this sidecar is written against.
+#
+# python-asynctools is pinned because p115client only asks for >=0.1.4, and the
+# 0.2.2 that resolves today does not export `to_list` (p115client imports it at
+# module load, so the sidecar dies at start-up). 0.1.4 is the version the
+# known-good runtime ships.
 p115client==0.0.9.4
+python-asynctools==0.1.4

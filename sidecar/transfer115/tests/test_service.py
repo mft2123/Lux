@@ -97,6 +97,24 @@ class ParseShareLinkTests(unittest.TestCase):
         self.assertEqual(link.share_code, "sw999")
         self.assertEqual(link.receive_code, "1234")
 
+    def test_password_with_poster_note_is_trimmed(self):
+        # Real-world paste: the sharer appended a note after the code, and the
+        # note arrives percent-encoded inside the password parameter.
+        url = (
+            "https://115cdn.com/s/sws1yeb3wt5?password=x3c1"
+            "%EF%BC%8C%E8%AF%B7%E5%8F%8A%E6%97%B6%E6%A3%80%E6%9F%A5"
+            "%E7%BD%91%E7%9B%98%E7%8A%B6%E5%86%B5%E6%88%96%E8%80%85"
+            "cookie%E6%98%AF%E5%90%A6%E9%A3%8E%E6%8E%A7%E6%88%96%E8%80%85"
+            "%E6%9C%89%E6%95%88%EF%BC%81"
+        )
+        link = parse_share_link(url)
+        self.assertEqual(link.share_code, "sws1yeb3wt5")
+        self.assertEqual(link.receive_code, "x3c1")
+
+    def test_password_without_ascii_token_is_empty(self):
+        link = parse_share_link("https://115.com/s/sw123abc?password=%E8%AF%B7%E6%A3%80%E6%9F%A5")
+        self.assertEqual(link.receive_code, "")
+
     def test_rejects_other_hosts_and_paths(self):
         self.assertIsNone(parse_share_link("https://example.com/s/sw123"))
         self.assertIsNone(parse_share_link("https://115.com/file/sw123"))

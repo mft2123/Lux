@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
@@ -31,6 +32,11 @@ SHARE_HOSTS = frozenset({"115.com", "115cdn.com", "anxia.com", "115.link", "115.
 
 #: Query parameters 115 uses for the receive code (share password).
 RECEIVE_CODE_KEYS = ("password", "pwd", "receive_code")
+
+#: The receive code is a short ASCII token. Share links are routinely copied
+#: together with the poster's note (``?password=x3c1，请及时检查…``), so the query
+#: value can carry trailing prose that must not be sent to 115.
+RECEIVE_CODE_TOKEN = re.compile(r"[A-Za-z0-9]+")
 
 
 class TransferRejected(Exception):
@@ -85,7 +91,8 @@ def parse_share_link(url: str) -> ShareLink | None:
     for key in RECEIVE_CODE_KEYS:
         values = query.get(key)
         if values and values[0]:
-            receive_code = values[0]
+            match = RECEIVE_CODE_TOKEN.match(values[0].strip())
+            receive_code = match.group(0) if match else ""
             break
     return ShareLink(share_code=share_code, receive_code=receive_code)
 

@@ -3811,6 +3811,12 @@ struct TransferOutcome {
     reason: String,
 }
 
+/// Hosts that serve 115 share links. Mirrors `SHARE_HOSTS` in
+/// `sidecar/transfer115/transfer115/service.py`: the share code is the same and
+/// 115 hands out `115cdn.com` / `anxia.com` links as often as `115.com` ones, so
+/// both halves must agree on what counts as a 115 share.
+const SHARE_LINK_HOSTS: [&str; 4] = ["115cdn.com", "anxia.com", "115.link", "115.com.cn"];
+
 /// Only 115 share links go to the transfer sidecar; magnet / ed2k are queued
 /// but parked as `unsupported` until 115 cloud download lands.
 fn is_115_share_link(url: &str) -> bool {
@@ -3827,7 +3833,7 @@ fn is_115_share_link(url: &str) -> bool {
         .split(':')
         .next()
         .unwrap_or_default();
-    host == "115.com" || host.ends_with(".115.com")
+    host == "115.com" || host.ends_with(".115.com") || SHARE_LINK_HOSTS.contains(&host)
 }
 
 /// One-line description of a reqwest failure for the pause reason. The URL is
@@ -5298,6 +5304,10 @@ mod tests {
         assert!(is_115_share_link("http://115.com/s/abc"));
         assert!(is_115_share_link("https://user:pass@115.com/s/abc"));
         assert!(is_115_share_link("https://sub.115.com/s/abc"));
+        // The front ends 115 actually hands out in share text.
+        assert!(is_115_share_link("https://115cdn.com/s/sws1yeb3wt5?password=x3c1"));
+        assert!(is_115_share_link("https://anxia.com/s/abc"));
+        assert!(is_115_share_link("https://115.link/s/abc"));
         assert!(!is_115_share_link("https://evil.com/115.com/s/abc"));
         assert!(!is_115_share_link("https://115.com.evil.com/x"));
         assert!(!is_115_share_link("magnet:?xt=urn:btih:abc"));

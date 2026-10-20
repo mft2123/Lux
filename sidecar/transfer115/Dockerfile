@@ -7,9 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# The 115 client library and its transitive dependencies.
+# The 115 client library and its transitive dependencies. The index is a build
+# argument because pypi.org itself is unreachable from the deployment LAN; the
+# default is the Tsinghua mirror, and `--build-arg PIP_INDEX_URL=...` overrides it.
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --index-url "$PIP_INDEX_URL" -r requirements.txt
 
 COPY transfer115 ./transfer115
 COPY main.py .
