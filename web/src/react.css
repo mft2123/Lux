@@ -1060,6 +1060,31 @@ html[data-lux-accent="silver"] .lux-button-primary:hover { background: #fff; }
 .lux-admin-panel-icon { color: var(--lux-subtle); }
 .lux-status-pill { padding: 6px 10px; border-radius: 999px; font-size: .7rem; }
 .lux-status-pill.is-ok { color: #a5e4bd; background: rgba(96, 194, 132, .13); }
+/* 浅色主题可读性：后台标题/图标按钮写死了 #fff，输入框写死了深色透明底，
+   在白底上会看不见或看不清；这里一律回退到主题变量。 */
+html[data-lux-theme="light"] .lux-admin-panel-heading h2,
+html[data-lux-theme="light"] .lux-admin-page-heading h1,
+html[data-lux-theme="light"] .lux-archive-settings-group > h3,
+html[data-lux-theme="light"] .lux-admin-page h1,
+html[data-lux-theme="light"] .lux-admin-page h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-icon-button { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-icon-button:hover { background: rgba(28,28,34,.07); }
+html[data-lux-theme="light"] .lux-admin-settings-form input:not([type="checkbox"]):not([type="radio"]),
+html[data-lux-theme="light"] .lux-admin-settings-form textarea,
+html[data-lux-theme="light"] .lux-admin-settings-form select,
+html[data-lux-theme="light"] .lux-archive-settings-group input:not([type="checkbox"]):not([type="radio"]),
+html[data-lux-theme="light"] .lux-archive-settings-group textarea,
+html[data-lux-theme="light"] .lux-archive-settings-group select {
+  color: var(--lux-text);
+  background: rgba(28,28,34,.04);
+  border-color: var(--lux-line-soft);
+}
+html[data-lux-theme="light"] .lux-archive-settings-status,
+html[data-lux-theme="light"] .lux-archive-settings-fieldset {
+  border-color: var(--lux-line-soft);
+  background: rgba(28,28,34,.035);
+}
+
 .lux-status-pill.is-warn { color: #f3c788; background: rgba(226, 163, 75, .13); }
 .lux-admin-page-state { display: grid; place-items: center; align-content: center; min-height: 65vh; color: var(--lux-muted); text-align: center; }
 .lux-admin-page-state h1 { margin: 12px 0 8px; color: #fff; }
