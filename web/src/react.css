@@ -133,12 +133,26 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-select-chevron { flex: 0 0 auto; color: var(--lux-subtle); transition: transform .2s var(--lux-ease), color .2s ease; }
 .lux-select-chevron.is-open { color: var(--lux-text); transform: rotate(180deg); }
 .lux-select-menu { position: fixed; z-index: 1000; display: grid; gap: 2px; overflow-y: auto; padding: 5px; border: 1px solid var(--lux-line); border-radius: 10px; color: var(--lux-text); background: rgba(21,21,25,.98); box-shadow: 0 18px 50px rgba(0,0,0,.3), 0 2px 7px rgba(0,0,0,.2); backdrop-filter: blur(20px); animation: lux-select-pop .16s var(--lux-ease); }
-.lux-select-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-width: 0; min-height: 34px; padding: 0 var(--lux-control-padding-x); border: 0; border-radius: 7px; color: var(--lux-muted); background: transparent; font-size: .78rem; text-align: left; transition: color .16s ease, background .16s ease; }
+.lux-select-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; min-width: 0; min-height: 34px; padding: 0 var(--lux-control-padding-x); border: 0; border-radius: 7px; color: var(--lux-text); background: transparent; font-size: .78rem; text-align: left; transition: color .16s ease, background .16s ease; }
 .lux-select-option:hover:not(:disabled), .lux-select-option.is-active:not(:disabled) { color: #fff; background: rgba(255,255,255,.1); }
 .lux-select-option[aria-selected="true"] { color: #fff; }
 .lux-select-option:disabled { color: var(--lux-subtle); cursor: not-allowed; }
 .lux-select-option-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lux-select-option-check { flex: 0 0 auto; color: var(--lux-accent); }
+
+/* 原生 <select> 的弹层由系统绘制，不继承页面背景：不显式给 option 定色时，
+   深色主题下会出现「白字白底 / 灰字灰底」，选项看起来是空的。
+   自定义下拉（.lux-select-option）已在上方按主题取色，这里只兜底原生控件。 */
+html[data-lux-theme="dark"] select option,
+html[data-lux-theme="dark"] select optgroup {
+  color: #f5f5f5;
+  background-color: #151519;
+}
+html[data-lux-theme="light"] select option,
+html[data-lux-theme="light"] select optgroup {
+  color: #18181b;
+  background-color: #ffffff;
+}
 @keyframes lux-select-pop { from { opacity: 0; transform: translateY(-4px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 
 .lux-app { min-height: 100vh; overflow: clip; background: var(--lux-bg); }
