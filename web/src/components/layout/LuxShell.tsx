@@ -3,15 +3,23 @@ import {
   Home,
   Library,
   Menu,
+  Moon,
   Search,
   Settings2,
+  Sun,
   X,
 } from "lucide-react";
 import { createContext, useContext, useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
-import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
+import {
+  applyAccountAccent,
+  applyAccountTheme,
+  readAccountSettings,
+  saveAccountSettings,
+  type LuxTheme,
+} from "../../features/account/account-settings";
 import { ScanActivityPopover } from "../../features/activity/ScanActivityPopover";
 import { SseConnectionContext, useUserEvents } from "../../features/activity/useUserEvents";
 import { LuxLogo } from "../LuxLogo";
@@ -46,6 +54,8 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(() => api.avatarUrl());
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
+  // Mirrored here so the header button can flip it without a round trip.
+  const [theme, setTheme] = useState<LuxTheme>(() => readAccountSettings(user.id).theme);
   const isDetail = location.pathname.startsWith("/libraries/")
     || location.pathname.startsWith("/items/")
     || location.pathname.startsWith("/people/");
@@ -55,7 +65,17 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
     const settings = readAccountSettings(user.id);
     applyAccountTheme(settings.theme);
     applyAccountAccent(settings.accentColor);
+    setTheme(settings.theme);
   }, [user.id]);
+
+  /** 顶栏的日/月按钮：与「账户 → 外观」写的是同一份设备偏好。 */
+  function toggleTheme() {
+    const current = readAccountSettings(user.id);
+    const next: LuxTheme = current.theme === "dark" ? "light" : "dark";
+    saveAccountSettings({ ...current, theme: next }, user.id);
+    applyAccountTheme(next);
+    setTheme(next);
+  }
 
   useEffect(() => {
     setAvatarUrl(api.avatarUrl());
@@ -111,6 +131,15 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
 
           <div className="lux-header-actions">
             {user.canManageServer ? <ScanActivityPopover /> : null}
+            <button
+              className="lux-icon-button"
+              type="button"
+              aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+              title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
+              onClick={toggleTheme}
+            >
+              {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+            </button>
             <button
               className="lux-user-button"
               type="button"

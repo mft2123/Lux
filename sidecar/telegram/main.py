@@ -27,7 +27,7 @@ if __package__ in (None, ""):  # 允许 `python /app/main.py` 直接跑
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tgwatch import config as config_mod
-from tgwatch import filters, logsafe, runner, sink as sink_mod, store as store_mod
+from tgwatch import filters, health, logsafe, runner, sink as sink_mod, store as store_mod
 
 log = logging.getLogger("tgwatch")
 
@@ -42,7 +42,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", default=None, help="覆盖 LUX_TG_LOG_LEVEL")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("run", help="常驻监听（首次运行会走登录流程）")
+    run = sub.add_parser("run", help="常驻监听（首次运行会走登录流程）")
+    # Lux 的「测试连接」和容器 healthcheck 都打这个端点；0 表示不监听。
+    run.add_argument(
+        "--health-port",
+        type=int,
+        default=int(os.environ.get("LUX_TG_HEALTH_PORT", "0") or 0),
+        help="监听 HTTP /healthz 的端口（默认 $LUX_TG_HEALTH_PORT，未设为 0 = 关闭）",
+    )
     sub.add_parser("status", help="打印配置（打码）与状态库统计")
     check = sub.add_parser("check", help="校验配置是否就绪；--deep 额外验 Telegram 登录态")
     check.add_argument(
@@ -213,7 +220,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "held":
             return _cmd_held(config, args.limit, args.channel)
         if args.command == "run":
-            asyncio.run(_run_with_signals(runner.run(config)))
+            # Started before the worker so Lux can probe during the first login.
+            server = health.serve(config, getattr(args, "health_port", 0))
+            if server is not None:
+                log.info("health endpoint on %s", server.server_address)
+            try:
+                asyncio.run(_run_with_signals(runner.run(config)))
+            finally:
+                if server is not None:
+                    server.shutdown()
             return 0
         if args.command == "replay":
             return asyncio.run(_cmd_replay(config, args))

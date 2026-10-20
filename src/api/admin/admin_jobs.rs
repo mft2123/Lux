@@ -56,6 +56,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_archive_transfer115_probe),
         )
         .route(
+            "/api/v1/admin/archive/telegram/probe",
+            post(admin_archive_telegram_probe),
+        )
+        .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
         )
@@ -1480,6 +1484,88 @@ pub(crate) async fn admin_archive_transfer115_probe(
         }))
         .into_response(),
     }
+}
+
+/// `GET {base}/healthz?deep=1` from the server, for sidecars the page cannot
+/// reach (they live on the docker network). The answer is passed through with
+/// the sidecar's own status word, so both probes render the same states.
+async fn probe_sidecar_health(base: &str) -> serde_json::Value {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return serde_json::json!({
+                "ok": false,
+                "status": "failed",
+                "detail": format!("无法创建 HTTP 客户端: {error}"),
+            })
+        }
+    };
+    match client
+        .get(format!("{base}/healthz?deep=1"))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let http_status = response.status();
+            let payload: serde_json::Value = response
+                .json()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let status = payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let detail = payload
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let ok = http_status.is_success()
+                && payload
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            serde_json::json!({
+                "ok": ok,
+                "status": if status.is_empty() {
+                    format!("http_{}", http_status.as_u16())
+                } else {
+                    status
+                },
+                "detail": detail,
+                "sidecar": base,
+            })
+        }
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "status": "unreachable",
+            "detail": format!("连不上侧车 {base}: {error}"),
+            "sidecar": base,
+        }),
+    }
+}
+
+/// Probe the Telegram userbot sidecar. Its address is deployment topology rather
+/// than a user setting, so it comes from `LUX_TG_SIDECAR_BASE` (default: the
+/// compose service name). A deep probe makes the sidecar ask Telegram whether the
+/// session is still authorized.
+pub(crate) async fn admin_archive_telegram_probe(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let base = std::env::var("LUX_TG_SIDECAR_BASE")
+        .unwrap_or_else(|_| "http://telegram:8091".to_owned());
+    let base = base.trim().trim_end_matches('/').to_owned();
+    Json(probe_sidecar_health(&base).await).into_response()
 }
 
 pub(crate) async fn admin_archive_run(    headers: HeaderMap,

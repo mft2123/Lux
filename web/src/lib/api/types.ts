@@ -1182,6 +1182,9 @@ export type ArchiveTransfer115Probe = {
   sidecar?: string;
 };
 
+/** Same answer shape from the Telegram userbot sidecar's `/healthz`. */
+export type ArchiveTelegramProbe = ArchiveTransfer115Probe;
+
 export type ArchiveSettings = {
   tmdb_api_key: string;
   watch_dirs: string[];

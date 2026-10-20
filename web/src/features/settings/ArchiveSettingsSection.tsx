@@ -213,6 +213,7 @@ export function ArchiveSettingsSection() {
   // Probing has to happen on the server: the sidecar sits on the docker network,
   // so only `luxd` can reach it.
   const probe = useMutation({ mutationFn: () => api.probeTransfer115() });
+  const tgProbe = useMutation({ mutationFn: () => api.probeTelegram() });
 
   function update<Key extends keyof ArchiveSettingsDraft>(
     key: Key,
@@ -223,6 +224,7 @@ export function ArchiveSettingsSection() {
     // A "连接正常" badge must not outlive the edit that changed the address or
     // the cookie it was earned with.
     if (key === "transferCookie" || key === "transferSidecar") probe.reset();
+    if (key === "apiId" || key === "apiHash" || key === "phone") tgProbe.reset();
     setDraft((current) => ({ ...current, [key]: value }));
   }
 
@@ -663,6 +665,54 @@ export function ArchiveSettingsSection() {
             busy={save.isPending && save.variables === "listen"}
             feedback={feedback.listen}
             onSave={() => save.mutate("listen")}
+            extra={
+              <>
+                <button
+                  className="lux-button lux-button-secondary"
+                  type="button"
+                  disabled={tgProbe.isPending || save.isPending}
+                  onClick={() => tgProbe.mutate()}
+                >
+                  {tgProbe.isPending ? (
+                    <Loader2 size={16} className="lux-spin" />
+                  ) : (
+                    <Activity size={16} />
+                  )}
+                  {tgProbe.isPending ? "测试中…" : "测试连接"}
+                </button>
+                {tgProbe.isPending ? (
+                  <span className="lux-network-proxy-status" role="status">
+                    <Loader2 size={15} className="lux-spin" /> 正在连接旁挂并校验 Telegram 会话…
+                  </span>
+                ) : null}
+                {!tgProbe.isPending && tgProbe.data ? (
+                  tgProbe.data.status === "logged_in" ? (
+                    <span className="lux-settings-saved" role="status" aria-live="polite">
+                      <Check size={15} /> {describeTelegramProbe(tgProbe.data)}
+                    </span>
+                  ) : tgProbe.data.status === "configured" ||
+                    tgProbe.data.status === "unconfigured" ? (
+                    <span
+                      className="lux-login-background-warning"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <AlertCircle size={15} /> {describeTelegramProbe(tgProbe.data)}
+                    </span>
+                  ) : (
+                    <span className="lux-error-copy" role="status" aria-live="polite">
+                      <AlertCircle size={15} /> {describeTelegramProbe(tgProbe.data)}
+                    </span>
+                  )
+                ) : null}
+                {!tgProbe.isPending && tgProbe.error ? (
+                  <span className="lux-error-copy" role="status" aria-live="polite">
+                    <AlertCircle size={15} />
+                    {tgProbe.error instanceof Error ? tgProbe.error.message : "测试连接失败"}
+                  </span>
+                ) : null}
+              </>
+            }
           />
         </div>
 
@@ -884,6 +934,23 @@ function describeProbe(result: ArchiveTransfer115Probe): string {
       return "连不上侧车，检查地址是否正确、容器是否在运行。";
     default:
       return `侧车返回：${result.status}${result.detail ? `（${result.detail}）` : ""}`;
+  }
+}
+
+function describeTelegramProbe(result: ArchiveTransfer115Probe): string {
+  switch (result.status) {
+    case "logged_in":
+      return "连接正常：旁挂在线，Telegram 会话已登录。";
+    case "configured":
+      return "旁挂在线，配置完整；未做深度校验，登录态未知。";
+    case "auth_required":
+      return "旁挂在线，但 Telegram 会话未登录或已失效，请在旁挂机器上重新登录。";
+    case "unconfigured":
+      return `旁挂配置不完整：${result.detail || "缺少 API ID / API Hash / 手机号"}`;
+    case "unreachable":
+      return "连不上旁挂（默认 http://telegram:8091，可用 LUX_TG_SIDECAR_BASE 指定）。";
+    default:
+      return `旁挂返回：${result.status}${result.detail ? `（${result.detail}）` : ""}`;
   }
 }
 
