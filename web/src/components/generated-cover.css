@@ -1,0 +1,77 @@
+/* 无海报条目的自动封面：纯本地绘制（渐变 + 片名首字），不请求网络。
+   颜色按类型区分：电影偏酒红、剧集偏藏蓝、动画偏紫。 */
+.lux-generated-cover {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  width: 100%;
+  height: 100%;
+  aspect-ratio: 2 / 3;
+  overflow: hidden;
+  border-radius: inherit;
+  color: #fff;
+  isolation: isolate;
+}
+
+.lux-generated-cover.is-movie { background: linear-gradient(160deg, #7a2230 0%, #33121a 55%, #150a0d 100%); }
+.lux-generated-cover.is-series { background: linear-gradient(160deg, #22406a 0%, #142235 55%, #0a1119 100%); }
+.lux-generated-cover.is-anime { background: linear-gradient(160deg, #4d2a72 0%, #2a1740 55%, #140d1c 100%); }
+
+/* 每部作品偏移一点，避免整墙封面看起来一模一样 */
+.lux-generated-cover .lux-generated-cover-glow {
+  position: absolute;
+  inset: -25%;
+  z-index: -1;
+  background: radial-gradient(circle at 30% 18%, rgba(255, 255, 255, .22), transparent 55%);
+  transform: rotate(calc(var(--cover-shift, 0) * 1deg));
+}
+
+.lux-generated-cover .lux-generated-cover-initials {
+  position: absolute;
+  top: 8%;
+  right: 8%;
+  color: rgba(255, 255, 255, .16);
+  font-size: clamp(2.4rem, 28%, 5rem);
+  font-weight: 800;
+  letter-spacing: -.04em;
+  line-height: 1;
+  pointer-events: none;
+  user-select: none;
+}
+
+.lux-generated-cover .lux-generated-cover-footer {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px 12px;
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, .55));
+}
+
+.lux-generated-cover .lux-generated-cover-footer strong {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #fff;
+  font-size: .82rem;
+  font-weight: 650;
+  line-height: 1.25;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.lux-generated-cover .lux-generated-cover-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, .72);
+  font-size: .68rem;
+}
+
+.lux-generated-cover .lux-generated-cover-meta em { font-style: normal; }
+.lux-generated-cover .lux-generated-cover-meta i {
+  padding: 1px 6px;
+  border: 1px solid rgba(255, 255, 255, .28);
+  border-radius: 999px;
+  font-style: normal;
+  font-size: .62rem;
+  line-height: 1.5;
+}
