@@ -115,3 +115,9 @@
 - 归档 F1（上一轮）：两季包 → 一季入库、一季进重复目录，镜像 strm 指向正确。
 
 未覆盖：旁挂的真 Telegram 登录与投递（没有测试账号凭据），已用离线 207 用例 + stub Lux 契约覆盖。
+
+## U11 验收（2026-10-20）
+
+- 真实 115 cookie 端到端通过：转存 → `转存目录` → CD2 可见 → `待整理`；坏 cookie → `auth_required` 且作业留队。
+- 修掉 3 个挡路 bug（`115cdn` 主机、密码尾部说明、auth 判定），侧车依赖钉 `python-asynctools==0.1.4`。
+- 证据：`docs/handoff/U11-ACCEPTANCE-2026-10-20.md`；镜像 `lux:phase-a` = `5aaa2f1ef7fa`。

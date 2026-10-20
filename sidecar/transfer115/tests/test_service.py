@@ -176,6 +176,45 @@ class TransferTests(unittest.TestCase):
         receive = [call for call in client.calls if call[0] == "share_receive"][0][1]
         self.assertEqual(receive["cid"], "8")
 
+    def test_recognises_115_native_directory_shape(self):
+        # What 115's own /files listing returns: a folder has ``cid`` and no
+        # ``fid``; a file has ``fid`` and its ``cid`` is the parent (often "0").
+        # There is no ``is_dir`` key at all.
+        client = FakeClient(
+            snap_items=[{"fid": "11", "n": "某剧"}],
+            children={
+                "0": [{"cid": "7", "n": "测试库", "pid": "0"}],
+                "7": [{"cid": "8", "n": "转存目录", "pid": "7"}],
+            },
+        )
+        result = self.build(client).transfer(job())
+
+        self.assertEqual(result.status, STATUS_TRANSFERRED)
+        self.assertFalse([call for call in client.calls if call[0] == "fs_mkdir"])
+        receive = [call for call in client.calls if call[0] == "share_receive"][0][1]
+        self.assertEqual(receive["cid"], "8")
+
+    def test_file_with_the_target_name_is_not_taken_for_a_directory(self):
+        # A stray *file* called 测试库 sits next to the real folder: it must be
+        # skipped (its ``cid`` is the parent, so trusting it would walk into the
+        # wrong tree), and the existing folder must be used without mkdir.
+        client = FakeClient(
+            snap_items=[{"fid": "11", "n": "某剧"}],
+            children={
+                "0": [
+                    {"cid": "0", "fid": "99", "n": "测试库"},
+                    {"cid": "7", "n": "测试库"},
+                ],
+                "7": [{"cid": "7b", "n": "转存目录"}],
+            },
+        )
+        result = self.build(client).transfer(job())
+
+        self.assertEqual(result.status, STATUS_TRANSFERRED)
+        self.assertFalse([call for call in client.calls if call[0] == "fs_mkdir"])
+        receive = [call for call in client.calls if call[0] == "share_receive"][0][1]
+        self.assertEqual(receive["cid"], "7b")
+
     def test_multiple_root_items_are_received_together(self):
         client = FakeClient(
             snap_items=[
@@ -192,9 +231,34 @@ class TransferTests(unittest.TestCase):
     def test_dead_cookie_is_auth_required(self):
         client = FakeClient(login_error=P115AuthenticationError("expired"))
         result = self.build(client).transfer(job())
-
         self.assertEqual(result.status, STATUS_AUTH_REQUIRED)
         self.assertIn("cookie", result.detail)
+
+    def test_login_status_false_is_auth_required(self):
+        # p115client reports a dead session as the bare False, not a dict and not
+        # an exception; missing that made a lost job look like a failure.
+        class DeadClient(FakeClient):
+            def login_status(self):
+                self.calls.append(("login_status",))
+                return False
+
+        client = DeadClient(snap_items=[{"file_id": 11, "file_name": "某剧"}])
+        result = self.build(client).transfer(job())
+
+        self.assertEqual(result.status, STATUS_AUTH_REQUIRED)
+        self.assertFalse([call for call in client.calls if call[0] == "share_snap"])
+
+    def test_session_lost_mid_flight_is_auth_required(self):
+        # The same session death also arrives in-body on an HTTP 200.
+        client = FakeClient(snap_items=[{"file_id": 11, "file_name": "某剧"}])
+        client.fs_files = lambda payload: {
+            "state": False,
+            "errno": 990001,
+            "error": "登录超时，请重新登录。",
+        }
+        result = self.build(client).transfer(job())
+
+        self.assertEqual(result.status, STATUS_AUTH_REQUIRED)
 
     def test_api_error_is_failure(self):
         client = FakeClient(snap_error=P115Error("boom"))

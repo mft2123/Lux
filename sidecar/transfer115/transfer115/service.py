@@ -38,6 +38,10 @@ RECEIVE_CODE_KEYS = ("password", "pwd", "receive_code")
 #: value can carry trailing prose that must not be sent to 115.
 RECEIVE_CODE_TOKEN = re.compile(r"[A-Za-z0-9]+")
 
+#: errno values 115 answers with when the session is gone (``登录超时，请重新登录。``).
+#: They arrive as ``{"state": false, ...}`` on an HTTP 200, not as an exception.
+AUTH_ERRNOS = frozenset({990001})
+
 
 class TransferRejected(Exception):
     """The transfer cannot be performed; reported to Lux as ``failed``."""
@@ -157,7 +161,29 @@ def _is_dir_of(item: dict) -> bool:
         return value
     if isinstance(value, (int, float)):
         return value != 0
-    return str(value).lower() in ("1", "true", "yes")
+    if isinstance(value, str) and value:
+        return value.lower() in ("1", "true", "yes")
+    # 115's own listing does not send ``is_dir``: a folder carries ``cid`` and no
+    # ``fid``, while a file carries ``fid`` (its ``cid`` is then the parent and is
+    # often "0"). Checking ``fid`` is therefore the only reliable discriminator.
+    return not item.get("fid")
+
+
+def _raise_for_state(payload: Any) -> None:
+    """Turn 115's in-body failures into the right exception.
+
+    A dead session is reported as ``state: false`` with errno 990001 on an HTTP
+    200, and cookies that are merely invalid make ``login_status()`` return
+    ``False`` rather than raise — so every answer has to be inspected here, or a
+    lost job is reported as ``failed`` instead of being kept for a retry.
+    """
+    if not isinstance(payload, dict) or payload.get("state") is not False:
+        return
+    errno = payload.get("errno") or payload.get("errNo") or 0
+    message = str(payload.get("error") or "115 接口返回失败")
+    if errno in AUTH_ERRNOS or "登录" in message:
+        raise P115AuthenticationError(message)
+    raise TransferRejected(message)
 
 
 def _new_id_of(payload: Any) -> str:
@@ -189,8 +215,14 @@ class TransferService:
         return self._client
 
     def check_login(self, client: Any) -> None:
-        """Raise ``P115AuthenticationError`` when the cookie no longer works."""
+        """Raise ``P115AuthenticationError`` when the cookie no longer works.
+
+        ``p115client`` reports a dead session as the bare ``False`` (not a dict,
+        not an exception), which is why the truthiness check comes first.
+        """
         status = client.login_status()
+        if status is False or status is None:
+            raise P115AuthenticationError("115 登录状态已失效")
         if isinstance(status, dict):
             data = status.get("data")
             if isinstance(data, dict) and data.get("login") is False:
@@ -215,6 +247,7 @@ class TransferService:
             if _is_dir_of(item) and _name_of(item) == name:
                 return _id_of(item)
         created = client.fs_mkdir(name, pid=cid)
+        _raise_for_state(created)
         new_id = _new_id_of(created)
         if not new_id:
             raise TransferRejected(f"创建 115 目录 {name!r} 失败：接口没有返回目录 id")
@@ -222,6 +255,7 @@ class TransferService:
 
     def _list_dir(self, client: Any, cid: str) -> list[dict]:
         payload = client.fs_files({"cid": cid, "limit": self.page_size})
+        _raise_for_state(payload)
         return _items_of(payload)
 
     # -- transfer -------------------------------------------------------------
@@ -273,12 +307,13 @@ class TransferService:
             }
         )
         items = _items_of(payload)
+        _raise_for_state(payload)
         if not items:
             raise TransferRejected("分享内容为空或无法读取")
         return items
 
     def _receive(self, client: Any, link: ShareLink, file_ids: str, cid: str) -> None:
-        client.share_receive(
+        payload = client.share_receive(
             {
                 "share_code": link.share_code,
                 "receive_code": link.receive_code,
@@ -287,6 +322,7 @@ class TransferService:
                 "is_check": self.is_check,
             }
         )
+        _raise_for_state(payload)
 
     def _confirm_saved(self, client: Any, cid: str, expected: Sequence[str]) -> str:
         """Wait briefly for the share to land, so the log says what happened.

@@ -21,6 +21,7 @@
 | 侧车离线 | 21 条用例通过（Python 3.12 + p115client 0.0.9.4） |
 | 前端 | 镜像构建里的 `pnpm build`（tsc + vite）通过 |
 | 测试实例 | 设置读写、侧车被调用 + `failed` 记账、侧车不可达不丢作业，三条路径都验过 |
+| 真实 115 cookie | ✅ 转存成功、文件在 CD2 可见、坏 cookie → `auth_required` 且作业留队（`U11-ACCEPTANCE-2026-10-20.md`） |
 
 **下一步就三件**（细节见 §8）：
 
@@ -211,7 +212,7 @@ Telegram 频道 ──(Telethon 旁挂)──> Lux ingest API ──> <archive_r
   并移入 `已处理/`（本机无外网，`share_snap` 读不到内容，属于预期）；
 - `sidecar_base` 指死端口 → 作业留在队列、`状态.jsonl` 不增行、`run` 仍 200（只暂停队列阶段）。
 
-### 8.2 ★ 真实 cookie 的端到端（最高优先，唯一没验的关键路径）
+### 8.2 ✅ 真实 cookie 的端到端（2026-10-20 已通过，见 `U11-ACCEPTANCE-2026-10-20.md`）
 
 环境要求：**能访问 115 的机器**（这台 NAS 没外网；测试可以在用户的生产机/能上网的容器里做）。
 
@@ -274,8 +275,10 @@ Telethon 旁挂 207 条离线用例已过，但**从未用真实凭据登录/投
 8. **chill 闭源**：只有 `.so`/`.pyc`，115 逻辑靠 `p115client` 的行为反推。
 9. **容器日志可能不滚动到 stdout**（`/config/logs` 有文件）；排查时看 `docker logs` 也看配置文件目录。
 10. **测试容器的 DB/元数据属 root**：读写要 `docker run --user 0 -v …:/config`，不要在宿主机直接读。
-11. **NAS 没有外网**：`pip install` / `docker pull` / PyPI 都不通；`docker build` 能成功是因为
-    `Dockerfile.custom` 里写死了 npmmirror 的 npm 源、cargo 走本地缓存。所以侧车镜像只能在上网环境构建。
+11. **NAS 不是「没有外网」，是「到某些域名不通」**（2026-10-20 实测）：`115.com` / `webapi.115.com` /
+    `115cdn.com` 与清华、阿里 pip 镜像都是 200；只有 `pypi.org` 和 `registry-1.docker.io` 直连不通。
+    所以侧车镜像**可以在这台 NAS 上构建**：基础镜像走 `docker.m.daocloud.io/library/python:3.12-slim`，
+    pip 走 `PIP_INDEX_URL`（默认清华源）。不要再按「必须去外网构建」处理。
 12. **宿主 Python 是 3.11，而 `p115client` 要求 ≥3.12**：在 NAS 上跑侧车测试要用 chill 镜像
     （`docker run --entrypoint python -v … chillne/cinechill:latest -m unittest …`），不要试图用宿主 venv。
 13. **`unittest discover` 要求 `tests/` 是包**：没有 `tests/__init__.py` 会报
