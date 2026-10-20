@@ -66,6 +66,15 @@ def make_handler(config: config_mod.SidecarConfig) -> type[BaseHTTPRequestHandle
 
         def do_GET(self) -> None:  # noqa: N802 - http.server API
             parsed = urlparse(self.path)
+            if parsed.path == "/channels":
+                # 设置页「刷新频道列表」：把账号里的频道交给 Lux，由它渲染勾选界面。
+                try:
+                    channels = asyncio.run(runner.list_channels(config))
+                except Exception as error:  # noqa: BLE001 - 探针式接口不抛栈
+                    self._send(503, {"ok": False, "channels": [], "detail": str(error)})
+                    return
+                self._send(200, {"ok": True, "channels": channels})
+                return
             if parsed.path != "/healthz":
                 self._send(404, {"ok": False, "status": "not_found", "detail": ""})
                 return
