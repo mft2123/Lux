@@ -401,8 +401,8 @@ def runtime_warnings(config: SidecarConfig) -> list[str]:
 def runtime_problems(config: SidecarConfig) -> list[str]:
     """`check` 用：硬错误（healthcheck 靠它返回非零）。"""
     problems: list[str] = []
-    if not config.channels:
-        problems.append("telegram.listen_channels 为空")
+    # 频道为空不是硬错误：设置页要先能列出账号里的频道，才有了勾选的前提。
+    # 空配置下侧车空转（/healthz、/channels 仍可用），由 runtime_warnings 提示。
     if not config.session_path.exists():
         problems.append(f"session 不存在（{config.session_path}）：等首次登录完成")
     if config.sink == SINK_HTTP and not config.api_key:
