@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Check, Loader2, Save, Settings2 } from "lucide-react";
+import { Activity, AlertCircle, Check, CheckCircle2, Loader2, Save, Settings2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../../lib/api/client";
@@ -157,7 +157,8 @@ const EMPTY_FEEDBACK: SectionFeedbackMap = {
   transfer: { phase: "idle" },
 };
 
-export function ArchiveSettingsSection() {  const queryClient = useQueryClient();
+export function ArchiveSettingsSection() {
+  const queryClient = useQueryClient();
   const settings = useQuery({
     queryKey: queryKeys.adminArchiveSettings,
     queryFn: () => api.archiveSettings(),
@@ -219,6 +220,9 @@ export function ArchiveSettingsSection() {  const queryClient = useQueryClient()
   ) {
     // Editing invalidates the "saved" badge of whichever group is now dirty.
     setFeedback((current) => clearSaved(current));
+    // A "连接正常" badge must not outlive the edit that changed the address or
+    // the cookie it was earned with.
+    if (key === "transferCookie" || key === "transferSidecar") probe.reset();
     setDraft((current) => ({ ...current, [key]: value }));
   }
 
@@ -529,39 +533,52 @@ export function ArchiveSettingsSection() {  const queryClient = useQueryClient()
             feedback={feedback.transfer}
             onSave={() => save.mutate("transfer")}
             extra={
-              <button
-                className="lux-button"
-                type="button"
-                disabled={probe.isPending || save.isPending}
-                onClick={() => probe.mutate()}
-              >
+              <>
+                <button
+                  className="lux-button lux-button-secondary"
+                  type="button"
+                  disabled={probe.isPending || save.isPending}
+                  onClick={() => probe.mutate()}
+                >
+                  {probe.isPending ? (
+                    <Loader2 size={16} className="lux-spin" />
+                  ) : (
+                    <Activity size={16} />
+                  )}
+                  {probe.isPending ? "测试中…" : "测试连接"}
+                </button>
                 {probe.isPending ? (
-                  <Loader2 size={16} className="lux-spin" />
-                ) : (
-                  <Activity size={16} />
-                )}
-                {probe.isPending ? "测试中…" : "测试连接"}
-              </button>
+                  <span className="lux-settings-probe is-pending" role="status">
+                    <Loader2 size={15} className="lux-spin" /> 正在连接侧车并校验 115 登录…
+                  </span>
+                ) : null}
+                {!probe.isPending && probe.data ? (
+                  <span
+                    className={
+                      probe.data.status === "logged_in"
+                        ? "lux-settings-probe is-ok"
+                        : "lux-settings-probe is-bad"
+                    }
+                    role="status"
+                    aria-live="polite"
+                  >
+                    {probe.data.status === "logged_in" ? (
+                      <CheckCircle2 size={15} />
+                    ) : (
+                      <AlertCircle size={15} />
+                    )}
+                    {describeProbe(probe.data)}
+                  </span>
+                ) : null}
+                {!probe.isPending && probe.error ? (
+                  <span className="lux-settings-probe is-bad" role="status" aria-live="polite">
+                    <AlertCircle size={15} />
+                    {probe.error instanceof Error ? probe.error.message : "测试连接失败"}
+                  </span>
+                ) : null}
+              </>
             }
           />
-          {probe.data ? (
-            <p
-              className={
-                probe.data.status === "logged_in"
-                  ? "lux-archive-settings-probe lux-archive-settings-probe-ok"
-                  : "lux-archive-settings-probe lux-archive-settings-probe-bad"
-              }
-              role="status"
-              aria-live="polite"
-            >
-              {describeProbe(probe.data)}
-            </p>
-          ) : null}
-          {probe.error ? (
-            <p className="lux-error-copy">
-              {probe.error instanceof Error ? probe.error.message : "测试连接失败"}
-            </p>
-          ) : null}
         </div>
 
         <div className="lux-archive-settings-group">
