@@ -121,3 +121,14 @@
 - 真实 115 cookie 端到端通过：转存 → `转存目录` → CD2 可见 → `待整理`；坏 cookie → `auth_required` 且作业留队。
 - 修掉 3 个挡路 bug（`115cdn` 主机、密码尾部说明、auth 判定），侧车依赖钉 `python-asynctools==0.1.4`。
 - 证据：`docs/handoff/U11-ACCEPTANCE-2026-10-20.md`；镜像 `lux:phase-a` = `5aaa2f1ef7fa`。
+
+## 设置页分区保存 + 115 测试连接（2026-10-20）
+
+- 归档设置页从「一个全局保存」改为**每个功能区分区保存**：TMDB / 目录与路径 / 洗版参数 / Telegram 通知 /
+  115 转存 / Telegram 频道监听，各自只提交自己的键，别处未保存的编辑不会被连带提交或回滚。
+- 115 转存区新增**测试连接**：`POST /api/v1/admin/archive/transfer115/probe` 由服务端调用
+  `{sidecar}/healthz?deep=1`，返回 `logged_in` / `auth_required` / `unconfigured` / `unreachable`。
+  浏览器到不了 docker 网络里的侧车，所以必须服务端代测。
+- 表单只在首次加载时填充；之后的重取不会覆盖未保存的编辑，保存成功只回填本分区的字段。
+- 实测：四条分支全部验过（logged_in / auth_required / unconfigured / unreachable），无 CSRF 的调用 403；
+  分区 PUT 不会动其它分区（telegram-only 保存后 cookie 与 sidecar_base 不变）。镜像 `lux:phase-a` = `60edbd9084d9`。
