@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, AlertCircle, Check, CheckCircle2, Loader2, Save, Settings2 } from "lucide-react";
+import { Activity, AlertCircle, Check, Loader2, Save, Settings2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "../../lib/api/client";
@@ -548,30 +548,31 @@ export function ArchiveSettingsSection() {
                   {probe.isPending ? "测试中…" : "测试连接"}
                 </button>
                 {probe.isPending ? (
-                  <span className="lux-settings-probe is-pending" role="status">
+                  <span className="lux-network-proxy-status" role="status">
                     <Loader2 size={15} className="lux-spin" /> 正在连接侧车并校验 115 登录…
                   </span>
                 ) : null}
                 {!probe.isPending && probe.data ? (
-                  <span
-                    className={
-                      probe.data.status === "logged_in"
-                        ? "lux-settings-probe is-ok"
-                        : "lux-settings-probe is-bad"
-                    }
-                    role="status"
-                    aria-live="polite"
-                  >
-                    {probe.data.status === "logged_in" ? (
-                      <CheckCircle2 size={15} />
-                    ) : (
-                      <AlertCircle size={15} />
-                    )}
-                    {describeProbe(probe.data)}
-                  </span>
+                  probe.data.status === "logged_in" ? (
+                    <span className="lux-settings-saved" role="status" aria-live="polite">
+                      <Check size={15} /> {describeProbe(probe.data)}
+                    </span>
+                  ) : probe.data.status === "unconfigured" ? (
+                    <span
+                      className="lux-login-background-warning"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <AlertCircle size={15} /> {describeProbe(probe.data)}
+                    </span>
+                  ) : (
+                    <span className="lux-error-copy" role="status" aria-live="polite">
+                      <AlertCircle size={15} /> {describeProbe(probe.data)}
+                    </span>
+                  )
                 ) : null}
                 {!probe.isPending && probe.error ? (
-                  <span className="lux-settings-probe is-bad" role="status" aria-live="polite">
+                  <span className="lux-error-copy" role="status" aria-live="polite">
                     <AlertCircle size={15} />
                     {probe.error instanceof Error ? probe.error.message : "测试连接失败"}
                   </span>

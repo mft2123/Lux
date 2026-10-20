@@ -15,13 +15,18 @@
 .lux-archive-settings-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding-top: 4px; }
 .lux-archive-settings-footer .lux-settings-saved { margin: 0; }
 .lux-archive-settings-footer .lux-error-copy { flex-basis: 100%; margin: 0; }
-/* Sidecar probe result: a coloured chip on the button row, so a failure is
-   obvious at a glance instead of being small print under the form. */
-.lux-settings-probe { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid transparent; border-radius: 8px; font-size: .78rem; font-weight: 500; line-height: 1.4; }
-.lux-settings-probe svg { flex: none; }
-.lux-settings-probe.is-ok { color: #3ddc84; background: rgba(61,220,132,.13); border-color: rgba(61,220,132,.38); }
-.lux-settings-probe.is-bad { color: #ff7d88; background: rgba(255,125,136,.13); border-color: rgba(255,125,136,.38); }
-.lux-settings-probe.is-pending { color: var(--lux-subtle); background: rgba(255,255,255,.05); border-color: var(--lux-line-soft); }
+/* Probe verdicts reuse the product's own status classes, so they keep the same
+   palette as the network-proxy panel and its light-theme overrides; only the
+   row layout inside a group footer is adjusted here. */
+.lux-archive-settings-footer .lux-settings-saved,
+.lux-archive-settings-footer .lux-error-copy,
+.lux-archive-settings-footer .lux-login-background-warning,
+.lux-archive-settings-footer .lux-network-proxy-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
 .lux-spin { animation: lux-spin 1s linear infinite; }
 @keyframes lux-spin { to { transform: rotate(360deg); } }
 .lux-archive-settings-status { display: grid; gap: 6px; padding: 13px 15px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.03); }
