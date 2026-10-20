@@ -3,6 +3,7 @@ import type {
   ArchiveSettings,
   ArchiveSettingsPatch,
   ArchiveStatus,
+  ArchiveTransfer115Probe,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -1416,6 +1417,13 @@ export class LuxApiClient {
     return this.request<ArchiveSettings>("/api/v1/admin/archive/settings", {
       method: "PUT",
       body: JSON.stringify(input),
+    });
+  }
+
+  /** Ask the server to probe the 115 sidecar (the browser cannot reach it). */
+  probeTransfer115() {
+    return this.request<ArchiveTransfer115Probe>("/api/v1/admin/archive/transfer115/probe", {
+      method: "POST",
     });
   }
 

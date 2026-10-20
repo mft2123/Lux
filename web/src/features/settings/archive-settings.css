@@ -11,6 +11,15 @@
 .lux-archive-settings-toggles .lux-admin-toggle { min-height: 32px; }
 .lux-archive-settings-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; }
 .lux-archive-settings-actions .lux-settings-saved { margin: 0; }
+/* One save bar per group: the button sits with the fields it commits. */
+.lux-archive-settings-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding-top: 4px; }
+.lux-archive-settings-footer .lux-settings-saved { margin: 0; }
+.lux-archive-settings-footer .lux-error-copy { flex-basis: 100%; margin: 0; }
+.lux-archive-settings-probe { flex-basis: 100%; margin: 0; font-size: .74rem; line-height: 1.5; }
+.lux-archive-settings-probe-ok { color: var(--lux-success, #35c26a); }
+.lux-archive-settings-probe-bad { color: var(--lux-danger, #f0616d); }
+.lux-spin { animation: lux-spin 1s linear infinite; }
+@keyframes lux-spin { to { transform: rotate(360deg); } }
 .lux-archive-settings-status { display: grid; gap: 6px; padding: 13px 15px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.03); }
 .lux-archive-settings-status div { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
 .lux-archive-settings-status span { flex: none; color: var(--lux-subtle); font-size: .73rem; }

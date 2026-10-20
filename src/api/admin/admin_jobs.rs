@@ -52,6 +52,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_archive_settings).put(admin_update_archive_settings),
         )
         .route(
+            "/api/v1/admin/archive/transfer115/probe",
+            post(admin_archive_transfer115_probe),
+        )
+        .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
         )
@@ -1390,8 +1394,95 @@ pub(crate) async fn admin_update_archive_settings(
     Json(body).into_response()
 }
 
-pub(crate) async fn admin_archive_run(
+/// Probe the 115 transfer sidecar from the server. The sidecar lives on the
+/// docker network, so the settings page cannot reach it; `?deep=1` makes the
+/// sidecar validate the stored cookie against 115, which is the only way to
+/// tell "process is up" apart from "the cookie still works".
+pub(crate) async fn admin_archive_transfer115_probe(
     headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let settings = crate::application::archive::ArchiveSettings::load();
+    let base = settings
+        .transfer115
+        .sidecar_base
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    if base.is_empty() {
+        return Json(serde_json::json!({
+            "ok": false,
+            "status": "unconfigured",
+            "detail": "未配置侧车地址，转存阶段当前是关闭的",
+        }))
+        .into_response();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "status": "failed",
+                "detail": format!("无法创建 HTTP 客户端: {error}"),
+            }))
+            .into_response();
+        }
+    };
+    let url = format!("{base}/healthz?deep=1");
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let http_status = response.status();
+            let payload: serde_json::Value = response
+                .json()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let status = payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let detail = payload
+                .get("detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let ok = http_status.is_success()
+                && payload
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            Json(serde_json::json!({
+                "ok": ok,
+                "status": if status.is_empty() {
+                    format!("http_{}", http_status.as_u16())
+                } else {
+                    status
+                },
+                // The sidecar's own words; the cookie itself is never echoed.
+                "detail": detail,
+                "sidecar": base,
+            }))
+            .into_response()
+        }
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "status": "unreachable",
+            "detail": format!("连不上侧车 {base}: {error}"),
+            "sidecar": base,
+        }))
+        .into_response(),
+    }
+}
+
+pub(crate) async fn admin_archive_run(    headers: HeaderMap,
     Query(query): Query<ArchiveRunQuery>,
     State(state): State<AppState>,
 ) -> Response {

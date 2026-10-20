@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Save, Settings2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Activity, Check, Loader2, Save, Settings2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type {
@@ -8,6 +9,7 @@ import type {
   ArchiveSettings,
   ArchiveSettingsPatch,
   ArchiveTelegramSettings,
+  ArchiveTransfer115Probe,
   ArchiveTransfer115Settings,
 } from "../../lib/api/types";
 import "./archive-settings.css";
@@ -135,8 +137,27 @@ const EMPTY_DRAFT: ArchiveSettingsDraft = {
   transferTimeout: "120",
 };
 
-export function ArchiveSettingsSection() {
-  const queryClient = useQueryClient();
+/**
+ * The form is split into the same groups the page renders. Each group owns its
+ * own save button and sends only its own keys, so a half-finished edit in one
+ * group is never committed (or reverted) by saving another.
+ */
+type SettingsSection = "tmdb" | "paths" | "wash" | "notify" | "listen" | "transfer";
+
+type SectionFeedback = { phase: "idle" | "saving" | "saved" | "error"; message?: string };
+
+type SectionFeedbackMap = Record<SettingsSection, SectionFeedback>;
+
+const EMPTY_FEEDBACK: SectionFeedbackMap = {
+  tmdb: { phase: "idle" },
+  paths: { phase: "idle" },
+  wash: { phase: "idle" },
+  notify: { phase: "idle" },
+  listen: { phase: "idle" },
+  transfer: { phase: "idle" },
+};
+
+export function ArchiveSettingsSection() {  const queryClient = useQueryClient();
   const settings = useQuery({
     queryKey: queryKeys.adminArchiveSettings,
     queryFn: () => api.archiveSettings(),
@@ -147,39 +168,62 @@ export function ArchiveSettingsSection() {
     queryFn: () => api.archiveStatus(),
   });
   const [draft, setDraft] = useState<ArchiveSettingsDraft>(EMPTY_DRAFT);
-  const [saved, setSaved] = useState(false);
+  const [feedback, setFeedback] = useState<SectionFeedbackMap>(EMPTY_FEEDBACK);
+  // The form is filled once from the server. A later refetch must not overwrite
+  // edits the admin has not saved yet; each save merges its own group back.
+  const initialized = useRef(false);
   const categories = categoryOptions(settings.data);
 
   useEffect(() => {
-    if (!settings.data) return;
+    if (!settings.data || initialized.current) return;
     setDraft(draftFromSettings(settings.data));
-    setSaved(false);
+    initialized.current = true;
   }, [settings.data]);
 
+  // Every group saves on its own and sends only its own keys, so saving one
+  // group never commits (or reverts) what is still being edited in another.
   const save = useMutation({
-    mutationFn: () => {
-      const problem = validateDraft(draft);
-      if (problem) return Promise.reject(new Error(problem));
-      return api.updateArchiveSettings(payloadFromDraft(draft));
+    mutationFn: (section: SettingsSection) => {
+      const problem = validateSection(section, draft);
+      if (problem) throw new Error(problem);
+      return api.updateArchiveSettings(payloadForSection(section, draft));
     },
-    onSuccess: (data) => {
-      setDraft(draftFromSettings(data));
-      setSaved(true);
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminArchiveSettings });
+    onMutate: (section) => {
+      setFeedback((current) => ({ ...current, [section]: { phase: "saving" } }));
+    },
+    onSuccess: (data, section) => {
+      const merged = draftFromSettings(data);
+      setDraft((current) => mergeSection(current, merged, section));
+      setFeedback((current) => ({ ...current, [section]: { phase: "saved" } }));
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminArchiveStatus });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminArchiveSettings });
+    },
+    onError: (error, section) => {
+      setFeedback((current) => ({
+        ...current,
+        [section]: {
+          phase: "error",
+          message: error instanceof Error ? error.message : "保存失败",
+        },
+      }));
     },
   });
+
+  // Probing has to happen on the server: the sidecar sits on the docker network,
+  // so only `luxd` can reach it.
+  const probe = useMutation({ mutationFn: () => api.probeTransfer115() });
 
   function update<Key extends keyof ArchiveSettingsDraft>(
     key: Key,
     value: ArchiveSettingsDraft[Key],
   ) {
-    setSaved(false);
+    // Editing invalidates the "saved" badge of whichever group is now dirty.
+    setFeedback((current) => clearSaved(current));
     setDraft((current) => ({ ...current, [key]: value }));
   }
 
   function toggleNotify(category: string, checked: boolean) {
-    setSaved(false);
+    setFeedback((current) => clearSaved(current));
     setDraft((current) => {
       const next = checked
         ? Array.from(new Set([...current.notify, category]))
@@ -204,7 +248,6 @@ export function ArchiveSettingsSection() {
   const loaded = settings.data;
   const listenMode =
     LISTEN_MODES.find((mode) => mode.value === draft.listenMode) ?? LISTEN_MODES[0];
-  const errorMessage = save.error instanceof Error ? save.error.message : null;
 
   return (
     <section
@@ -235,6 +278,11 @@ export function ArchiveSettingsSection() {
               onChange={(event) => update("tmdbApiKey", event.target.value)}
             />
           </label>
+          <SectionSaveBar
+            busy={save.isPending && save.variables === "tmdb"}
+            feedback={feedback.tmdb}
+            onSave={() => save.mutate("tmdb")}
+          />
         </div>
 
         <div className="lux-archive-settings-group">
@@ -285,6 +333,11 @@ export function ArchiveSettingsSection() {
               onChange={(event) => update("watchDirs", event.target.value)}
             />
           </label>
+          <SectionSaveBar
+            busy={save.isPending && save.variables === "paths"}
+            feedback={feedback.paths}
+            onSave={() => save.mutate("paths")}
+          />
         </div>
 
         <div className="lux-archive-settings-group">
@@ -339,6 +392,11 @@ export function ArchiveSettingsSection() {
             />
             <span>启用洗版（新包明显更大时替换旧包）</span>
           </label>
+          <SectionSaveBar
+            busy={save.isPending && save.variables === "wash"}
+            feedback={feedback.wash}
+            onSave={() => save.mutate("wash")}
+          />
         </div>
 
         <div className="lux-archive-settings-group">
@@ -404,6 +462,11 @@ export function ArchiveSettingsSection() {
               ))}
             </div>
           </div>
+          <SectionSaveBar
+            busy={save.isPending && save.variables === "notify"}
+            feedback={feedback.notify}
+            onSave={() => save.mutate("notify")}
+          />
         </div>
 
         <div className="lux-archive-settings-group">
@@ -461,6 +524,44 @@ export function ArchiveSettingsSection() {
               />
             </label>
           </div>
+          <SectionSaveBar
+            busy={save.isPending && save.variables === "transfer"}
+            feedback={feedback.transfer}
+            onSave={() => save.mutate("transfer")}
+            extra={
+              <button
+                className="lux-button"
+                type="button"
+                disabled={probe.isPending || save.isPending}
+                onClick={() => probe.mutate()}
+              >
+                {probe.isPending ? (
+                  <Loader2 size={16} className="lux-spin" />
+                ) : (
+                  <Activity size={16} />
+                )}
+                {probe.isPending ? "测试中…" : "测试连接"}
+              </button>
+            }
+          />
+          {probe.data ? (
+            <p
+              className={
+                probe.data.status === "logged_in"
+                  ? "lux-archive-settings-probe lux-archive-settings-probe-ok"
+                  : "lux-archive-settings-probe lux-archive-settings-probe-bad"
+              }
+              role="status"
+              aria-live="polite"
+            >
+              {describeProbe(probe.data)}
+            </p>
+          ) : null}
+          {probe.error ? (
+            <p className="lux-error-copy">
+              {probe.error instanceof Error ? probe.error.message : "测试连接失败"}
+            </p>
+          ) : null}
         </div>
 
         <div className="lux-archive-settings-group">
@@ -540,6 +641,11 @@ export function ArchiveSettingsSection() {
               />
             </label>
           </div>
+          <SectionSaveBar
+            busy={save.isPending && save.variables === "listen"}
+            feedback={feedback.listen}
+            onSave={() => save.mutate("listen")}
+          />
         </div>
 
         <div className="lux-archive-settings-group">
@@ -573,21 +679,6 @@ export function ArchiveSettingsSection() {
             </p>
           )}
         </div>
-
-        <div className="lux-archive-settings-actions">
-          <button
-            className="lux-button lux-button-primary lux-settings-save"
-            type="button"
-            disabled={save.isPending}
-            onClick={() => save.mutate()}
-          >
-            <Save size={16} /> {save.isPending ? "保存中…" : "保存归档设置"}
-          </button>
-          {saved ? (
-            <p className="lux-settings-saved"><Check size={15} /> 已生效，无需重启</p>
-          ) : null}
-        </div>
-        {errorMessage ? <p className="lux-error-copy">{errorMessage}</p> : null}
       </div>
     </section>
   );
@@ -634,68 +725,183 @@ function draftFromSettings(settings: ArchiveSettings): ArchiveSettingsDraft {
   };
 }
 
-function payloadFromDraft(draft: ArchiveSettingsDraft): ArchiveSettingsPatch {
-  const telegram: Partial<ArchiveTelegramSettings> = {
-    api_id: draft.apiId.trim(),
-    listen_mode: draft.listenMode,
-    listen_channels: splitLines(draft.listenChannels),
-    follow_list: splitLines(draft.followList),
-    // Only rewrite the selection when the admin actually toggled something:
-    // an untouched save must keep `null` (everything on) or the stored object
-    // shape instead of turning it into a fixed list.
-    notify: draft.notifyTouched ? draft.notify : draft.notifyOriginal,
-    enabled: draft.notifyEnabled,
-  };
-  // Blank secrets are left out entirely: the server keeps the stored value.
-  if (draft.botToken.trim()) telegram.bot_token = draft.botToken.trim();
-  if (draft.chatId.trim()) telegram.chat_id = draft.chatId.trim();
-  if (draft.apiKey.trim()) telegram.api_key = draft.apiKey.trim();
-  if (draft.apiHash.trim()) telegram.api_hash = draft.apiHash.trim();
-  if (draft.phone.trim()) telegram.phone = draft.phone.trim();
+const SECTION_FIELDS: Record<SettingsSection, (keyof ArchiveSettingsDraft)[]> = {
+  tmdb: ["tmdbApiKey"],
+  paths: ["watchDirs", "mirrorRoot", "cd2Prefix", "cd2Mount"],
+  wash: ["pollSeconds", "settleSeconds", "washEnabled", "washTolerance"],
+  notify: ["notifyEnabled", "botToken", "chatId", "apiKey", "notify", "notifyOriginal", "notifyTouched"],
+  listen: ["apiId", "apiHash", "phone", "listenMode", "listenChannels", "followList"],
+  transfer: ["transferCookie", "transferTarget", "transferSidecar", "transferTimeout"],
+};
 
-  const transfer115: Partial<ArchiveTransfer115Settings> = {
-    target_dir: draft.transferTarget.trim(),
-    sidecar_base: draft.transferSidecar.trim(),
-  };
-  const transferTimeout = parseNumber(draft.transferTimeout);
-  if (transferTimeout !== undefined) {
-    transfer115.timeout_seconds = Math.trunc(transferTimeout);
-  }
-  // Same rule as the other secrets: blank means "keep the stored cookie".
-  if (draft.transferCookie.trim()) transfer115.cookie = draft.transferCookie.trim();
-
-  const payload: ArchiveSettingsPatch = {
-    watch_dirs: splitLines(draft.watchDirs),
-    mirror_root: draft.mirrorRoot.trim(),
-    cd2_prefix: draft.cd2Prefix.trim(),
-    cd2_mount: draft.cd2Mount.trim(),
-    wash_enabled: draft.washEnabled,
-    telegram,
-    transfer115,
-  };
-  if (draft.tmdbApiKey.trim()) payload.tmdb_api_key = draft.tmdbApiKey.trim();
-  const poll = parseNumber(draft.pollSeconds);
-  if (poll !== undefined) payload.poll_seconds = Math.trunc(poll);
-  const settle = parseNumber(draft.settleSeconds);
-  if (settle !== undefined) payload.settle_seconds = Math.trunc(settle);
-  const tolerance = parseNumber(draft.washTolerance);
-  if (tolerance !== undefined) payload.wash_tolerance_ratio = tolerance;
-  return payload;
+/** Take back only the fields a section saved, leaving other drafts untouched. */
+function mergeSection(
+  current: ArchiveSettingsDraft,
+  saved: ArchiveSettingsDraft,
+  section: SettingsSection,
+): ArchiveSettingsDraft {
+  const patch = Object.fromEntries(
+    SECTION_FIELDS[section].map((field) => [field, saved[field]]),
+  ) as Partial<ArchiveSettingsDraft>;
+  return { ...current, ...patch };
 }
 
-/** Mirror the server-side checks so an obvious typo does not need a round trip. */
-function validateDraft(draft: ArchiveSettingsDraft): string | null {
-  if (!draft.mirrorRoot.trim()) return "本地镜像库路径不能为空";
-  if (!draft.cd2Mount.trim()) return "CD2 挂载点不能为空";
-  const poll = parseNumber(draft.pollSeconds);
-  if (poll === undefined || poll < 0 || poll > 3600) return "自动轮询间隔必须是 0 到 3600 之间的整数";
-  const settle = parseNumber(draft.settleSeconds);
-  if (settle === undefined || settle < 0 || settle > 3600) return "稳定等待必须是 0 到 3600 之间的整数";
-  const tolerance = parseNumber(draft.washTolerance);
-  if (tolerance === undefined || tolerance < 0 || tolerance > 1) {
-    return "洗版容差必须是 0 到 1 之间的数字";
+/** Drop the "已生效" badge once the admin starts editing again. */
+function clearSaved(current: SectionFeedbackMap): SectionFeedbackMap {
+  let changed = false;
+  const next = { ...current };
+  for (const section of Object.keys(next) as SettingsSection[]) {
+    if (next[section].phase === "saved") {
+      next[section] = { phase: "idle" };
+      changed = true;
+    }
+  }
+  return changed ? next : current;
+}
+
+function payloadForSection(
+  section: SettingsSection,
+  draft: ArchiveSettingsDraft,
+): ArchiveSettingsPatch {
+  switch (section) {
+    case "tmdb": {
+      const patch: ArchiveSettingsPatch = {};
+      if (draft.tmdbApiKey.trim()) patch.tmdb_api_key = draft.tmdbApiKey.trim();
+      return patch;
+    }
+    case "paths":
+      return {
+        watch_dirs: splitLines(draft.watchDirs),
+        mirror_root: draft.mirrorRoot.trim(),
+        cd2_prefix: draft.cd2Prefix.trim(),
+        cd2_mount: draft.cd2Mount.trim(),
+      };
+    case "wash": {
+      const patch: ArchiveSettingsPatch = { wash_enabled: draft.washEnabled };
+      const poll = parseNumber(draft.pollSeconds);
+      if (poll !== undefined) patch.poll_seconds = Math.trunc(poll);
+      const settle = parseNumber(draft.settleSeconds);
+      if (settle !== undefined) patch.settle_seconds = Math.trunc(settle);
+      const tolerance = parseNumber(draft.washTolerance);
+      if (tolerance !== undefined) patch.wash_tolerance_ratio = tolerance;
+      return patch;
+    }
+    case "notify": {
+      const telegram: Partial<ArchiveTelegramSettings> = {
+        enabled: draft.notifyEnabled,
+        // Only rewrite the selection when the admin actually toggled something:
+        // an untouched save must keep `null` (everything on) or the stored object
+        // shape instead of turning it into a fixed list.
+        notify: draft.notifyTouched ? draft.notify : draft.notifyOriginal,
+      };
+      // Blank secrets are left out entirely: the server keeps the stored value.
+      if (draft.botToken.trim()) telegram.bot_token = draft.botToken.trim();
+      if (draft.chatId.trim()) telegram.chat_id = draft.chatId.trim();
+      if (draft.apiKey.trim()) telegram.api_key = draft.apiKey.trim();
+      return { telegram };
+    }
+    case "listen": {
+      const telegram: Partial<ArchiveTelegramSettings> = {
+        api_id: draft.apiId.trim(),
+        listen_mode: draft.listenMode,
+        listen_channels: splitLines(draft.listenChannels),
+        follow_list: splitLines(draft.followList),
+      };
+      if (draft.apiHash.trim()) telegram.api_hash = draft.apiHash.trim();
+      if (draft.phone.trim()) telegram.phone = draft.phone.trim();
+      return { telegram };
+    }
+    case "transfer": {
+      const transfer115: Partial<ArchiveTransfer115Settings> = {
+        target_dir: draft.transferTarget.trim(),
+        sidecar_base: draft.transferSidecar.trim(),
+      };
+      const timeout = parseNumber(draft.transferTimeout);
+      if (timeout !== undefined) transfer115.timeout_seconds = Math.trunc(timeout);
+      // Same rule as the other secrets: blank means "keep the stored cookie".
+      if (draft.transferCookie.trim()) transfer115.cookie = draft.transferCookie.trim();
+      return { transfer115 };
+    }
+  }
+}
+
+/** Mirror the server-side checks for just the group being saved. */
+function validateSection(section: SettingsSection, draft: ArchiveSettingsDraft): string | null {
+  if (section === "paths") {
+    if (!draft.mirrorRoot.trim()) return "本地镜像库路径不能为空";
+    if (!draft.cd2Mount.trim()) return "CD2 挂载点不能为空";
+  }
+  if (section === "wash") {
+    const poll = parseNumber(draft.pollSeconds);
+    if (poll === undefined || poll < 0 || poll > 3600) {
+      return "自动轮询间隔必须是 0 到 3600 之间的整数";
+    }
+    const settle = parseNumber(draft.settleSeconds);
+    if (settle === undefined || settle < 0 || settle > 3600) {
+      return "稳定等待必须是 0 到 3600 之间的整数";
+    }
+    const tolerance = parseNumber(draft.washTolerance);
+    if (tolerance === undefined || tolerance < 0 || tolerance > 1) {
+      return "洗版容差必须是 0 到 1 之间的数字";
+    }
+  }
+  if (section === "transfer") {
+    const timeout = parseNumber(draft.transferTimeout);
+    if (timeout !== undefined && (timeout < 0 || timeout > 600)) {
+      return "转存超时必须是 0 到 600 之间的秒数";
+    }
   }
   return null;
+}
+
+function describeProbe(result: ArchiveTransfer115Probe): string {
+  switch (result.status) {
+    case "logged_in":
+      return "连接正常：侧车在线，115 cookie 有效。";
+    case "auth_required":
+      return "侧车在线，但 115 cookie 已失效，请重新填写后保存。";
+    case "unconfigured":
+      return "未配置侧车地址，转存阶段当前是关闭的。";
+    case "unreachable":
+      return "连不上侧车，检查地址是否正确、容器是否在运行。";
+    default:
+      return `侧车返回：${result.status}${result.detail ? `（${result.detail}）` : ""}`;
+  }
+}
+
+function SectionSaveBar({
+  busy,
+  feedback,
+  onSave,
+  extra,
+}: {
+  busy: boolean;
+  feedback: SectionFeedback;
+  onSave: () => void;
+  extra?: ReactNode;
+}) {
+  return (
+    <div className="lux-archive-settings-footer">
+      <button
+        className="lux-button lux-button-primary"
+        type="button"
+        disabled={busy}
+        onClick={onSave}
+      >
+        {busy ? <Loader2 size={16} className="lux-spin" /> : <Save size={16} />}
+        {busy ? "保存中…" : "保存"}
+      </button>
+      {extra}
+      {feedback.phase === "saved" ? (
+        <p className="lux-settings-saved">
+          <Check size={15} /> 已生效
+        </p>
+      ) : null}
+      {feedback.phase === "error" && feedback.message ? (
+        <p className="lux-error-copy">{feedback.message}</p>
+      ) : null}
+    </div>
+  );
 }
 
 function selectedNotifyCategories(

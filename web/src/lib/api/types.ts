@@ -1170,6 +1170,18 @@ export type ArchiveTransfer115Settings = {
 
 export type ArchiveNotifyCategory = { key: string; label: string; emoji: string };
 
+/**
+ * Answer of the server-side sidecar probe. `status` is the sidecar's own word
+ * (`logged_in` / `auth_required` / `unconfigured`) or `unreachable` when the
+ * request itself failed.
+ */
+export type ArchiveTransfer115Probe = {
+  ok: boolean;
+  status: string;
+  detail: string;
+  sidecar?: string;
+};
+
 export type ArchiveSettings = {
   tmdb_api_key: string;
   watch_dirs: string[];
