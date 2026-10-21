@@ -92,3 +92,67 @@ curl -s http://127.0.0.1:8091/channels
 # 构建（总控/交接者）
 cd /tmp/lux-u11 && DOCKER_BUILDKIT=1 docker build -f Dockerfile.custom -t lux:phase-a .
 ```
+---
+
+# 2026-10-21 本轮：年代段 + 自动入库 + 动画分库
+
+## 6. 改了什么
+
+1. **归档目标改为年代**：`<类型>/<国内|国外>/<年代>/<片名 (年份)>/`（`2024` → `2020s`，无年份 → `未知年代`），
+   对齐用户既有 `影视库/媒体目录` 结构。`is_library_year_segment` 同时认「年份」和「年代」，
+   老目录（`电影/国外/1989`）仍能被库内查找/洗版逻辑解析。
+2. **自动入库**（`src/application/archive/auto_library.rs`，契约 `AUTO-LIBRARY.md`）：
+   镜像一级目录 → 一个库；**动画拆「国内动画 / 国外动画」两个库**；空板（无 strm/nfo）不建库；
+   幂等键 = 库根路径；建库后入队一次全量扫描。
+   触发三个：归档 run 结束（organized 非空）、启动对账、每 600s 兜底对账。
+3. **接线**：`AppState::register_archive_auto_library()`（`main.rs` 在 `start_poller()` 前调用）
+   把 database / libraries / scan_jobs 交给 poller，`start_poller()` 签名不变。
+
+## 7. 测试库数据迁移（115 侧，已做）
+
+- `测试库/媒体目录/动画/<年代>/` → `动画/<国内|国外>/<年代>/`，共 **141 条：国内 112、国外 29**。
+  地区取自 `影视库/媒体目录/动漫/国产动漫|日本动漫` 的同名条目（测试库那批动画是从真实库复制出来的、
+  复制时丢了地区层，所以原始数据里根本没有地区信息）。
+- 2 条目录名里的 `{tmdb-ID}` 是错的（`46711` → CBC News、`319496` → 生命的极限）：已从目录名里去掉 id，
+  让 TMDB 搜索重新解析（长江7号爱地球 正确命中 46711 电影条目）。
+- 回填镜像：`POST /api/v1/admin/archive/metadata?dry_run=false` → `created 6272, failed 0`，6m41s。
+  注意：测试容器默认没有 TMDB key，重建容器时加了 `-e LUX_TMDB_API_KEY=$(chillposter settings.json:tmdb_key)`。
+
+## 8. 实测证据（镜像 `lux:phase-a` = `66a3c85fdcbf`）
+
+| 项 | 结果 |
+| --- | --- |
+| 启动对账 | `created:["国外动画"] existing:3 scans:["国外动画"] failed:[]` |
+| 幂等（再重启） | `found nothing to create, existing:5`；库/根数量不变 |
+| 触发点①（run 结束） | 放「周杰伦地表最强演唱会 2019」进 `待整理` → `organized:1` → 立即 `created:["演唱会"]` 并入队扫描 |
+| 空目录 | 镜像里建空目录「测试空板」→ 没有建库（验证后删除） |
+| 最终库 | 剧集 359 / 国内动画 3053 / 国外动画 123 / 电影 16，扫描全 COMPLETED、error 为空 |
+| 镜像完整性 | 抽样 `X特遣队的奇幻之旅`：115 侧 10 文件 → 镜像 10 strm + NFO + 海报 |
+| 单测 | `cargo test --lib` 1094 passed |
+
+`tests/admin_health.rs` 在**干净 HEAD `702a2ead` 上同样失败**（`maxConnections` 期望 8、实际 24），
+是环境相关的既有失败，与本轮无关。
+
+## 9. 已知 / 待办
+
+1. **存量年份目录没迁**：`媒体目录/电影/国外/1989`、`电视剧/国内/2024` 这些还是年份层，新归档写年代层，
+   两套并存（功能上都能扫）。要统一得单独做一次迁移 + 重扫，用户尚未点头。
+2. 回填生成的镜像目录名保留了 115 侧的 `{tmdb-123}` 后缀（归档 run 生成的不带），只影响观感。
+3. TMDB `{tmdb-ID}` 提示可能跨命名空间误命中（同一 id 在 movie/tv 下都存在），目前靠人工核对。
+4. 第 3 节的老待办仍在：`原因.txt` 加 BOM、TG 频道监听 v2 的 Lux 侧、封面/主题的真眼验收。
+
+## 10. 本轮验证命令
+
+```bash
+docker logs lux-testlib 2>&1 | grep -E "archive auto library|archive pipeline run completed"
+# 库 / 根 / 扫描状态
+python3 - <<'PY'
+import sqlite3
+c = sqlite3.connect('/vol5/1000/build/archive-test-config/lux.db')
+print([r for r in c.execute('select name,kind from libraries order by name')])
+print([r[0] for r in c.execute('select display_path from library_roots order by display_path')])
+print(list(c.execute('select status,count(*) from scan_jobs group by status')))
+PY
+# 重建镜像
+cd /tmp/lux-u11 && DOCKER_BUILDKIT=1 docker build -f Dockerfile.custom -t lux:phase-a .
+```
