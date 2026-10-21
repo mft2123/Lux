@@ -2,7 +2,7 @@
 //! sinks. This is the first slice of the chill replacement work (plan U9):
 //! resources land in the transfer directory, are moved to pending, are
 //! identified through TMDB, and are organized into
-//! `<media>/<国内|国外><类型>/<年份>/<Title (Year)>/`.
+//! `<media>/<类型>/<国内|国外>/<年代>/<Title (Year)>/`.
 //!
 //! The pipeline is deliberately directory-driven: every stage is a visible
 //! directory role, so a failed identification can be inspected by hand and a
@@ -27,8 +27,20 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::{
+    application::{libraries::LibraryService, scanner::ScanJobService},
+    storage::Database,
+};
+
+mod auto_library;
 mod nfo;
 mod settings;
+
+/// Auto library reconciliation (docs/handoff/AUTO-LIBRARY.md): the library
+/// services registered at startup, and how often a full pass re-runs even when
+/// no archive run organized anything.
+static AUTO_LIBRARY_SERVICES: OnceLock<auto_library::AutoLibraryServices> = OnceLock::new();
+const AUTO_LIBRARY_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 
 pub(crate) use settings::{ArchiveSettings, mask_secret};
 
@@ -836,9 +848,7 @@ impl ArchiveService {
                 .filter(|year| (1888..=2100).contains(year));
             let region = if matched.is_domestic() { "国内" } else { "国外" };
             let category = matched.category_label();
-            let year_segment = year
-                .map(|year| year.to_string())
-                .unwrap_or_else(|| "未知年份".to_owned());
+            let year_segment = decade_segment(year);
             let safe_title = sanitize_component(&matched.title);
             let title_dir = match year {
                 Some(year) => format!("{safe_title} ({year})"),
@@ -1653,9 +1663,7 @@ impl ArchiveService {
             Some(year) => format!("{safe_title} ({year})"),
             None => safe_title.clone(),
         };
-        let year_segment = year
-            .map(|year| year.to_string())
-            .unwrap_or_else(|| "未知年份".to_owned());
+        let year_segment = decade_segment(year);
         let mut target_dir = self.config.media_dir().join(category);
         let region = if category == "演唱会" {
             let region = if contains_cjk(&parsed.title) {
@@ -2484,6 +2492,11 @@ pub fn start_poller() {
         ),
     }
     tokio::spawn(async move {
+        // Startup reconciliation: a process that was down while new boards
+        // appeared must still end up with their libraries (docs/handoff/
+        // AUTO-LIBRARY.md §2).
+        reconcile_libraries().await;
+        let mut last_reconcile = Instant::now();
         loop {
             let Some(interval) = archive_poll_interval() else {
                 tokio::time::sleep(Duration::from_secs(POLL_DISABLED_RECHECK_SECONDS)).await;
@@ -2493,26 +2506,83 @@ pub fn start_poller() {
             // Rebuild the service so settings edited in the meantime apply to
             // this run instead of the values captured at startup.
             let service = ArchiveService::new(ArchiveConfig::from_env());
-            match service.run_once(false).await {
-                Ok(report)
+            let report = service.run_once(false).await;
+            let organized = match &report {
+                Ok(report) => {
                     if !report.archived_to_pending.is_empty()
                         || !report.organized.is_empty()
                         || !report.failed.is_empty()
-                        || !report.duplicates.is_empty() =>
-                {
-                    tracing::info!(
-                        archived = report.archived_to_pending.len(),
-                        organized = report.organized.len(),
-                        failed = report.failed.len(),
-                        duplicates = report.duplicates.len(),
-                        washed = report.washed.len(),
-                        "archive pipeline run completed"
-                    );
+                        || !report.duplicates.is_empty()
+                    {
+                        tracing::info!(
+                            archived = report.archived_to_pending.len(),
+                            organized = report.organized.len(),
+                            failed = report.failed.len(),
+                            duplicates = report.duplicates.len(),
+                            washed = report.washed.len(),
+                            "archive pipeline run completed"
+                        );
+                    }
+                    !report.organized.is_empty()
                 }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "archive pipeline run failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "archive pipeline run failed");
+                    false
+                }
+            };
+            // A run that organized something may have created a new board; the
+            // periodic reconciliation also catches boards added from outside.
+            if organized || last_reconcile.elapsed() >= AUTO_LIBRARY_RECONCILE_INTERVAL {
+                reconcile_libraries().await;
+                last_reconcile = Instant::now();
             }
         }
+    });
+}
+
+/// Run one auto-library reconciliation, using the services `AppState` registered
+/// at startup. A server without library services (setup mode) does nothing.
+async fn reconcile_libraries() {
+    let Some(services) = AUTO_LIBRARY_SERVICES.get() else {
+        return;
+    };
+    let mirror_root = ArchiveConfig::from_env().mirror_root;
+    let report = auto_library::provision(
+        &services.database,
+        &services.libraries,
+        Some(&services.scan_jobs),
+        &mirror_root,
+    )
+    .await;
+    if !report.worth_logging() {
+        tracing::debug!(
+            mirror = %mirror_root.display(),
+            existing = report.existing.len(),
+            "archive auto library reconciliation found nothing to create"
+        );
+        return;
+    }
+    tracing::info!(
+        mirror = %mirror_root.display(),
+        created = ?report.created,
+        existing = report.existing.len(),
+        scans = ?report.scans,
+        failed = ?report.failed,
+        "archive auto library reconciliation"
+    );
+}
+
+/// Give the archive poller the handles it needs to create libraries and queue
+/// scans. Called once from the server startup, after `AppState` built them.
+pub(crate) fn register_auto_library_services(
+    database: Database,
+    libraries: LibraryService,
+    scan_jobs: ScanJobService,
+) {
+    let _ = AUTO_LIBRARY_SERVICES.set(auto_library::AutoLibraryServices {
+        database,
+        libraries,
+        scan_jobs,
     });
 }
 
@@ -3910,11 +3980,34 @@ fn title_match_key(value: &str) -> (String, Option<i64>) {
     }
 }
 
-/// `2024` / `未知年份` are the year level of the library tree, never a title.
+/// The library tree groups titles by decade (`2020s`) instead of by year, which
+/// is what the existing 影视库 tree already does. A title with no usable year
+/// keeps its own bucket so it is still browsable.
+const UNKNOWN_DECADE: &str = "未知年代";
+
+pub(crate) fn decade_segment(year: Option<i64>) -> String {
+    match year {
+        Some(year) if year > 0 => format!("{}s", (year / 10) * 10),
+        _ => UNKNOWN_DECADE.to_owned(),
+    }
+}
+
+/// `2024` / `2020s` / `未知年份` / `未知年代` are the year-or-decade level of the
+/// library tree, never a title. The four-digit form stays accepted so trees
+/// written before the decade switch keep resolving.
 fn is_library_year_segment(name: &str) -> bool {
     let name = name.trim();
-    (name.chars().count() == 4 && name.chars().all(|character| character.is_ascii_digit()))
-        || name == "未知年份"
+    let mut characters = name.chars();
+    let head: Vec<char> = characters.by_ref().take(4).collect();
+    let digits = head.len() == 4 && head.iter().all(char::is_ascii_digit);
+    if !digits {
+        return name == "未知年份" || name == UNKNOWN_DECADE;
+    }
+    match characters.next() {
+        None => true,
+        Some('s') => characters.next().is_none(),
+        Some(_) => false,
+    }
 }
 
 /// Does the library title `entry_name` denote the same work as `query`?
@@ -4132,6 +4225,28 @@ mod tests {
         let parsed = parse_media_name("繁花 第02集").expect("parsed");
         assert_eq!(parsed.title, "繁花");
         assert_eq!(parsed.episode, Some(2));
+    }
+
+    /// The library tree groups by decade, so a 2019 release lands under
+    /// `2010s` and a title without a year keeps its own bucket.
+    #[test]
+    fn organizes_titles_into_decades() {
+        assert_eq!(decade_segment(Some(2024)), "2020s");
+        assert_eq!(decade_segment(Some(2019)), "2010s");
+        assert_eq!(decade_segment(Some(2010)), "2010s");
+        assert_eq!(decade_segment(Some(2009)), "2000s");
+        assert_eq!(decade_segment(Some(1989)), "1980s");
+        assert_eq!(decade_segment(None), UNKNOWN_DECADE);
+        assert_eq!(decade_segment(Some(0)), UNKNOWN_DECADE);
+
+        // The year / decade level is never mistaken for a title, in either the
+        // decade layout or the year layout written before the switch.
+        for segment in ["2020s", "2010s", "2024", "未知年代", "未知年份"] {
+            assert!(is_library_year_segment(segment), "{segment}");
+        }
+        for segment in ["20200s", "2020ss", "某剧 (2024)", "未知"] {
+            assert!(!is_library_year_segment(segment), "{segment}");
+        }
     }
 
     #[test]

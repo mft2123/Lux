@@ -205,6 +205,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Hand the archive poller the library services so it can auto-provision a
+    /// library per mirror board and queue the first scan
+    /// (docs/handoff/AUTO-LIBRARY.md). Called once, before the poller starts.
+    pub fn register_archive_auto_library(&self) {
+        let (Some(database), Some(libraries), Some(scan_jobs)) =
+            (self.database.clone(), self.libraries.clone(), self.scan_jobs.clone())
+        else {
+            return;
+        };
+        crate::application::archive::register_auto_library_services(
+            database, libraries, scan_jobs,
+        );
+    }
+
     pub async fn shutdown_background_workers(&self) {
         if let Err(error) = self.shutdown_background_workers_checked().await {
             tracing::error!(%error, "background workers could not drain before shutdown");

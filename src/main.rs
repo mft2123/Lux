@@ -160,6 +160,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker();
+    // The poller also provisions a library per mirror board, which needs the
+    // library services `AppState` just built.
+    app_state.register_archive_auto_library();
     luxd::application::archive::start_poller();
     // A large existing library can contain hundreds of thousands of episodes.
     // Repairing their legacy identities is a one-time background operation and
