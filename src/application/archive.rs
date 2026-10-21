@@ -543,14 +543,15 @@ impl TmdbMatch {
             .is_some_and(|language| matches!(language, "zh" | "cn" | "yue"))
     }
 
-    /// Variety shows and animation get their own boards; everything else is a
-    /// movie or a TV series.
+    /// Variety shows get their own board. Animation is split by origin: a
+    /// domestic production goes to `动画`, a Japanese/Western one to `动漫`
+    /// (user decision 2026-10-21). Everything else is a movie or a TV series.
     pub(crate) fn category_label(&self) -> &'static str {
         if self.genres.iter().any(|genre| genre == "综艺") {
             return "综艺";
         }
         if self.genres.iter().any(|genre| genre == "动画") {
-            return "动画";
+            return if self.is_domestic() { "动画" } else { "动漫" };
         }
         self.kind.label()
     }
@@ -1560,7 +1561,11 @@ impl ArchiveService {
                 .unwrap_or_default();
             let series_category = category_name.contains("电视剧")
                 || category_name.contains("综艺")
-                || category_name.contains("动画");
+                || category_name.contains("动画")
+                || category_name.contains("动漫");
+            // 动画 / 动漫 boards carry both films and episodes.
+            let animation_category =
+                category_name.contains("动画") || category_name.contains("动漫");
             let movie_category = category_name.contains("电影");
             if !series_category && !movie_category {
                 continue;
@@ -1605,13 +1610,21 @@ impl ArchiveService {
                         continue;
                     };
                     let matched = match self.lookup_tmdb(&parsed, series_category).await {
-                        Ok(Some(matched)) => matched,
-                        Ok(None) => {
-                            report
-                                .failed
-                                .push(format!("{}: TMDB 未找到匹配", title_dir.display()));
-                            continue;
+                        // The animation boards hold films and episodes alike, so
+                        // a title that is no series there may still be a film.
+                        Ok(None) if animation_category => {
+                            match self.lookup_tmdb(&parsed, false).await {
+                                Ok(matched) => matched,
+                                Err(error) => {
+                                    report.failed.push(format!(
+                                        "{}: TMDB 查询失败: {error}",
+                                        title_dir.display()
+                                    ));
+                                    continue;
+                                }
+                            }
                         }
+                        Ok(matched) => matched,
                         Err(error) => {
                             report.failed.push(format!(
                                 "{}: TMDB 查询失败: {error}",
@@ -1619,6 +1632,12 @@ impl ArchiveService {
                             ));
                             continue;
                         }
+                    };
+                    let Some(matched) = matched else {
+                        report
+                            .failed
+                            .push(format!("{}: TMDB 未找到匹配", title_dir.display()));
+                        continue;
                     };
                     if dry_run {
                         report.created.push(format!(
@@ -2565,6 +2584,7 @@ async fn reconcile_libraries() {
     tracing::info!(
         mirror = %mirror_root.display(),
         created = ?report.created,
+        updated = ?report.updated,
         existing = report.existing.len(),
         scans = ?report.scans,
         failed = ?report.failed,
@@ -4288,6 +4308,31 @@ mod tests {
             genres: vec!["综艺".to_owned()],
         };
         assert_eq!(variety.category_label(), "综艺");
+
+        // Animation is split by origin: domestic titles stay on 动画, imported
+        // ones go to 动漫 (2026-10-21).
+        let domestic_anime = TmdbMatch {
+            kind: MediaKind::Series,
+            tmdb_id: 4,
+            title: "灵笼".to_owned(),
+            year: Some(2019),
+            origin_countries: vec!["CN".to_owned()],
+            release_country: None,
+            original_language: Some("zh".to_owned()),
+            genres: vec!["动画".to_owned()],
+        };
+        assert_eq!(domestic_anime.category_label(), "动画");
+        let imported_anime = TmdbMatch {
+            kind: MediaKind::Series,
+            tmdb_id: 5,
+            title: "進撃の巨人".to_owned(),
+            year: Some(2013),
+            origin_countries: vec!["JP".to_owned()],
+            release_country: None,
+            original_language: Some("ja".to_owned()),
+            genres: vec!["动画".to_owned()],
+        };
+        assert_eq!(imported_anime.category_label(), "动漫");
     }
 
     #[test]
