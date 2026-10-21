@@ -543,15 +543,16 @@ impl TmdbMatch {
             .is_some_and(|language| matches!(language, "zh" | "cn" | "yue"))
     }
 
-    /// Variety shows get their own board. Animation is split by origin: a
-    /// domestic production goes to `动画`, a Japanese/Western one to `动漫`
-    /// (user decision 2026-10-21). Everything else is a movie or a TV series.
+    /// Variety shows get their own board. Animation is one board that is split
+    /// by region only — 动画 and 动漫 are the same board (user decision
+    /// 2026-10-21: merge them, keep just 国内/国外). Everything else is a movie
+    /// or a TV series.
     pub(crate) fn category_label(&self) -> &'static str {
         if self.genres.iter().any(|genre| genre == "综艺") {
             return "综艺";
         }
         if self.genres.iter().any(|genre| genre == "动画") {
-            return if self.is_domestic() { "动画" } else { "动漫" };
+            return "动画";
         }
         self.kind.label()
     }
@@ -4309,30 +4310,21 @@ mod tests {
         };
         assert_eq!(variety.category_label(), "综艺");
 
-        // Animation is split by origin: domestic titles stay on 动画, imported
-        // ones go to 动漫 (2026-10-21).
-        let domestic_anime = TmdbMatch {
-            kind: MediaKind::Series,
-            tmdb_id: 4,
-            title: "灵笼".to_owned(),
-            year: Some(2019),
-            origin_countries: vec!["CN".to_owned()],
-            release_country: None,
-            original_language: Some("zh".to_owned()),
-            genres: vec!["动画".to_owned()],
-        };
-        assert_eq!(domestic_anime.category_label(), "动画");
-        let imported_anime = TmdbMatch {
-            kind: MediaKind::Series,
-            tmdb_id: 5,
-            title: "進撃の巨人".to_owned(),
-            year: Some(2013),
-            origin_countries: vec!["JP".to_owned()],
-            release_country: None,
-            original_language: Some("ja".to_owned()),
-            genres: vec!["动画".to_owned()],
-        };
-        assert_eq!(imported_anime.category_label(), "动漫");
+        // 动画 and 动漫 are the same board: it is split by region, never by
+        // origin (2026-10-21).
+        for (title, origin, language) in [("灵笼", "CN", "zh"), ("進撃の巨人", "JP", "ja")] {
+            let anime = TmdbMatch {
+                kind: MediaKind::Series,
+                tmdb_id: 4,
+                title: title.to_owned(),
+                year: Some(2019),
+                origin_countries: vec![origin.to_owned()],
+                release_country: None,
+                original_language: Some(language.to_owned()),
+                genres: vec!["动画".to_owned()],
+            };
+            assert_eq!(anime.category_label(), "动画");
+        }
     }
 
     #[test]

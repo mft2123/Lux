@@ -5,15 +5,16 @@
 //! [`provision`]: the end of an archive run and a startup reconciliation. Both
 //! are idempotent because the library root path is the idempotency key.
 //!
-//! The animation boards are split by region into one library per region, because
-//! that is how the user browses them (2026-10-21):
+//! The animation board is one board split by region into one library per region,
+//! because that is how the user browses it (2026-10-21):
 //!
-//! - `动画` holds Chinese productions, `动漫` holds Japanese/Western ones (the
-//!   archive classifier writes the board, see [`crate::application::archive`]);
-//! - each board is browsed as one library per region: `国内动画` / `国外动漫`;
+//! - 动画 and 动漫 are the **same** board — merged, region is the only split;
+//! - it is browsed as `国内动画` / `国外动画`;
 //! - the region directory may use any of the names the existing 影视库 tree
 //!   uses (`国内`/`国产`/`华语`… and `国外`/`日本`/`欧美`…), and several
-//!   directories that denote the same region become roots of the same library.
+//!   directories that denote the same region become roots of the same library;
+//! - a `动漫` directory is treated as the same board as `动画`, so data copied
+//!   over from the real tree does not need renaming first.
 //!
 //! Every other board stays one library.
 
@@ -34,8 +35,12 @@ use crate::{
     storage::Database,
 };
 
-/// Boards split into one library per region.
+/// Boards split by region. `动漫` is the same board as `动画` (merged
+/// 2026-10-21), accepted so a directory copied over from the real tree keeps
+/// working.
 const REGION_SPLIT_BOARDS: &[&str] = &["动画", "动漫"];
+/// The board every split region library is named after: `国内` + this.
+const SPLIT_BOARD_LABEL: &str = "动画";
 const DOMESTIC: &str = "国内";
 const FOREIGN: &str = "国外";
 /// Region directory names used by the real library tree. A directory whose name
@@ -111,7 +116,26 @@ pub(crate) fn plan_libraries(mirror_root: &Path) -> Vec<LibraryPlan> {
             roots: vec![board],
         });
     }
-    plans
+    merge_same_named_plans(plans)
+}
+
+/// Merge plans that ended up with the same name: 动画/国内 和 动漫/国产动漫 are
+/// the same library, so they contribute one library with both roots.
+fn merge_same_named_plans(plans: Vec<LibraryPlan>) -> Vec<LibraryPlan> {
+    let mut merged: Vec<LibraryPlan> = Vec::new();
+    for plan in plans {
+        match merged.iter_mut().find(|kept| kept.name == plan.name) {
+            Some(kept) => {
+                for root in plan.roots {
+                    if !kept.roots.contains(&root) {
+                        kept.roots.push(root);
+                    }
+                }
+            }
+            None => merged.push(plan),
+        }
+    }
+    merged
 }
 
 /// One library per region of a split board, plus one library per subdirectory
@@ -142,7 +166,7 @@ fn plan_split_board(board: &Path, board_name: &str) -> Vec<LibraryPlan> {
     }
     let mut plans = Vec::new();
     for (region, roots) in regions {
-        let name = format!("{region}{board_name}");
+        let name = format!("{region}{SPLIT_BOARD_LABEL}");
         // Animation boards carry both films and episodes, so the scan has to
         // classify each file instead of forcing one parser on the library.
         let kept: Vec<PathBuf> = roots
@@ -163,7 +187,8 @@ fn plan_split_board(board: &Path, board_name: &str) -> Vec<LibraryPlan> {
             continue;
         }
         plans.push(LibraryPlan {
-            kind: kind_for_board(&name),
+            // An animation sub-board (儿童动漫) carries films and episodes too.
+            kind: LibraryKind::Mixed,
             name,
             roots: vec![root],
         });
@@ -389,10 +414,11 @@ mod tests {
         touch(&root.join("电影/国外/2020s/某片 (2024)/某片.strm"));
         touch(&root.join("电影/国内/2010s/另一片 (2014)/另一片.strm"));
         touch(&root.join("电视剧/国内/2020s/某剧 (2024)/Season 01/S01E01.strm"));
-        // The real tree spells the animation regions as their own directories.
         touch(&root.join("动画/国内/2020s/国漫 (2024)/S01E01.strm"));
-        touch(&root.join("动漫/日本动漫/2020s/日漫 (2024)/S01E01.strm"));
-        touch(&root.join("动漫/欧美动漫/2020s/美漫 (2024)/S01E01.strm"));
+        touch(&root.join("动画/国外/2020s/日漫 (2024)/S01E01.strm"));
+        // 动漫 is the same board as 动画: its region directories feed the same
+        // library instead of creating a second one.
+        touch(&root.join("动漫/日本动漫/2020s/另一部日漫 (2024)/S01E01.strm"));
         // An empty board must not become an empty library.
         std::fs::create_dir_all(root.join("综艺")).expect("empty board");
         // A board without the region level keeps a single library.
@@ -408,34 +434,34 @@ mod tests {
     }
 
     #[test]
-    fn plans_one_library_per_board_and_splits_the_animation_boards() {
+    fn plans_one_library_per_board_and_splits_animation_by_region() {
         let mirror = mirror();
         let plans = plan_libraries(mirror.path());
         assert_eq!(
             plans.len(),
             5,
-            "电影/电视剧/国内动画/国外动漫/纪录片, without the empty 综艺: {plans:?}"
+            "电影/电视剧/国内动画/国外动画/纪录片, without the empty 综艺: {plans:?}"
         );
         assert_eq!(plan_named(&plans, "电影").kind, LibraryKind::Movie);
         assert_eq!(plan_named(&plans, "电视剧").kind, LibraryKind::Series);
         assert_eq!(plan_named(&plans, "纪录片").kind, LibraryKind::Series);
-        // Animation boards hold films and episodes alike.
+        // The animation board holds films and episodes alike.
         assert_eq!(plan_named(&plans, "国内动画").kind, LibraryKind::Mixed);
-        assert_eq!(plan_named(&plans, "国外动漫").kind, LibraryKind::Mixed);
+        assert_eq!(plan_named(&plans, "国外动画").kind, LibraryKind::Mixed);
         assert!(plans.iter().all(|plan| plan.name != "综艺"));
     }
 
-    /// 日本动漫 和 欧美动漫 都是国外：两种拼法合成一个库、两个根。
+    /// 动画/国外 和 动漫/日本动漫 是同一个板块的同一地区：一个库、两个根。
     #[test]
-    fn several_region_directories_feed_one_library() {
+    fn merged_animation_boards_feed_one_library() {
         let mirror = mirror();
         let plans = plan_libraries(mirror.path());
-        let foreign = plan_named(&plans, "国外动漫");
+        let foreign = plan_named(&plans, "国外动画");
         assert_eq!(
             foreign.roots,
             vec![
                 mirror.path().join("动漫/日本动漫"),
-                mirror.path().join("动漫/欧美动漫"),
+                mirror.path().join("动画/国外"),
             ]
         );
     }
@@ -471,7 +497,7 @@ mod tests {
         touch(&mirror.path().join("动漫/国产动漫/2020s/国漫 (2024)/S01E01.strm"));
         touch(&mirror.path().join("动漫/儿童动漫/2020s/儿童番 (2024)/S01E01.strm"));
         let plans = plan_libraries(mirror.path());
-        assert_eq!(plan_named(&plans, "国内动漫").kind, LibraryKind::Mixed);
+        assert_eq!(plan_named(&plans, "国内动画").kind, LibraryKind::Mixed);
         assert_eq!(
             plan_named(&plans, "儿童动漫").roots,
             vec![mirror.path().join("动漫/儿童动漫")]
@@ -493,14 +519,14 @@ mod tests {
         assert!(first.failed.is_empty(), "{:?}", first.failed);
         assert_eq!(first.created.len(), 5, "{first:?}");
         assert!(first.created.iter().any(|name| name == "国内动画"));
-        assert!(first.created.iter().any(|name| name == "国外动漫"));
+        assert!(first.created.iter().any(|name| name == "国外动画"));
 
         let second = provision(&database, &libraries, None, mirror.path()).await;
         assert!(second.created.is_empty(), "{second:?}");
         assert!(second.updated.is_empty(), "{second:?}");
         assert_eq!(second.existing.len(), 5, "{second:?}");
 
-        // 国外动漫 is fed by two region directories.
+        // 国外动画 is fed by both animation boards.
         let stored = database.list_all_library_roots().await?;
         assert_eq!(stored.len(), 6);
         Ok(())
