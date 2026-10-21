@@ -1,171 +1,172 @@
-# Lux 交接（2026-10-20 收尾）
+# Lux 交接（2026-10-21 收尾，给下一次会话）
 
-> 给下一个对话：先读本文件，再读 `HANDOFF.md`（历史全貌）与 `CHANNEL-MONITORING.md`、`AUTO-LIBRARY.md`（两份新契约）。
-> 仓库：`qiangli@192.168.8.8:/vol5/1000/build/lux`（**主 checkout 在 `feat/telegram-ingest`，不是主干**）。
-> 本轮所有工作都在 worktree `/tmp/lux-u11`（分支 `fix/u11-e2e`），已 fast-forward 到主干。
+> **先读这个文件，再读两份契约**：
+> - `docs/archive-pipeline.md` —— 归档流水线的行为规范（代码按它执行，改算法先改它）
+> - `docs/handoff/AUTO-LIBRARY.md` —— 自动入库契约
+> - `docs/handoff/CHANNEL-MONITORING.md` —— TG 频道监听 v2（还没做）
+>
+> 上一轮（2026-10-20：U11 115 转存、5 个真 bug、设置页、主题、TG 侧车、封面）的全文在
+> `docs/handoff/ARCHIVE-2026-10-20.md`，需要背景时再翻。
+>
+> 仓库：`qiangli@192.168.8.8:/vol5/1000/build/lux`（主 checkout 在 `feat/telegram-ingest`）。
+> 本轮工作区：worktree `/tmp/lux-u11`，分支 `fix/u11-e2e`。
 
 ## 1. 当前基线
 
 | 项 | 值 |
 | --- | --- |
-| 主干 `fork/phase-a` / `integration/round2` | `b970604f` |
-| 镜像 `lux:phase-a` | `0c20b6520f77` |
+| 代码提交 | `b02cbc9f` `feat(archive): one library per type board`（本文件另有一次 docs 提交，在它之后） |
+| 镜像 | `lux:phase-a` = `0514bbafeb6a`（已部署，容器在跑） |
 | 测试容器 | `lux-testlib`（8099→8097，admin/`Test@12345a`，healthy） |
-| 115 侧车 | `lux-transfer115`（8098，healthy，`logged_in`） |
-| TG 侧车（测试用） | `lux-telegram-test`（8091，`logged_in`，24 个频道） |
-| 测试配置 | `/vol5/1000/build/archive-test-config`（含真实 115 cookie 与 chill 的 TG 凭证） |
-| 镜像 lux: 前端产物 | `assets/index-*.js`，改动后哈希必变（可用它判断是否进包） |
+| 115 侧车 | `lux-transfer115`（8098，healthy） |
+| TG 侧车（测试） | `lux-telegram-test`（8091，24 个频道） |
+| 测试配置 | `/vol5/1000/build/archive-test-config` |
+| 构建/测试 | docker `rust:1.94-test`，target 共享在 `/vol5/1000/build/target` |
 
-## 2. 本轮完成（都有实测证据）
-
-### 2.1 U11 115 转存端到端（真实 cookie）
-- 链路全通：`ingest → 侧车 share_receive → 115 转存目录 → CD2 可见 → 待整理`。
-- 实测落盘 `测试库/转存目录/Whistle (2026) {tmdb-1759321}/`。
-- 失败分支：坏 cookie → `auth_required`，作业留队、`状态.jsonl` 行数不变。
-
-### 2.2 修掉的 5 个真 bug
-1. Rust 只认 `115.com`，`115cdn.com` 被判 unsupported（已与侧车 `SHARE_HOSTS` 对齐）。
-2. 分享密码粘连说明文字（`?password=x3c1，请及时检查…`）被整串当提取码。
-3. `login_status()` 失效时返回裸 `False`；115 又把登录失效放在 HTTP 200 的 body（`errno 990001`）——两处都不认，导致作业被记 `failed` 而不是留队。
-4. 侧车 `_is_dir_of` 只认 `is_dir` 键，而 115 的真实列表用 `cid`/`fid` 区分目录与文件。
-5. `p115client==0.0.9.4` 不可复现：必须钉 `python-asynctools==0.1.4`（0.2.2 缺 `to_list`，镜像启动即崩）。
-
-### 2.3 设置页
-- 归档设置拆成 6 个区、**各自保存**；115 区加「测试连接」（服务端代测 `healthz?deep=1`）。
-- 全局「服务器设置」拆出「媒体库显示」，同样各自保存；表单只在首次加载填充，不再覆盖未保存编辑。
-
-### 2.4 主题
-- 顶栏加日/月切换（原先只在「账户→外观」）。
-- 主按钮跟随强调色（silver 保持原样）。
-- 浅色主题可读性：后台标题、图标按钮、输入框、状态框回退到主题变量。
-- 下拉可读性：`.lux-select-option` 改用 `--lux-text`；原生 `<select>` 的 `option` 按主题显式定色。
-
-### 2.5 TG 侧车（频道清单的地基）
-- `GET /channels`：`iter_dialogs` 取账号频道（只留 `is_channel`），60s 超时、失败断开重连。
-- `listen_channels` 为空不再 `exit 2`，改为空转 + WARNING（否则永远没机会列频道）。
-- `runtime_problems` 不再把「频道为空」当不健康。
-- 实测：`/healthz` → configured；`?deep=1` → logged_in；`/channels` → 24 个频道。
-- 单测 `tests/test_channels.py` 2 条通过。
-
-### 2.6 封面
-- 新增 `GeneratedCover`（本地绘制，无网络）：电影酒红 / 剧集藏蓝 / 动画紫，片名 + 年份 + 类型角标。
-- 已接进 `MediaPlaceholder`（无图条目）。
-- 电影卡片 `<img>` 加 `onError` 回退到生成封面（电影有 imageTags 但图片 404，导致空白）。
-
-## 3. 未完成（按优先级）
-
-1. **自动入库**（契约已写：`AUTO-LIBRARY.md`，尚未实现）
-   - 规则：`媒体目录/<分类>` → 同名库（电影 MOVIE、电视剧/动画/晚会/演唱会 SERIES），幂等键=库根路径，空目录不建库。
-   - 触发：归档 run 结束 + 启动对账；建库后自动全量扫描。
-   - **前置**：`lux-library` 里没有 `动画` 目录 → 先查归档分类→镜像生成为何漏了动画。
-2. **TG 频道监听 v2 的 Lux 侧**（契约：`CHANNEL-MONITORING.md`）
-   - `POST /admin/archive/telegram/channels` 代取 → 设置 schema `channels[{id,telegramId,username,title,enabled,modes}]` → 页面勾选 → 每频道 `lastMessageId` 游标 + 判定矩阵。
-   - 注意：`manual` 是派生值（其余四个全 false），不是独立开关。
-3. **失败原因文件乱码**：`失败目录/<ts>/原因.txt` 实际是**合法 UTF-8**，Windows 默认 GBK 编辑器打开才乱码。
-   修法：写入时加 UTF-8 BOM（`EF BB BF`），在 `src/application/archive.rs` 写原因文件处加前缀即可。
-4. **封面/主题的视觉验收**：本机无浏览器，以上 UI 改动只验到「编译通过 + 产物含新代码 + 接口行为」，**没有真眼看过**。
-
-## 4. 踩坑（本轮新增）
-
-1. `docker build` 成功的旧哈希可能表示**改动没进 bundle**（模块未被引用会被 tree-shake）。判断依据应是镜像哈希是否变化。
-2. 权限：测试设置文件是 0600 root，TG 侧车以 uid 10001 跑会读不到；测试时用 `--user 0` 或 `group_add`。
-3. TG 侧车 `sink=http` 必须要有 Lux 管理 API key（可从 `POST /api/v1/admin/api-key/rotate` 取），否则 exit 2。
-4. 用 chill 的 session 做真机测试：复制 `/vol5/1000/docker/chillposter/config/telegram_user.session` 到测试目录并重命名 `lux-telegram.session`，**不要动原件**。
-5. `docker inspect ... --format '{{...}}'` 在 Windows 的 ssh 传参里会被引号吃掉，写脚本文件执行更稳。
-6. 别再用 `git branch -f ... HEAD`（在 `-C 主仓库` 下 HEAD 指主 checkout，会把主干指回旧提交）；要给显式 SHA。
-
-## 5. 常用验收命令
+**容器需要 TMDB key**（否则归档/回填全失败）：
 
 ```bash
-# 测试容器登录
+KEY=$(python3 -c "import json;print(json.load(open('/vol5/1000/docker/chillposter/config/settings.json'))['tmdb_key'])")
+# 重建容器时加：-e LUX_TMDB_API_KEY="$KEY"
+```
+
+## 2. 本轮（10-21）做了什么
+
+### 2.1 目录层：年份 → 年代
+
+`媒体目录/<类型>/<国内|国外>/<年代>/<片名 (年份)>/`。`2024` → `2020s`，无年份 → `未知年代`，
+与用户既有 `影视库/媒体目录` 一致。库内查找同时认「年份」和「年代」，老目录还能解析。
+
+### 2.2 自动入库（新增，`src/application/archive/auto_library.rs`）
+
+**一个类型一个库**，和电影、电视剧完全一样：`电影` / `电视剧` / `动画` / `综艺` / `晚会` / `演唱会` …
+地区（国内/国外）和年代是库**里面**的目录层，**永不拆库**。
+
+- 库类型：含「电影」→ `MOVIE`；动画板块 → `MIXED`（既有动画电影也有番剧，按文件逐个判定）；其余 `SERIES`
+- `动漫` 是动画板块的别名，合并进「动画」库（第二个根），不新建库
+- 空目录（无 strm/nfo）不建库
+- 幂等键 = 库根路径；已存在只补缺的根
+- 建库后自动入队一次全量扫描（复用 `ScanJobService`，不另起通道）
+- 触发三个：① 归档 run 结束（`organized` 非空）② 启动对账 ③ 每 600s 兜底对账
+- 接线：`AppState::register_archive_auto_library()`（`main.rs` 在 `start_poller()` 前调用），
+  `start_poller()` 签名未变
+
+### 2.3 动画 / 动漫最终口径
+
+**合并成一个板块「动画」**，只按地区分国内/国外，且**地区只是库内目录**。
+归类器 `category_label()` 只输出 `动画`（不再按产地分 `动漫`）。
+
+### 2.4 测试库数据迁移（115 侧，只动 `测试库/媒体目录`）
+
+1. `动画/<年代>/` → `动画/国内|国外/<年代>/`（141 条：国内 112、国外 29）
+2. 存量年份目录 → 年代目录（电影 5 个、电视剧 8 个年份桶，22 条片）
+3. `动漫/*` 合并回 `动画/*`（29 条），`动漫` 空目录已删
+4. 回填镜像：`POST /api/v1/admin/archive/metadata?dry_run=false`
+5. 建库来回建过几次，最后只留三个库（旧库 DELETE 后由对账重建）
+
+## 3. 当前数据状态（实测）
+
+115 `测试库/媒体目录`：
+
+```
+电影/国外/{1980s,2000s,2010s}          （电影只有国外，没有国内）
+电视剧/{国内,国外}/{1990s,2010s,2020s}
+动画/{国内/{2010s,2020s}, 国外/2020s}
+```
+
+本地镜像 `/vol5/1000/docker/lux-library`：结构同上（去掉 `媒体目录/` 这层），每部片是
+`.strm` + NFO + 海报。
+
+| 库 | kind | 根 | 条目 |
+| --- | --- | --- | --- |
+| 动画 | MIXED | `/library/动画`（国内、国外都在库内） | SERIES 129 · MOVIE 1 · SEASON 140 · EPISODE 2913 · FOLDER 3 |
+| 电影 | MOVIE | `/library/电影` | MOVIE 5 · FOLDER 9 |
+| 电视剧 | SERIES | `/library/电视剧` | SERIES 18 · SEASON 19 · EPISODE 364 |
+| 合集 | MIXED | 无根、0 条目 | 早先遗留的空库 |
+
+扫描任务：3 条全部 `COMPLETED`。web 库列表：`['动画', '电影', '电视剧']`。
+
+## 4. 已定的事（别翻案）
+
+1. **一类型一库**：`动画`、`电影`、`电视剧` 各一个库。10-21 当天先按产地拆过两个库、又按地区拆过两个库，
+   两次都被用户纠正——**不要再按地区/产地拆库**。
+2. **国内/国外、年代是库内目录层**，不是库。
+3. **动画与动漫是同一个板块**，只分国内/国外。
+4. **晚会不分地区**（`晚会/<年代>/…`），**演唱会分地区**（`演唱会/<国内|国外>/<年代>/…`），各一个库。
+5. **只动测试库**：真实库 `影视库/媒体目录` 全程只读。真实库等调试完成后**分批复制**到测试库再跑。
+6. 年代段与真实库一致（真实库是 `<类型>/<地区>/<年代>/<片名>`）。
+
+## 5. 未完成（按优先级）
+
+1. **电影库只有 5/16 部识别成 MOVIE，其余 9 条是 FOLDER**（连 `1980s`、`国外` 这种目录也被扫成条目）。
+   既有问题，不是本轮引入的，但真实库接进来会放大——建议批量复制前先修。
+2. **`合集` 空库**（MIXED、无根、0 条目，web 不显示）：删或留着待用户定。
+3. **失败原因文件 `原因.txt` 乱码**：内容其实是合法 UTF-8，Windows 记事本按 GBK 打开才乱。
+   修法：写入时加 UTF-8 BOM（`EF BB BF`），改 `src/application/archive.rs` 写原因文件处。
+4. **真实库分批复制方案**：真实库一级目录是 `剧集/动漫/电影/综艺/纪录片/晚会/演唱会/特摄剧/…`，
+   与 Lux 写的 `电视剧/动画` 不同；复制时要么改名为 Lux 口径，要么依赖别名（`动漫` 已支持，`剧集` 尚未）。
+5. **TG 频道监听 v2 的 Lux 侧**（契约 `CHANNEL-MONITORING.md`）：代取频道 → 设置 schema → 每频道游标 +
+   判定矩阵。`manual` 是派生值（其余四个全 false），不是独立开关。
+6. **封面/主题的视觉验收**：本机无浏览器，10-20 那批 UI 改动只验到编译+接口，没人眼看过。
+7. 回填生成的镜像目录名保留了 115 侧的 `{tmdb-123}` 后缀（归档 run 生成的不带），只影响观感。
+8. TMDB `{tmdb-ID}` 提示可能跨命名空间误命中（同一 id 在 movie/tv 下都存在），目前靠人工核对。
+
+## 6. 踩坑（本轮新增，必看）
+
+1. **年份→年代迁移要合并内容**：把 `1989/` 目录整个塞进 `1980s/` 会变成 `1980s/1989/<片>`，
+   回填时报 `无法从目录名解析`。正确做法是把年份目录的**内容**挪进年代目录，再删空目录。
+2. **`"动漫".contains("动画")` 是 false**：任何按分类名的启发式（回填的 series 判定、自动入库）都要
+   两个都写，否则 `动漫` 整块被静默跳过。
+3. **动了 `媒体目录` 就必须重建镜像**：strm 内容里带着 115 侧的完整路径，只挪目录不改 strm 就是死链。
+   标准动作：挪 115 → 删对应镜像目录 → `POST /admin/archive/metadata?dry_run=false` → 重扫。
+4. **改库的类型要删库重建**：`SERIES` → `MIXED` 这种没有接口改，DELETE 库再让对账重建即可
+   （条目会重新扫回来）。
+5. **回填/归档需要 TMDB key**：容器默认没有，重建时加 `-e LUX_TMDB_API_KEY`。
+6. **`tests/admin_health.rs` 在干净 HEAD 也失败**（`maxConnections` 期望 8、实际 24），环境相关，别当回归。
+7. `docker build` 成功不代表改动进包：看**镜像哈希是否变化**，以及 `assets/index-*.js` 哈希。
+8. 别用 `git branch -f … HEAD`（主 checkout 的 HEAD 会把主干指回旧提交），要给显式 SHA。
+
+## 7. 常用验收命令
+
+```bash
+# 登录 + CSRF
 curl -s -c /tmp/c.jar -X POST http://127.0.0.1:8099/api/v1/auth/login \
   -H 'content-type: application/json' -d '{"username":"admin","password":"Test@12345a"}'
 csrf=$(awk '$6=="lux_csrf" {print $7}' /tmp/c.jar)
 
-# 115 / TG 探活
+# 归档状态 / 回填镜像 / 重启扫描
+curl -s -b /tmp/c.jar http://127.0.0.1:8099/api/v1/admin/archive/status
 curl -s -b /tmp/c.jar -X POST -H "X-CSRF-Token: $csrf" \
-  http://127.0.0.1:8099/api/v1/admin/archive/transfer115/probe
-curl -s -b /tmp/c.jar -X POST -H "X-CSRF-Token: $csrf" \
-  http://127.0.0.1:8099/api/v1/admin/archive/telegram/probe
-curl -s http://127.0.0.1:8091/channels
+  "http://127.0.0.1:8099/api/v1/admin/archive/metadata?dry_run=false"
 
-# 构建（总控/交接者）
-cd /tmp/lux-u11 && DOCKER_BUILDKIT=1 docker build -f Dockerfile.custom -t lux:phase-a .
-```
----
-
-# 2026-10-21 本轮：年代段 + 自动入库 + 动画分国内/国外两库
-
-## 6. 改了什么
-
-1. **归档目标改为年代**：`<类型>/<地区>/<年代>/<片名 (年份)>/`（`2024` → `2020s`，无年份 → `未知年代`），
-   对齐用户既有 `影视库/媒体目录`。`is_library_year_segment` 同时认「年份」和「年代」，
-   老目录仍能被库内查找/洗版逻辑解析。
-2. **动画与动漫合并成一个板块**（用户 2026-10-21 最终决定）：归类器只输出 `动画`，
-   板块内只按地区分「国内 / 国外」。`动漫` 目录名只当同一板块的别名（自动入库时两块合流成同一个库）。
-   坑：`"动漫".contains("动画")` 是 false——任何按分类名的启发式（如回填的 series 判定）都要两个都写，
-   否则 `动漫` 整块会被静默跳过（本轮踩过一次已修）。
-3. **自动入库**（`src/application/archive/auto_library.rs`，契约 `AUTO-LIBRARY.md`）：
-   **一个类型一个库** —— 电影 / 电视剧 / 动画 / 综艺 / 晚会 / 演唱会 …，和电影、电视剧完全一致。
-   **国内/国外是库内的目录层，不拆库**（用户 2026-10-21 最终纠正：`动画/国内` 和 `动画/国外`
-   都属于同一个「动画」库）；`动漫` 是动画板块的别名，合并成同一个库的第二个根。
-   动画库类型 `MIXED`（既有动画电影也有番剧，按文件逐个判定），其余含「电影」→ MOVIE、否则 SERIES。
-   空板不建库；幂等键 = 库根路径（只补缺的根）；建库后入队全量扫描。
-   触发三个：归档 run 结束（organized 非空）、启动对账、每 600s 兜底。
-   **走偏记录**：同一天先按产地拆过「动画/动漫」两个库、又按地区拆过「国内动画/国外动画」，
-   两次都被用户纠正。最终口径就是「一类型一库」，别再拆。
-4. **接线**：`AppState::register_archive_auto_library()`（`main.rs` 在 `start_poller()` 前调用）
-   把 database / libraries / scan_jobs 交给 poller，`start_poller()` 签名不变。
-
-## 7. 测试库数据迁移（115 侧，已做）
-
-- `动画/<年代>/` → `动画/国内|国外/<年代>/`（141 条：国内 112、国外 29，地区取自
-  `影视库/媒体目录/动漫/国产动漫|日本动漫` 的同名条目）。
-- 动画/动漫来回挪过两次：先按「国产→动画、日本/欧美→动漫」把 29 条挪到 `动漫/国外`，
-  合并决定后又整体挪回 `动画/国外`，`动漫` 目录已删。
-- 建库也来回建过：`国内动画`+`国外动漫` → `国内动画`+`国外动画` → 最终只留一个 `动画` 库
-  （根 `动画`，`国内/国外` 在库内）。旧库都是 DELETE 接口删掉后由对账重建的。
-  **本机只动过 `测试库/媒体目录`，`影视库` 全程只读**；真实库等调试好再分批复制。
-- 存量年份目录 → 年代目录（电影 5 个、电视剧 8 个年份桶，22 条片）。
-  **注意**：第一次迁移脚本把年份目录**嵌套**进了年代目录（`1980s/1989/<片>`），
-  回填时报 `无法从目录名解析`；正确做法是把年份目录的**内容**合并进年代目录后再删空目录。
-- 2 条目录名里的 `{tmdb-ID}` 是错的（`46711` → CBC News、`319496` → 生命的极限）：已去掉 id 让搜索重解析。
-- 回填镜像：`POST /api/v1/admin/archive/metadata?dry_run=false`（容器需 `LUX_TMDB_API_KEY`，
-  取自 `/vol5/1000/docker/chillposter/config/settings.json` 的 `tmdb_key`）。
-
-## 8. 实测证据
-
-| 项 | 结果 |
-| --- | --- |
-| 启动对账（空镜像） | 不建库（空板不产生库） |
-| 启动对账（有镜像） | `created:["国外动画"] existing:3 scans:["国外动画"] failed:[]` |
-| 幂等（再重启） | `found nothing to create, existing:5`；库/根数量不变 |
-| 触发点①（run 结束） | 放「周杰伦地表最强演唱会 2019」进 `待整理` → `organized:1` → 立即 `created:["演唱会"]` 并入队扫描 |
-| 空目录 | 镜像里建空目录 → 没有建库（验证后删除） |
-| 单测 | `cargo test --lib` 1094 passed；`archive` 相关 89 passed |
-
-`tests/admin_health.rs` 在**干净 HEAD `702a2ead` 上同样失败**（`maxConnections` 期望 8、实际 24），
-环境相关的既有失败，与本轮无关。
-
-## 9. 已知 / 待办
-
-1. 回填生成的镜像目录名保留了 115 侧的 `{tmdb-123}` 后缀（归档 run 生成的不带），只影响观感。
-2. TMDB `{tmdb-ID}` 提示可能跨命名空间误命中（同一 id 在 movie/tv 下都存在），目前靠人工核对。
-3. 真实库（`影视库/媒体目录`）还没接进来：它的一级目录是 `剧集/动漫/电影/综艺/纪录片/晚会/演唱会/...`，
-   二级是 `国产动漫/日本动漫/欧美动漫`，与 Lux 写的 `电视剧/动画/动漫` 不同。
-   自动入库能认（别名表覆盖），但要上线得先决定：镜像从真实库生成，还是让 Lux 归档接管新片。
-4. 老待办仍在：`原因.txt` 加 BOM、TG 频道监听 v2 的 Lux 侧、封面/主题的真眼验收。
-
-## 10. 本轮验证命令
-
-```bash
+# 自动入库日志
 docker logs lux-testlib 2>&1 | grep -E "archive auto library|archive pipeline run completed"
+
+# 库 / 根 / 扫描 / 条目
 python3 - <<'PY'
 import sqlite3
 c = sqlite3.connect('/vol5/1000/build/archive-test-config/lux.db')
-print([r for r in c.execute('select name,kind from libraries order by name')])
+print(list(c.execute('select name,kind from libraries order by name')))
 print([r[0] for r in c.execute('select display_path from library_roots order by display_path')])
 print(list(c.execute('select status,count(*) from scan_jobs group by status')))
+print(list(c.execute("select l.name,m.item_type,count(*) from media_items m join libraries l on l.id=m.library_id group by 1,2")))
 PY
+
+# 单测（只跑归档相关，约 2 分钟）
+docker run --rm -e CARGO_HOME=/cargo-home -e RUSTUP_TOOLCHAIN=1.94.1 -e RUSTUP_DIST_SERVER=https://rsproxy.cn \
+  -v /vol5/1000/build/cargo-home:/cargo-home -v /tmp/lux-u11:/src -v /vol5/1000/build/target:/src/target -w /src \
+  rust:1.94-test bash -c "cargo test --locked --lib archive"
+
+# 重建镜像（约 5 分钟，web 层有缓存）
 cd /tmp/lux-u11 && DOCKER_BUILDKIT=1 docker build -f Dockerfile.custom -t lux:phase-a .
 ```
+
+`/tmp/recreate3.sh` 是重建 `lux-testlib` 的脚本（含 TMDB key、全部挂载与端口）。
+
+## 8. 建议的下一步顺序
+
+1. 修电影库的 FOLDER 噪音（影响真实库接入体验）
+2. `原因.txt` 加 BOM（单点、10 分钟）
+3. 定真实库分批复制方案（改名的映射表 + 每批复制后的回填/重扫流程）
+4. TG 频道监听 v2 的 Lux 侧（契约已写好，工作量最大）
+5. 找一台有浏览器的机器做封面/主题的视觉验收
