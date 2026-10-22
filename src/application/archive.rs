@@ -995,11 +995,26 @@ impl ArchiveService {
                     // Sidecars go into the LOCAL mirror (strm + NFO + images);
                     // the 115 pack keeps only media files. Best effort: a
                     // metadata problem must never undo a correct move.
+                    //
+                    // A single moved file is not a pack: point the writer at the
+                    // title directory that now holds it (its Season NN dir for a
+                    // series), otherwise `mirror_dir_for(&target)` maps the file
+                    // name into the mirror path and the sidecars land in a bogus
+                    // `<file>.mp4/` directory.
                     let mut metadata_report = nfo::MetadataReport::default();
-                    if let Some(mirror) = self.mirror_dir_for(&target) {
+                    let pack = if is_dir {
+                        Some(target.clone())
+                    } else if matched.kind == MediaKind::Series {
+                        target_dir.parent().map(Path::to_path_buf)
+                    } else {
+                        Some(target_dir.clone())
+                    };
+                    if let Some(pack) = pack
+                        && let Some(mirror) = self.mirror_dir_for(&pack)
+                    {
                         let writer = nfo::MetadataWriter::new(self, false);
                         writer
-                            .write_entry(&target, &mirror, &parsed, &matched, &mut metadata_report)
+                            .write_entry(&pack, &mirror, &parsed, &matched, &mut metadata_report)
                             .await;
                     }
                     if !metadata_report.failed.is_empty() {
