@@ -552,7 +552,13 @@ impl TmdbMatch {
     /// `<board>/<国内|国外>/<年代>/<Title (Year)>/`; 晚会 is the one board without
     /// the region level (user decision 2026-10-22).
     pub(crate) fn category_label(&self) -> &'static str {
-        if self.genres.iter().any(|genre| genre == "综艺") {
+        // TMDB has no 综艺 genre: Chinese variety shows are filed under
+        // 真人秀 (reality) or 脱口秀 (talk), so those two map to the board.
+        if self
+            .genres
+            .iter()
+            .any(|genre| matches!(genre.as_str(), "综艺" | "真人秀" | "脱口秀"))
+        {
             return "综艺";
         }
         if self.is_tokusatsu() {
@@ -3370,15 +3376,35 @@ pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
     // the default one. Release names also use dots as separators
     // (`汤直志异.S01E01.2026.2160p`), and a CJK title glued to the tags that way
     // never splits under the literal reading — the separator reading only wins
-    // when it actually finds the episode tags, so `唐探.1900` keeps its dot.
+    // when it finds the episode tags, or when the literal reading saw no year
+    // but this one recovers it from a release name (`周华健…演唱会.1996.480p`).
     if raw.chars().any(is_cjk) && raw.contains(['.', '_']) {
+        let literal = parse_media_name_pass(raw, false);
         if let Some(parsed) = parse_media_name_pass(raw, true) {
-            if parsed.season.is_some() && parsed.episode.is_some() {
+            let has_episode = parsed.season.is_some() && parsed.episode.is_some();
+            let recovers_year = parsed.year.is_some()
+                && literal.as_ref().is_none_or(|literal| literal.year.is_none())
+                && looks_like_release_name(raw);
+            if has_episode || recovers_year {
                 return Some(parsed);
             }
         }
+        return literal;
     }
     parse_media_name_pass(raw, false)
+}
+
+/// Release tags that only appear in file names, never inside a title, so the
+/// separator reading is safe when they are present.
+fn looks_like_release_name(raw: &str) -> bool {
+    const RELEASE_TAGS: &[&str] = &[
+        "1080p", "2160p", "720p", "480p", "WEB-DL", "WEBRip", "BluRay", "REMUX", "H264", "H265",
+        "x264", "x265", "HEVC", "AAC", "DTS",
+    ];
+    let lower = raw.to_ascii_lowercase();
+    RELEASE_TAGS
+        .iter()
+        .any(|tag| lower.contains(&tag.to_ascii_lowercase()))
 }
 
 fn parse_media_name_pass(raw: &str, split_separators: bool) -> Option<ParsedName> {
@@ -4334,6 +4360,15 @@ mod tests {
         // episode tag to split off.
         let parsed = parse_media_name("唐探.1900").expect("parsed");
         assert_eq!(parsed.title, "唐探.1900");
+
+        // A release-style name with no episode tag still has to recover the
+        // year, otherwise the 演唱会/晚会 board files it under 未知年代.
+        let parsed = parse_media_name(
+            "周华健96 香港弦全演唱会.1996.480p.H264.8bit.30fps.MP22.0",
+        )
+        .expect("parsed");
+        assert_eq!(parsed.title, "周华健96 香港弦全演唱会");
+        assert_eq!(parsed.year, Some(1996));
     }
 
     #[test]
@@ -4431,6 +4466,21 @@ mod tests {
             genres: vec!["综艺".to_owned()],
         };
         assert_eq!(variety.category_label(), "综艺");
+
+        // TMDB has no 综艺 genre: reality and talk shows carry 真人秀 / 脱口秀.
+        for genre in ["真人秀", "脱口秀"] {
+            let show = TmdbMatch {
+                kind: MediaKind::Series,
+                tmdb_id: 7,
+                title: "一起露营吧".to_owned(),
+                year: Some(2022),
+                origin_countries: vec!["CN".to_owned()],
+                release_country: None,
+                original_language: Some("zh".to_owned()),
+                genres: vec![genre.to_owned()],
+            };
+            assert_eq!(show.category_label(), "综艺", "{genre}");
+        }
 
         // 动画 and 动漫 are the same board: it is split by region, never by
         // origin (2026-10-21).
