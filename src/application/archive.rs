@@ -3349,6 +3349,22 @@ fn urlencode(value: &str) -> String {
 /// Parse `Title (2024)`, `Title.2024`, `Title.2024.S01E02`, `[Group] Title [2024]`
 /// and similar release names into title, year, season and episode.
 pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
+    // Chinese titles may legitimately contain dots, so the literal reading is
+    // the default one. Release names also use dots as separators
+    // (`汤直志异.S01E01.2026.2160p`), and a CJK title glued to the tags that way
+    // never splits under the literal reading — the separator reading only wins
+    // when it actually finds the episode tags, so `唐探.1900` keeps its dot.
+    if raw.chars().any(is_cjk) && raw.contains(['.', '_']) {
+        if let Some(parsed) = parse_media_name_pass(raw, true) {
+            if parsed.season.is_some() && parsed.episode.is_some() {
+                return Some(parsed);
+            }
+        }
+    }
+    parse_media_name_pass(raw, false)
+}
+
+fn parse_media_name_pass(raw: &str, split_separators: bool) -> Option<ParsedName> {
     let mut text = raw.trim().to_string();
     if text.is_empty() {
         return None;
@@ -3369,7 +3385,7 @@ pub(crate) fn parse_media_name(raw: &str) -> Option<ParsedName> {
     // Normalize separators: dots/underscores between title words are common in
     // release names, but Chinese titles may legitimately contain them.
     let has_cjk = text.chars().any(is_cjk);
-    if !has_cjk {
+    if split_separators || !has_cjk {
         text = text.replace(['.', '_'], " ");
     }
     let tokens = text.split_whitespace().collect::<Vec<_>>();
@@ -4279,6 +4295,28 @@ mod tests {
             "无法从目录名解析"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_dot_glued_chinese_episode_names() {
+        // Chinese titles may contain dots, so the parser keeps them by default;
+        // a CJK title glued to `.SxxExx` release tags still has to split.
+        for stem in [
+            "汤直志异.S01E01.2026.2160p.WEB-DL.H265.8bit.24fps.AAC2.0",
+            "十二层宝塔.S01E01.2026.2160p.WEB-DL.H265.8bit.30fps.AAC2.0",
+            "我叫MT：归来.S01E01.2021.1080p",
+        ] {
+            let parsed = parse_media_name(stem).unwrap_or_else(|| panic!("parsed: {stem}"));
+            assert_eq!(parsed.season, Some(1), "{stem}");
+            assert_eq!(parsed.episode, Some(1), "{stem}");
+            assert!(!parsed.title.contains("S01E01"), "{stem} -> {}", parsed.title);
+            assert!(!parsed.title.contains("1080p"), "{stem} -> {}", parsed.title);
+        }
+
+        // A dot inside the title stays part of the title when there is no
+        // episode tag to split off.
+        let parsed = parse_media_name("唐探.1900").expect("parsed");
+        assert_eq!(parsed.title, "唐探.1900");
     }
 
     #[test]
