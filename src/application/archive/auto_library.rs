@@ -33,8 +33,9 @@ use crate::{
 /// Board spellings that are the same board: merged into one library.
 const BOARD_ALIASES: &[(&str, &str)] = &[("动漫", "动画")];
 /// Boards whose scan has to classify each file instead of forcing one parser:
-/// an animation or documentary board carries films and episodes alike.
-const MIXED_BOARDS: &[&str] = &["动画", "纪录片"];
+/// an animation or documentary board carries films and episodes alike, and a
+/// 演唱会/晚会 board holds single concert films next to multi-part recordings.
+const MIXED_BOARDS: &[&str] = &["动画", "纪录片", "演唱会", "晚会"];
 const STRM_EXTENSION: &str = "strm";
 const NFO_EXTENSION: &str = "nfo";
 /// A board is deep (`board/region/decade/title/Season/file`); the probe only
@@ -368,7 +369,9 @@ mod tests {
         );
         assert_eq!(plan_named(&plans, "电影").kind, LibraryKind::Movie);
         assert_eq!(plan_named(&plans, "电视剧").kind, LibraryKind::Series);
-        assert_eq!(plan_named(&plans, "演唱会").kind, LibraryKind::Series);
+        // A concert board is usually single films, but multi-part recordings
+        // exist too, so the scan has to classify each file.
+        assert_eq!(plan_named(&plans, "演唱会").kind, LibraryKind::Mixed);
         // Animation mixes films and episodes, so the scan classifies each file.
         assert_eq!(plan_named(&plans, "动画").kind, LibraryKind::Mixed);
         // Documentaries do the same; 特摄剧 is a plain series board.
