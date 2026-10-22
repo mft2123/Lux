@@ -1807,11 +1807,21 @@ impl ArchiveService {
                     year,
                     title: parsed.title.clone(),
                 });
-                if let Some(mirror) = self.mirror_dir_for(&target) {
+                // A single moved file has no pack of its own; point the writer at
+                // the title directory so the sidecars do not land in a bogus
+                // `<file>.mp4/` directory (same rule as the TMDB path).
+                let pack = if is_dir {
+                    Some(target.clone())
+                } else {
+                    Some(target_dir.clone())
+                };
+                if let Some(pack) = pack
+                    && let Some(mirror) = self.mirror_dir_for(&pack)
+                {
                     let mut metadata_report = nfo::MetadataReport::default();
                     let writer = nfo::MetadataWriter::new(self, false);
                     writer
-                        .write_special(&target, &mirror, &parsed.title, year, &mut metadata_report)
+                        .write_special(&pack, &mirror, &parsed.title, year, &mut metadata_report)
                         .await;
                     if !metadata_report.failed.is_empty() {
                         tracing::warn!(
