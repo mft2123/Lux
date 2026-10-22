@@ -2,7 +2,9 @@
 //! sinks. This is the first slice of the chill replacement work (plan U9):
 //! resources land in the transfer directory, are moved to pending, are
 //! identified through TMDB, and are organized into
-//! `<media>/<类型>/<国内|国外>/<年代>/<Title (Year)>/`.
+//! `<media>/<类型>/<国内|国外>/<年代>/<Title (Year)>/`. The 晚会 and 演唱会
+//! boards are the exception: there are only a handful of them, so they skip the
+//! decade level (`<晚会>/<Title (Year)>/`, `<演唱会>/<国内|国外>/<Title (Year)>/`).
 //!
 //! The pipeline is deliberately directory-driven: every stage is a visible
 //! directory role, so a failed identification can be inspected by hand and a
@@ -1742,7 +1744,6 @@ impl ArchiveService {
             Some(year) => format!("{safe_title} ({year})"),
             None => safe_title.clone(),
         };
-        let year_segment = decade_segment(year);
         let mut target_dir = self.config.media_dir().join(category);
         let region = if category == "演唱会" {
             let region = if contains_cjk(&parsed.title) {
@@ -1755,7 +1756,11 @@ impl ArchiveService {
         } else {
             ""
         };
-        let target_dir = target_dir.join(&year_segment);
+        let target_dir = target_dir;
+        // 晚会/演唱会 boards stay shallow on purpose (user decision 2026-10-22):
+        // there are only a handful of them, so the decade level is dropped and
+        // the title directory sits right under the board (演唱会 keeps its
+        // region directory). Everything else keeps `<类型>/<地区>/<年代>/<片名>`.
         let target = if is_dir {
             target_dir.join(&title_dir)
         } else {
