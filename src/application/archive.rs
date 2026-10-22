@@ -558,7 +558,9 @@ impl TmdbMatch {
         if self.is_tokusatsu() {
             return "特摄剧";
         }
-        if self.genres.iter().any(|genre| genre == "纪录片") {
+        // TMDB's zh-CN genre 99 comes back as「纪录」on the API even though the
+        // site labels it 纪录片, so match the stem instead of the full word.
+        if self.genres.iter().any(|genre| genre.contains("纪录")) {
             return "纪录片";
         }
         if self.genres.iter().any(|genre| genre == "动画") {
@@ -4432,18 +4434,21 @@ mod tests {
         }
 
         // 纪录片 and 特摄剧 are boards of their own, region-split like every
-        // other board except 晚会 (user decision 2026-10-22).
-        let documentary = TmdbMatch {
-            kind: MediaKind::Movie,
-            tmdb_id: 5,
-            title: "地球脉动".to_owned(),
-            year: Some(2006),
-            origin_countries: vec!["GB".to_owned()],
-            release_country: None,
-            original_language: Some("en".to_owned()),
-            genres: vec!["纪录片".to_owned()],
-        };
-        assert_eq!(documentary.category_label(), "纪录片");
+        // other board except 晚会 (user decision 2026-10-22). TMDB's zh-CN
+        // genre 99 is 「纪录」on the API, so both spellings have to match.
+        for genre in ["纪录片", "纪录"] {
+            let documentary = TmdbMatch {
+                kind: MediaKind::Movie,
+                tmdb_id: 5,
+                title: "地球脉动".to_owned(),
+                year: Some(2006),
+                origin_countries: vec!["GB".to_owned()],
+                release_country: None,
+                original_language: Some("en".to_owned()),
+                genres: vec![genre.to_owned()],
+            };
+            assert_eq!(documentary.category_label(), "纪录片", "{genre}");
+        }
 
         for title in ["欧布奥特曼", "假面骑士555", "Kamen Rider Build", "超级战队"] {
             let tokusatsu = TmdbMatch {
