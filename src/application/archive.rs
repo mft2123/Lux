@@ -1000,7 +1000,7 @@ impl ArchiveService {
         let stamp = unix_now();
         let bucket = self.config.failed_dir().join(format!("{stamp}"));
         std::fs::create_dir_all(&bucket).map_err(|error| format!("创建失败目录: {error}"))?;
-        let _ = std::fs::write(bucket.join("原因.txt"), reason);
+        let _ = write_reason_file(&bucket, reason);
         let target = bucket.join(&name);
         move_entry(entry, &target).map_err(|error| format!("移入失败目录: {error}"))?;
         report.failed.push(FailedItem {
@@ -3184,7 +3184,22 @@ fn read_dir_entries(directory: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn is_ignored_entry(name: &str) -> bool {
-    name.starts_with('.') || name == "原因.txt" || name.ends_with(".part") || name.ends_with(".tmp")
+    name.starts_with('.') || name == REASON_FILE_NAME || name.ends_with(".part") || name.ends_with(".tmp")
+}
+
+/// Name of the sidecar that records why an entry landed in the failure directory.
+const REASON_FILE_NAME: &str = "原因.txt";
+
+/// Writes the failure reason as UTF-8 with a BOM.
+///
+/// The text is legal UTF-8 either way, but Windows Notepad guesses the code page
+/// from the first bytes and renders BOM-less UTF-8 as GBK mojibake. A BOM keeps
+/// the file readable there without changing what any UTF-8 reader sees.
+fn write_reason_file(bucket: &Path, reason: &str) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(3 + reason.len());
+    bytes.extend_from_slice(b"\xEF\xBB\xBF");
+    bytes.extend_from_slice(reason.as_bytes());
+    std::fs::write(bucket.join(REASON_FILE_NAME), bytes)
 }
 
 fn entry_is_settled(path: &Path, settle_seconds: u64) -> bool {
@@ -4212,6 +4227,22 @@ mod tests {
         let parsed = parse_media_name("[FRDS] The.Matrix.1999.REPACK").expect("parsed");
         assert_eq!(parsed.title, "The Matrix");
         assert_eq!(parsed.year, Some(1999));
+    }
+
+    /// Windows Notepad opens BOM-less UTF-8 as GBK, so the failure reason is
+    /// written with a BOM: the bytes are still plain UTF-8 for every other reader.
+    #[test]
+    fn writes_failure_reason_with_utf8_bom() {
+        let dir = std::env::temp_dir().join(format!("lux-reason-{}", unix_now()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        write_reason_file(&dir, "无法从目录名解析").expect("write reason");
+        let bytes = std::fs::read(dir.join(REASON_FILE_NAME)).expect("read reason");
+        assert_eq!(&bytes[..3], b"\xEF\xBB\xBF");
+        assert_eq!(
+            std::str::from_utf8(&bytes[3..]).expect("utf8 body"),
+            "无法从目录名解析"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
