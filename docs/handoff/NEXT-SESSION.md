@@ -17,10 +17,10 @@
 
 | 项 | 值 |
 | --- | --- |
-| 代码提交 | `ef58940e` `fix(archive): parse Chinese titles glued to episode tags` |
-| 本轮另外两个提交 | `1ece2a0b` 纪录片/特摄剧板块 · `24ee562e` `原因.txt` 加 BOM |
+| 代码提交 | `2a23d0da` `fix(archive): write sidecars for a single moved file into its title dir` |
+| 本轮其它提交 | `9b8d87ca` 纪录片「纪录」genre · `ef58940e` 中文标题点号解析 · `cebc0d8b` 本文件 · `1ece2a0b` 纪录片/特摄剧板块 · `24ee562e` `原因.txt` 加 BOM |
 | 分支状态 | `fix/u11-e2e`，worktree 干净 |
-| 镜像 | `lux:phase-a` = `a3417cdf52bf…`（已部署，容器在跑） |
+| 镜像 | `lux:phase-a` = `d7fa41f555d5…`（已部署，容器在跑） |
 | 测试容器 | `lux-testlib`（8099→8097，admin/`Test@12345a`，healthy） |
 | 115 侧车 | `lux-transfer115`（8098，healthy） |
 | TG 侧车（测试） | `lux-telegram-test`（8091，24 个频道） |
@@ -82,6 +82,28 @@ chillposter 的 settings.json 取 key；手工重建时要加 `-e LUX_TMDB_API_K
 失败目录里每个桶的 `原因.txt` 现在是 UTF-8 + BOM（`EF BB BF`），Windows 记事本不再按 GBK
 显示成乱码；正文仍是合法 UTF-8。落点 `archive.rs::write_reason_file()`。
 
+### 2.5 新板块端到端验证（纪录片 / 特摄剧）
+
+从真实库 `cp` 了 3 个文件到 `待整理`（只读真实库），跑通「归档 → 镜像 → 自动建库 → 扫描」：
+
+| 样本 | 落点 |
+| --- | --- |
+| `Kamen Rider ZEZTZ.S01E44…mp4` | `特摄剧/国外/2020s/假面骑士ZZZ (2025)/Season 01/` |
+| `And Yet The Books.S01E04…mp4` | `纪录片/国内/2010s/但是，还有书籍 (2019)/Season 01/` |
+| `Kids Kingdom.2009…mkv` | `纪录片/国内/2000s/小人国 (2009)/` |
+
+日志里 `archive auto library reconciliation` 依次 `created:["特摄剧"]`、`created:["纪录片"]`，
+两个库自动建好并各扫一次，条目都进库了。
+
+这轮验证挖出并修掉三个 bug（都不只影响这两个板块）：
+
+1. **`ef58940e` 中文标题粘点号** → 见 §2.3。
+2. **`9b8d87ca` 纪录片板块不生效**：TMDB 的 zh-CN genre 99 在接口上返回「纪录」，站点上写「纪录片」；
+   原来按「纪录片」精确匹配，样本落到 `电影` / `电视剧`。改成按「纪录」匹配，两种写法都覆盖。
+3. **`2a23d0da` 单文件包写不出 strm**：一集单文件没有自己的目录，`mirror_dir_for(&target)` 会把
+   文件名带进镜像路径，生成 `…/Season 01/<集>.mp4/` 这种假目录（里面是海报+NFO），扫描器看不到
+   媒体 → 特摄剧库扫出 0 条。改成跟回填一致：单文件按「片名目录」写，剧集落进 `Season NN/`。
+
 ## 3. 当前数据状态（2026-10-22 实测）
 
 115 `测试库/媒体目录`：
@@ -100,6 +122,8 @@ chillposter 的 settings.json 取 key；手工重建时要加 `-e LUX_TMDB_API_K
 | 动画 | MIXED | SERIES 139 · SEASON 159 · EPISODE 3085 · MOVIE 1 · FOLDER 3 |
 | 电影 | MOVIE | MOVIE 5 · FOLDER 9 |
 | 电视剧 | SERIES | SERIES 18 · SEASON 19 · EPISODE 364 |
+| 纪录片 | MIXED | MOVIE 1（小人国）· SERIES 1（但是，还有书籍）· SEASON 1 · EPISODE 1 · FOLDER 3 |
+| 特摄剧 | SERIES | SERIES 1（假面骑士ZZZ）· SEASON 1 · EPISODE 1 |
 
 `待整理`、`转存目录` 都是空；`失败目录` 7 个桶全是 10-18/10-20 的旧记录，本轮没有新增失败。
 
@@ -113,17 +137,25 @@ chillposter 的 settings.json 取 key；手工重建时要加 `-e LUX_TMDB_API_K
 3. **晚会不分地区**，其余板块都分；晚会/演唱会不查 TMDB，按名称+年份归档。
 4. **动画 = 动漫**（同一板块，`动漫` 是别名，合并成一个库的第二个根）。
 5. **真实库 `影视库/媒体目录` 全程只读**：不扫、不复制、不改名、不删除，除非用户单独发话。
+   本轮验新板块时只从真实库 `cp` 了 3 个文件到 `待整理`（一集特摄、一集纪录片、一部纪录电影），
+   没有移动或修改。
 6. **以后新内容一律只进 `待整理`（或 `转存目录`）**，不再手工往 `媒体目录` 里塞东西；要重排也是
    挪进 `待整理` 让它自己跑。
+7. **镜像库 + `.strm` 是 Lux 原项目的做法，不改成"真实文件库"**：115 的 `媒体目录` 只放媒体，
+   Lux 扫描的是本地镜像 `/vol5/1000/docker/lux-library`，里面是 `.strm`（内容 =
+   `LUX_ARCHIVE_CD2_MOUNT + PREFIX + 相对路径`）+ NFO + 海报。扫描快、云端库不被 sidecar 污染、
+   媒体只有一份。`media_url()` 只在路径落在 CD2 挂载下时才写 strm，普通本地文件不会生成。
 
 ## 5. 未完成（按优先级）
 
 1. **三层目录在界面上不可导航**：`CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE` 只认 `VIDEO` 子项，
    电影是 `MOVIE`、剧集是 `SERIES`，所以点不进 `国内/国外 → 年代 → 片名` 这三层（数据在、
    进度不受影响）。要做的话是改判定 + 让 `parent_scope` 放行 `MOVIE/SERIES/SEASON/EPISODE`。
-2. **纪录片 / 特摄剧还没有测试样本**：代码和契约都就绪，测试库里没有这两类真实条目，
-   端到端没验过。
+2. **纪录片 / 特摄剧只验了 1-2 个样本**：`docs/archive-pipeline.md` 与
+   `docs/handoff/AUTO-LIBRARY.md` 都写好了，端到端（归档 → 镜像 → 自动建库 → 扫描）跑通，
+   但样本量小，更多片名/多季/多地区的组合还要再压一压。
 3. **特摄剧判定靠标题清单**，真实片库接进来前要按实际名称补 `is_tokusatsu()` 的名单。
+   实测已覆盖：`假面骑士ZZZ`；待补：奥特曼/超级战队/牙狼/铠甲勇士的更多命名变体。
 4. **真实库一级目录与 Lux 口径不同**：真实库是 `剧集/动漫/电影/综艺/纪录片/晚会/演唱会/特摄剧/…`，
    Lux 写 `电视剧/动画`；`动漫` 已支持别名，`剧集` 还没做。**真实库仍然不许动**，方案等用户发话。
 5. **TG 频道监听 v2 的 Lux 侧**（契约 `CHANNEL-MONITORING.md`）：代取频道 → 设置 schema →
@@ -143,9 +175,13 @@ chillposter 的 settings.json 取 key；手工重建时要加 `-e LUX_TMDB_API_K
    别一条命令 `mv *`。
 5. **重排前先查重名**：同一 `片名 (年份)` 可能同时出现在国内和国外，直接 mv 会撞进 `待整理`。
 6. **回填会跳过已有 `tvshow.nfo` 的目录**：要重写某部剧的 sidecar，先删它的镜像目录。
-7. **`docker build` 成功 ≠ 改动生效**：看镜像哈希 + `docker inspect lux-testlib --format "{{.Image}}"`。
-8. **别用 `git branch -f … HEAD`**（主 checkout 的 HEAD 会把主干指回旧提交），要给显式 SHA。
-9. `tests/admin_health.rs` 在干净 HEAD 也失败（`maxConnections` 期望 8、实际 24），环境相关，别当回归。
+7. **TMDB 的 zh-CN 类型名要按接口值匹配**：genre 99 是「纪录」不是「纪录片」；别按网站文案写死。
+   加新板块前先 `curl https://api.themoviedb.org/3/tv/<id>?language=zh-CN` 看实际 `genres`。
+8. **单文件条目不能当目录包写镜像**：`mirror_dir_for(&target)` 对文件会把文件名带进路径；
+   单文件一律按「片名目录」（剧集是 `Season NN` 的父目录）传给 `MetadataWriter`。
+9. **`docker build` 成功 ≠ 改动生效**：看镜像哈希 + `docker inspect lux-testlib --format "{{.Image}}"`。
+10. **别用 `git branch -f … HEAD`**（主 checkout 的 HEAD 会把主干指回旧提交），要给显式 SHA。
+11. `tests/admin_health.rs` 在干净 HEAD 也失败（`maxConnections` 期望 8、实际 24），环境相关，别当回归。
 
 ## 7. 常用验收命令
 
