@@ -5,13 +5,13 @@
 //! [`provision`]: the end of an archive run and a startup reconciliation. Both
 //! are idempotent because the library root path is the idempotency key.
 //!
-//! One library per board — 电影 / 电视剧 / 动画 / 晚会 / 演唱会 …, exactly like
-//! 电影 and 电视剧 are today (user decision 2026-10-21). The 国内/国外 level is a
-//! directory *inside* the library, never a second library:
+//! One library per board — 电影 / 电视剧 / 动画 / 综艺 / 纪录片 / 特摄剧 / 晚会 /
+//! 演唱会 …, exactly like 电影 and 电视剧 are today (user decision 2026-10-21). The
+//! 国内/国外 level is a directory *inside* the library, never a second library:
 //!
 //! - `动画/国内/2020s/…` 和 `动画/国外/2020s/…` 都属于同一个「动画」库；
 //! - `动漫` 是同一板块的另一种拼法，合并进「动画」库（多个根）而不是新建一个库；
-//! - 动画板块的库类型是 MIXED：既有动画电影也有番剧，扫描按文件逐个判定。
+//! - 动画与纪录片板块的库类型是 MIXED：既有电影也有剧集，扫描按文件逐个判定。
 
 use std::{
     collections::{HashMap, HashSet},
@@ -33,8 +33,8 @@ use crate::{
 /// Board spellings that are the same board: merged into one library.
 const BOARD_ALIASES: &[(&str, &str)] = &[("动漫", "动画")];
 /// Boards whose scan has to classify each file instead of forcing one parser:
-/// an animation board carries films and episodes alike.
-const MIXED_BOARDS: &[&str] = &["动画"];
+/// an animation or documentary board carries films and episodes alike.
+const MIXED_BOARDS: &[&str] = &["动画", "纪录片"];
 const STRM_EXTENSION: &str = "strm";
 const NFO_EXTENSION: &str = "nfo";
 /// A board is deep (`board/region/decade/title/Season/file`); the probe only
@@ -341,6 +341,9 @@ mod tests {
         // Both regions live inside one library.
         touch(&root.join("动画/国内/2020s/国漫 (2024)/S01E01.strm"));
         touch(&root.join("动画/国外/2020s/日漫 (2024)/S01E01.strm"));
+        // 纪录片 and 特摄剧 are boards of their own, region-split like the rest.
+        touch(&root.join("纪录片/国外/2010s/地球脉动 (2006)/S01E01.strm"));
+        touch(&root.join("特摄剧/国外/2020s/欧布奥特曼 (2016)/S01E01.strm"));
         // An empty board must not become an empty library.
         std::fs::create_dir_all(root.join("综艺")).expect("empty board");
         touch(&root.join("演唱会/国内/2010s/某演唱会 (2019)/某演唱会.strm"));
@@ -360,14 +363,17 @@ mod tests {
         let plans = plan_libraries(mirror.path());
         assert_eq!(
             plans.len(),
-            4,
-            "电影/电视剧/动画/演唱会, without the empty 综艺: {plans:?}"
+            6,
+            "电影/电视剧/动画/演唱会/纪录片/特摄剧, without the empty 综艺: {plans:?}"
         );
         assert_eq!(plan_named(&plans, "电影").kind, LibraryKind::Movie);
         assert_eq!(plan_named(&plans, "电视剧").kind, LibraryKind::Series);
         assert_eq!(plan_named(&plans, "演唱会").kind, LibraryKind::Series);
         // Animation mixes films and episodes, so the scan classifies each file.
         assert_eq!(plan_named(&plans, "动画").kind, LibraryKind::Mixed);
+        // Documentaries do the same; 特摄剧 is a plain series board.
+        assert_eq!(plan_named(&plans, "纪录片").kind, LibraryKind::Mixed);
+        assert_eq!(plan_named(&plans, "特摄剧").kind, LibraryKind::Series);
         // The region level never becomes a library of its own.
         assert!(plans.iter().all(|plan| !plan.name.contains("国内")
             && !plan.name.contains("国外")));
@@ -416,16 +422,16 @@ mod tests {
 
         let first = provision(&database, &libraries, None, mirror.path()).await;
         assert!(first.failed.is_empty(), "{:?}", first.failed);
-        assert_eq!(first.created.len(), 4, "{first:?}");
+        assert_eq!(first.created.len(), 6, "{first:?}");
         assert!(first.created.iter().any(|name| name == "动画"));
 
         let second = provision(&database, &libraries, None, mirror.path()).await;
         assert!(second.created.is_empty(), "{second:?}");
         assert!(second.updated.is_empty(), "{second:?}");
-        assert_eq!(second.existing.len(), 4, "{second:?}");
+        assert_eq!(second.existing.len(), 6, "{second:?}");
 
         let stored = database.list_all_library_roots().await?;
-        assert_eq!(stored.len(), 4);
+        assert_eq!(stored.len(), 6);
         Ok(())
     }
 }

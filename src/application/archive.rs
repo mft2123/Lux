@@ -543,18 +543,50 @@ impl TmdbMatch {
             .is_some_and(|language| matches!(language, "zh" | "cn" | "yue"))
     }
 
-    /// Variety shows get their own board. Animation is one board that is split
-    /// by region only — 动画 and 动漫 are the same board (user decision
-    /// 2026-10-21: merge them, keep just 国内/国外). Everything else is a movie
-    /// or a TV series.
+    /// 综艺, 纪录片, 特摄剧 and 动画 get their own board. Animation is one board
+    /// that is split by region only — 动画 and 动漫 are the same board (user
+    /// decision 2026-10-21: merge them, keep just 国内/国外). Everything else is
+    /// a movie or a TV series.
+    ///
+    /// Every board keeps the same chain below itself:
+    /// `<board>/<国内|国外>/<年代>/<Title (Year)>/`; 晚会 is the one board without
+    /// the region level (user decision 2026-10-22).
     pub(crate) fn category_label(&self) -> &'static str {
         if self.genres.iter().any(|genre| genre == "综艺") {
             return "综艺";
+        }
+        if self.is_tokusatsu() {
+            return "特摄剧";
+        }
+        if self.genres.iter().any(|genre| genre == "纪录片") {
+            return "纪录片";
         }
         if self.genres.iter().any(|genre| genre == "动画") {
             return "动画";
         }
         self.kind.label()
+    }
+
+    /// TMDB has no 特摄 genre, so the board is decided from the franchise names
+    /// that make up the category. A title that does not match stays on 电影 or
+    /// 电视剧; extend the list instead of guessing from genre alone.
+    fn is_tokusatsu(&self) -> bool {
+        const TOKUSATSU_TITLE_HINTS: &[&str] = &[
+            "奥特曼",
+            "假面骑士",
+            "超级战队",
+            "牙狼",
+            "铠甲勇士",
+            "特摄",
+            "ultraman",
+            "kamen rider",
+            "super sentai",
+            "garo",
+        ];
+        let title = self.title.to_lowercase();
+        TOKUSATSU_TITLE_HINTS
+            .iter()
+            .any(|hint| title.contains(*hint))
     }
 }
 
@@ -1562,11 +1594,15 @@ impl ArchiveService {
                 .unwrap_or_default();
             let series_category = category_name.contains("电视剧")
                 || category_name.contains("综艺")
+                || category_name.contains("纪录片")
+                || category_name.contains("特摄")
                 || category_name.contains("动画")
                 || category_name.contains("动漫");
-            // 动画 / 动漫 boards carry both films and episodes.
-            let animation_category =
-                category_name.contains("动画") || category_name.contains("动漫");
+            // 动画 / 纪录片 boards carry both films and episodes, so a title that
+            // is no series there may still be a film.
+            let mixed_category = category_name.contains("动画")
+                || category_name.contains("动漫")
+                || category_name.contains("纪录片");
             let movie_category = category_name.contains("电影");
             if !series_category && !movie_category {
                 continue;
@@ -1611,9 +1647,9 @@ impl ArchiveService {
                         continue;
                     };
                     let matched = match self.lookup_tmdb(&parsed, series_category).await {
-                        // The animation boards hold films and episodes alike, so
-                        // a title that is no series there may still be a film.
-                        Ok(None) if animation_category => {
+                        // Mixed boards hold films and episodes alike, so a title
+                        // that is no series there may still be a film.
+                        Ok(None) if mixed_category => {
                             match self.lookup_tmdb(&parsed, false).await {
                                 Ok(matched) => matched,
                                 Err(error) => {
@@ -4355,6 +4391,34 @@ mod tests {
                 genres: vec!["动画".to_owned()],
             };
             assert_eq!(anime.category_label(), "动画");
+        }
+
+        // 纪录片 and 特摄剧 are boards of their own, region-split like every
+        // other board except 晚会 (user decision 2026-10-22).
+        let documentary = TmdbMatch {
+            kind: MediaKind::Movie,
+            tmdb_id: 5,
+            title: "地球脉动".to_owned(),
+            year: Some(2006),
+            origin_countries: vec!["GB".to_owned()],
+            release_country: None,
+            original_language: Some("en".to_owned()),
+            genres: vec!["纪录片".to_owned()],
+        };
+        assert_eq!(documentary.category_label(), "纪录片");
+
+        for title in ["欧布奥特曼", "假面骑士555", "Kamen Rider Build", "超级战队"] {
+            let tokusatsu = TmdbMatch {
+                kind: MediaKind::Series,
+                tmdb_id: 6,
+                title: title.to_owned(),
+                year: Some(2016),
+                origin_countries: vec!["JP".to_owned()],
+                release_country: None,
+                original_language: Some("ja".to_owned()),
+                genres: vec!["科幻".to_owned()],
+            };
+            assert_eq!(tokusatsu.category_label(), "特摄剧", "{title}");
         }
     }
 
