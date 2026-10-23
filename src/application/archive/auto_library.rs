@@ -5,8 +5,10 @@
 //! [`provision`]: the end of an archive run and a startup reconciliation. Both
 //! are idempotent because the library root path is the idempotency key.
 //!
-//! One library per board — 电影 / 电视剧 / 动画 / 综艺 / 纪录片 / 特摄剧 / 晚会 /
-//! 演唱会 …, exactly like 电影 and 电视剧 are today (user decision 2026-10-21). The
+//! One library per board — 电影 / 电视剧 / 动画 / 综艺 / 纪录片 / 晚会 /
+//! 演唱会 …, exactly like 电影 and 电视剧 are today (user decision 2026-10-21).
+//! 特摄 is not a board (user decision 2026-10-23: the form decides, so a
+//! tokusatsu series is a 电视剧 and a tokusatsu film is a 电影). The
 //! 国内/国外 level is a directory *inside* the library, never a second library:
 //!
 //! - `动画/国内/2020s/…` 和 `动画/国外/2020s/…` 都属于同一个「动画」库；
@@ -32,6 +34,10 @@ use crate::{
 
 /// Board spellings that are the same board: merged into one library.
 const BOARD_ALIASES: &[(&str, &str)] = &[("动漫", "动画")];
+/// Boards that must not become a library even when their directory is still
+/// around: 特摄 is classified by form now (2026-10-23), so a leftover mirror
+/// directory would only resurrect a board that no longer exists.
+const RETIRED_BOARDS: &[&str] = &["特摄"];
 /// Boards whose scan has to classify each file instead of forcing one parser:
 /// an animation or documentary board carries films and episodes alike, and a
 /// 演唱会/晚会 board holds single concert films next to multi-part recordings.
@@ -87,10 +93,16 @@ impl AutoLibraryReport {
 pub(crate) fn plan_libraries(mirror_root: &Path) -> Vec<LibraryPlan> {
     let mut plans = Vec::new();
     for board in sorted_subdirectories(mirror_root) {
+        let board_name = file_name(&board);
+        if RETIRED_BOARDS
+            .iter()
+            .any(|retired| board_name.contains(retired))
+        {
+            continue;
+        }
         if !has_media_content(&board) {
             continue;
         }
-        let board_name = file_name(&board);
         let name = canonical_board(&board_name).to_owned();
         plans.push(LibraryPlan {
             kind: kind_for_board(&name),
@@ -412,8 +424,9 @@ mod tests {
         // Both regions live inside one library.
         touch(&root.join("动画/国内/2020s/国漫 (2024)/S01E01.strm"));
         touch(&root.join("动画/国外/2020s/日漫 (2024)/S01E01.strm"));
-        // 纪录片 and 特摄剧 are boards of their own, region-split like the rest.
+        // 纪录片 is a board of its own, region-split like the rest.
         touch(&root.join("纪录片/国外/2010s/地球脉动 (2006)/S01E01.strm"));
+        // A left-over 特摄剧 directory must not resurrect the retired board.
         touch(&root.join("特摄剧/国外/2020s/欧布奥特曼 (2016)/S01E01.strm"));
         // An empty board must not become an empty library.
         std::fs::create_dir_all(root.join("综艺")).expect("empty board");
@@ -434,8 +447,8 @@ mod tests {
         let plans = plan_libraries(mirror.path());
         assert_eq!(
             plans.len(),
-            6,
-            "电影/电视剧/动画/演唱会/纪录片/特摄剧, without the empty 综艺: {plans:?}"
+            5,
+            "电影/电视剧/动画/演唱会/纪录片, without the empty 综艺 or the retired 特摄剧: {plans:?}"
         );
         assert_eq!(plan_named(&plans, "电影").kind, LibraryKind::Movie);
         assert_eq!(plan_named(&plans, "电视剧").kind, LibraryKind::Series);
@@ -444,9 +457,11 @@ mod tests {
         assert_eq!(plan_named(&plans, "演唱会").kind, LibraryKind::Mixed);
         // Animation mixes films and episodes, so the scan classifies each file.
         assert_eq!(plan_named(&plans, "动画").kind, LibraryKind::Mixed);
-        // Documentaries do the same; 特摄剧 is a plain series board.
+        // Documentaries do the same.
         assert_eq!(plan_named(&plans, "纪录片").kind, LibraryKind::Mixed);
-        assert_eq!(plan_named(&plans, "特摄剧").kind, LibraryKind::Series);
+        // 特摄 is not a board any more: the form decides, so the directory the
+        // mirror still carries plans nothing at all.
+        assert!(plans.iter().all(|plan| !plan.name.contains("特摄")));
         // The region level never becomes a library of its own.
         assert!(plans.iter().all(|plan| !plan.name.contains("国内")
             && !plan.name.contains("国外")));
@@ -495,16 +510,16 @@ mod tests {
 
         let first = provision(&database, &libraries, None, mirror.path()).await;
         assert!(first.failed.is_empty(), "{:?}", first.failed);
-        assert_eq!(first.created.len(), 6, "{first:?}");
+        assert_eq!(first.created.len(), 5, "{first:?}");
         assert!(first.created.iter().any(|name| name == "动画"));
 
         let second = provision(&database, &libraries, None, mirror.path()).await;
         assert!(second.created.is_empty(), "{second:?}");
         assert!(second.updated.is_empty(), "{second:?}");
-        assert_eq!(second.existing.len(), 6, "{second:?}");
+        assert_eq!(second.existing.len(), 5, "{second:?}");
 
         let stored = database.list_all_library_roots().await?;
-        assert_eq!(stored.len(), 6);
+        assert_eq!(stored.len(), 5);
         Ok(())
     }
 

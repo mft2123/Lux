@@ -545,10 +545,10 @@ impl TmdbMatch {
             .is_some_and(|language| matches!(language, "zh" | "cn" | "yue"))
     }
 
-    /// 综艺, 纪录片, 特摄剧 and 动画 get their own board. Animation is one board
-    /// that is split by region only — 动画 and 动漫 are the same board (user
-    /// decision 2026-10-21: merge them, keep just 国内/国外). Everything else is
-    /// a movie or a TV series.
+    /// 综艺, 纪录片 and 动画 get their own board; everything else is a movie or a
+    /// TV series. 特摄 is deliberately not a board (user decision 2026-10-23):
+    /// the form already decides where a title belongs, so a tokusatsu series is
+    /// a 电视剧 and a tokusatsu film is a 电影.
     ///
     /// Every board keeps the same chain below itself:
     /// `<board>/<国内|国外>/<年代>/<Title (Year)>/`; 晚会 is the one board without
@@ -563,9 +563,6 @@ impl TmdbMatch {
         {
             return "综艺";
         }
-        if self.is_tokusatsu() {
-            return "特摄剧";
-        }
         // TMDB's zh-CN genre 99 comes back as「纪录」on the API even though the
         // site labels it 纪录片, so match the stem instead of the full word.
         if self.genres.iter().any(|genre| genre.contains("纪录")) {
@@ -575,28 +572,6 @@ impl TmdbMatch {
             return "动画";
         }
         self.kind.label()
-    }
-
-    /// TMDB has no 特摄 genre, so the board is decided from the franchise names
-    /// that make up the category. A title that does not match stays on 电影 or
-    /// 电视剧; extend the list instead of guessing from genre alone.
-    fn is_tokusatsu(&self) -> bool {
-        const TOKUSATSU_TITLE_HINTS: &[&str] = &[
-            "奥特曼",
-            "假面骑士",
-            "超级战队",
-            "牙狼",
-            "铠甲勇士",
-            "特摄",
-            "ultraman",
-            "kamen rider",
-            "super sentai",
-            "garo",
-        ];
-        let title = self.title.to_lowercase();
-        TOKUSATSU_TITLE_HINTS
-            .iter()
-            .any(|hint| title.contains(*hint))
     }
 }
 
@@ -1620,7 +1595,6 @@ impl ArchiveService {
             let series_category = category_name.contains("电视剧")
                 || category_name.contains("综艺")
                 || category_name.contains("纪录片")
-                || category_name.contains("特摄")
                 || category_name.contains("动画")
                 || category_name.contains("动漫");
             // 动画 / 纪录片 boards carry both films and episodes, so a title that
@@ -4523,7 +4497,7 @@ mod tests {
             assert_eq!(anime.category_label(), "动画");
         }
 
-        // 纪录片 and 特摄剧 are boards of their own, region-split like every
+        // 纪录片 is a board of its own, region-split like every
         // other board except 晚会 (user decision 2026-10-22). TMDB's zh-CN
         // genre 99 is 「纪录」on the API, so both spellings have to match.
         for genre in ["纪录片", "纪录"] {
@@ -4540,6 +4514,9 @@ mod tests {
             assert_eq!(documentary.category_label(), "纪录片", "{genre}");
         }
 
+        // 特摄 is not a board (2026-10-23): the form decides, so a tokusatsu
+        // series lands on 电视剧 and a tokusatsu film lands on 电影 even though
+        // the franchise name would have matched the old keyword list.
         for title in ["欧布奥特曼", "假面骑士555", "Kamen Rider Build", "超级战队"] {
             let tokusatsu = TmdbMatch {
                 kind: MediaKind::Series,
@@ -4551,8 +4528,19 @@ mod tests {
                 original_language: Some("ja".to_owned()),
                 genres: vec!["科幻".to_owned()],
             };
-            assert_eq!(tokusatsu.category_label(), "特摄剧", "{title}");
+            assert_eq!(tokusatsu.category_label(), "电视剧", "{title}");
         }
+        let tokusatsu_film = TmdbMatch {
+            kind: MediaKind::Movie,
+            tmdb_id: 7,
+            title: "哥斯拉".to_owned(),
+            year: Some(1998),
+            origin_countries: vec!["JP".to_owned()],
+            release_country: None,
+            original_language: Some("ja".to_owned()),
+            genres: vec!["科幻".to_owned()],
+        };
+        assert_eq!(tokusatsu_film.category_label(), "电影");
     }
 
     #[test]
