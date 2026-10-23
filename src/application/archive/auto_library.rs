@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::REMUX_BOARD;
+use super::{REMUX_BOARD, SHORT_DRAMA_BOARD};
 
 use crate::{
     application::{
@@ -46,7 +46,7 @@ const REMUX_BOARD_TITLE: &str = "影视原盘";
 /// Boards whose scan has to classify each file instead of forcing one parser:
 /// an animation or documentary board carries films and episodes alike, and a
 /// 演唱会/晚会 board holds single concert films next to multi-part recordings.
-const MIXED_BOARDS: &[&str] = &["动画", "纪录片", "演唱会", "晚会"];
+const MIXED_BOARDS: &[&str] = &["动画", "纪录片", "演唱会", "晚会", SHORT_DRAMA_BOARD];
 const STRM_EXTENSION: &str = "strm";
 const NFO_EXTENSION: &str = "nfo";
 /// A board is deep (`board/region/decade/title/Season/file`); the probe only

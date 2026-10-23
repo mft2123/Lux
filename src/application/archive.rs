@@ -737,7 +737,29 @@ impl ArchiveService {
 
     async fn organize_pending_entries(&self, report: &mut ArchiveReport) -> Result<(), String> {
         let pending = self.config.pending_dir();
-        let mut candidates = read_dir_entries(&pending)?;
+        // `待整理/国产短剧/` is a container, not an entry: every child is one
+        // short drama that belongs to that board whatever its name looks like.
+        let mut candidates = Vec::new();
+        let mut short_drama_entries: HashSet<PathBuf> = HashSet::new();
+        let mut short_drama_containers: Vec<PathBuf> = Vec::new();
+        for entry in read_dir_entries(&pending)? {
+            if is_short_drama_container(&entry) {
+                short_drama_containers.push(entry.clone());
+                for child in read_dir_entries(&entry)? {
+                    let child_name = child
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if is_ignored_entry(&child_name) {
+                        continue;
+                    }
+                    short_drama_entries.insert(child.clone());
+                    candidates.push(child);
+                }
+                continue;
+            }
+            candidates.push(entry);
+        }
         // Dry runs do not move anything, so the plan must remember which
         // targets an earlier entry of the same batch would have created;
         // otherwise two releases of one title both plan to the same path and
@@ -773,6 +795,10 @@ impl ArchiveService {
                 continue;
             }
             if special_category(&name).is_some() {
+                continue;
+            }
+            // Short dramas are placed by name, never looked up on TMDB.
+            if short_drama_entries.contains(entry) {
                 continue;
             }
             let raw_name = if is_dir {
@@ -840,6 +866,20 @@ impl ArchiveService {
                     continue;
                 }
             };
+            // Short dramas win over the keyword boards: a drama dropped into
+            // `国产短剧/` is a short drama even when its name says 晚会.
+            if short_drama_entries.contains(&entry) {
+                self.organize_special(
+                    report,
+                    &entry,
+                    &parsed,
+                    SHORT_DRAMA_BOARD,
+                    is_dir,
+                    &mut planned_targets,
+                )
+                .await?;
+                continue;
+            }
             if let Some(category) = special_category(&name) {
                 self.organize_special(report, &entry, &parsed, category, is_dir, &mut planned_targets)
                     .await?;
@@ -1017,6 +1057,15 @@ impl ArchiveService {
                 }
                 Err(error) => {
                     self.fail_entry(report, &entry, &format!("移动失败: {error}"))?;
+                }
+            }
+        }
+        // The container is scaffolding: once its children are gone it would only
+        // be re-scanned every tick, so drop it when it is empty.
+        if !report.dry_run {
+            for container in short_drama_containers {
+                if is_dir_empty(&container) {
+                    let _ = std::fs::remove_dir(&container);
                 }
             }
         }
@@ -1756,6 +1805,12 @@ impl ArchiveService {
         } else {
             ""
         };
+        // 国产短剧 drops only the region level: `国产短剧/<年代>/<片名 (年份)>/`
+        // (user decision 2026-10-23). It keeps the decade so the board still
+        // browses like the others.
+        if category == SHORT_DRAMA_BOARD {
+            target_dir = target_dir.join(decade_segment(year));
+        }
         let target_dir = target_dir;
         // 晚会/演唱会 boards stay shallow on purpose (user decision 2026-10-22):
         // there are only a handful of them, so the decade level is dropped and
@@ -3215,6 +3270,20 @@ fn dir_signals_series(directory: &Path, parsed: &ParsedName) -> bool {
 /// 晚会/演唱会 are not TMDB categories: they are detected from the entry
 /// name (an explicit `{晚会}` / `{演唱会}` marker wins over keywords, and a
 /// `{tmdb-ID}` hint is handled before this check by the caller).
+/// Everything dropped into `待整理/国产短剧/` belongs to the 国产短剧 board
+/// (user decision 2026-10-23). These are AI-made short dramas: they are not on
+/// TMDB, so the entry is placed by name and the pack keeps its own board.
+pub(crate) const SHORT_DRAMA_BOARD: &str = "国产短剧";
+
+/// Whether this directory is the 国产短剧 container inside `待整理/`.
+fn is_short_drama_container(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .map(|name| name.to_string_lossy() == SHORT_DRAMA_BOARD)
+            .unwrap_or(false)
+}
+
 pub(crate) fn special_category(name: &str) -> Option<&'static str> {
     if name.contains("{晚会}") || name.contains("【晚会】") {
         return Some("晚会");
