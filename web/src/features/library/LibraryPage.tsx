@@ -147,15 +147,20 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
   const isHomeVideos = library?.kind === "HOMEVIDEOS";
-  const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
-  const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
-  const folderFilter = !isGlobalCollectionLibrary && !isHomeVideos
+  // The archive keeps 地区/年代/片名 as FOLDER rows in every board, not only in
+  // home videos, so the same drill-down drives both: the empty path browses the
+  // library root and each entry narrows the parent scope by one level.
+  const folderPath = homeVideoFolderPath(searchParams.get("folderPath"));
+  const parentId = isGlobalCollectionLibrary
+    ? undefined
+    : folderPath.at(-1)?.id ?? "root";
+  const folderFilter = !isGlobalCollectionLibrary && !folderPath.length
     ? searchParams.get("folder")?.trim() ?? ""
     : "";
   const folderOptions = useQuery({
     queryKey: ["library-folders", libraryId],
     queryFn: () => api.libraryFolders(libraryId),
-    enabled: Boolean(libraryId) && !isGlobalCollectionLibrary && !isHomeVideos,
+    enabled: Boolean(libraryId) && !isGlobalCollectionLibrary && !isHomeVideos && !folderPath.length,
   });
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
   const itemTypes = isGlobalCollectionLibrary ? "BOX_SET" : libraryItemTypeFilter(library?.kind);
@@ -322,10 +327,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
 
   return (
     <section className="lux-page lux-page-narrow">
-      {isHomeVideos && folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
+      {folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
       <div className="lux-page-heading">
         <h1>{library?.name || "媒体库"}</h1>
-        <p>{metadataStatus ? `${total} 项待确认内容` : isGlobalCollectionLibrary ? `${total} 个系列 · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${total} 项内容` : `${total} 项内容`}</p>
+        <p>{metadataStatus ? `${total} 项待确认内容` : isGlobalCollectionLibrary ? `${total} 个系列 · 按默认上映顺序` : folderPath.length ? `${folderPath.at(-1)?.title ?? "目录"} · ${total} 项内容` : `${total} 项内容`}</p>
       </div>
       {!isGlobalCollectionLibrary ? <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
         <button
@@ -366,7 +371,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
             key={item.id}
             detailHref={isGlobalCollectionLibrary ? `/collections/${encodeURIComponent(item.id)}` : undefined}
             readOnly={isGlobalCollectionLibrary}
-            folderHref={isHomeVideos && item.itemType === "FOLDER" ? folderHref(item) : undefined}
+            folderHref={item.itemType === "FOLDER" ? folderHref(item) : undefined}
             metadataAttention={!isGlobalCollectionLibrary && showMetadataPending && Boolean(item.metadataPending)}
             detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined}
             selectionMode={!isGlobalCollectionLibrary && selectionMode}
@@ -421,7 +426,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           </section>
         </div>
       ) : null}
-      {!loadedItems.length ? <div className="lux-empty-card"><span>{isGlobalCollectionLibrary ? "当前没有可见的合集。" : isHomeVideos && folderPath.length ? "此文件夹没有可浏览内容。" : "这个媒体库还没有内容。"}</span>{!(isHomeVideos && folderPath.length) ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
+      {!loadedItems.length ? <div className="lux-empty-card"><span>{isGlobalCollectionLibrary ? "当前没有可见的合集。" : folderPath.length ? "此文件夹没有可浏览内容。" : "这个媒体库还没有内容。"}</span>{!folderPath.length ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />
       {pages.isFetchingNextPage ? <p className="lux-muted-copy" role="status">正在加载更多…</p> : null}
       {pages.isFetchNextPageError ? (

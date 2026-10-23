@@ -27,7 +27,7 @@ use crate::{
     },
     domain::ids::LibraryId,
     library::LibraryKind,
-    storage::Database,
+    storage::{Database, StoredFolderLocation},
 };
 
 /// Board spellings that are the same board: merged into one library.
@@ -258,6 +258,76 @@ pub(crate) async fn provision(
     report
 }
 
+/// Soft-delete `FOLDER` items whose directory is gone.
+///
+/// Renaming a level or lifting one out of the tree (演唱会/晚会 dropped their
+/// decade level on 2026-10-22) leaves the old folder row behind: the scan
+/// removes the files under it, but nothing ever removes the folder itself, so
+/// the browser keeps offering a level that cannot be entered. Reconciliation is
+/// the owner of that repair because it already runs at startup, after every
+/// archive run and on the 600 s fallback.
+///
+/// Two guards keep a missing mount from looking like a deleted tree: roots that
+/// are flagged unavailable, and roots whose path is not mounted right now, are
+/// skipped whole. Returns the titles of the folders that were pruned so the
+/// caller can log them.
+pub(crate) async fn prune_orphan_folders(database: &Database) -> Vec<String> {
+    let Ok(roots) = database.list_all_library_roots().await else {
+        return Vec::new();
+    };
+    let mounted: HashMap<String, PathBuf> = roots
+        .into_iter()
+        .filter(|root| root.is_available)
+        .filter_map(|root| {
+            let path = PathBuf::from(&root.canonical_path);
+            path.is_dir().then_some((root.id, path))
+        })
+        .collect();
+    if mounted.is_empty() {
+        return Vec::new();
+    }
+    let Ok(folders) = database.list_live_folder_locations().await else {
+        return Vec::new();
+    };
+    let orphans = orphan_folder_locations(&mounted, folders);
+    if orphans.is_empty() {
+        return Vec::new();
+    }
+    let ids = orphans
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if database.mark_items_removed(&ids).await.is_err() {
+        return Vec::new();
+    }
+    orphans.into_iter().map(|(_, title)| title).collect()
+}
+
+/// The folders whose `root + relative_path` is not a directory. Pure so the
+/// decision can be tested without a database.
+fn orphan_folder_locations(
+    mounted_roots: &HashMap<String, PathBuf>,
+    folders: Vec<StoredFolderLocation>,
+) -> Vec<(String, String)> {
+    let mut orphans = Vec::new();
+    for folder in folders {
+        // A folder under an unknown or unmounted root proves nothing about the
+        // disk, so it is left alone.
+        let Some(root) = mounted_roots.get(&folder.library_root_id) else {
+            continue;
+        };
+        let path = folder
+            .relative_path
+            .split('/')
+            .fold(root.clone(), |path, component| path.join(component));
+        if path.is_dir() {
+            continue;
+        }
+        orphans.push((folder.id, folder.title));
+    }
+    orphans
+}
+
 fn sorted_subdirectories(directory: &Path) -> Vec<PathBuf> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(directory)
         .map(|reader| {
@@ -321,12 +391,12 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LibraryPlan, plan_libraries, provision};
+    use super::{LibraryPlan, orphan_folder_locations, plan_libraries, provision};
     use crate::{
         application::libraries::LibraryService, config::Config, library::LibraryKind,
-        storage::Database,
+        storage::{Database, StoredFolderLocation},
     };
-    use std::path::Path;
+    use std::{collections::HashMap, path::Path};
 
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
@@ -436,5 +506,55 @@ mod tests {
         let stored = database.list_all_library_roots().await?;
         assert_eq!(stored.len(), 6);
         Ok(())
+    }
+
+    fn folder(id: &str, title: &str, root: &str, relative: &str) -> StoredFolderLocation {
+        StoredFolderLocation {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            library_root_id: root.to_owned(),
+            relative_path: relative.to_owned(),
+        }
+    }
+
+    /// Lifting a level out of the tree leaves the folder row behind; the
+    /// reconciliation pass has to notice that its directory is gone, and only
+    /// then.
+    #[test]
+    fn only_folders_whose_directory_is_gone_are_pruned() {
+        let mirror = tempfile::tempdir().expect("mirror");
+        std::fs::create_dir_all(mirror.path().join("电影/国外/2000s/某片 (2001)"))
+            .expect("title dir");
+        let roots = HashMap::from([(
+            "root-1".to_owned(),
+            mirror.path().join("电影"),
+        )]);
+        let folders = vec![
+            folder("kept", "2000s", "root-1", "国外/2000s"),
+            folder("kept-deep", "某片 (2001)", "root-1", "国外/2000s/某片 (2001)"),
+            folder("gone", "1990s", "root-1", "国外/1990s"),
+            // 演唱会 dropped its decade level: the row points at a level that
+            // no longer exists.
+            folder("lifted", "2010s", "root-1", "演唱会/2010s/周华健 (1996)"),
+            // An unknown root carries no evidence about the disk.
+            folder("unknown-root", "2000s", "root-2", "国外/2000s"),
+        ];
+
+        let orphans = orphan_folder_locations(&roots, folders);
+
+        assert_eq!(
+            orphans,
+            vec![
+                ("gone".to_owned(), "1990s".to_owned()),
+                ("lifted".to_owned(), "2010s".to_owned()),
+            ]
+        );
+    }
+
+    /// A root that is not mounted at all must not prune its whole subtree.
+    #[test]
+    fn an_unmounted_root_never_looks_like_a_deleted_tree() {
+        let folders = vec![folder("a", "2000s", "root-1", "国外/2000s")];
+        assert!(orphan_folder_locations(&HashMap::new(), folders).is_empty());
     }
 }

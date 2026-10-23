@@ -802,6 +802,13 @@ pub(super) async fn lux_list_favorites(
     }
 }
 
+/// Item types a folder walk may expose, one level at a time. The archive layout
+/// puts `MOVIE` rows below `片名 (年份)/` and keeps `SERIES` at the board root,
+/// so the browse set cannot be the home-video `FOLDER | VIDEO` pair alone.
+const FOLDER_BROWSE_ITEM_TYPES: &[&str] = &[
+    "FOLDER", "VIDEO", "MOVIE", "SERIES", "SEASON", "EPISODE",
+];
+
 pub(super) async fn lux_list_library_items(
     headers: HeaderMap,
     Path(library_id): Path<String>,
@@ -939,17 +946,15 @@ pub(super) async fn lux_list_library_items(
             parent_id.to_owned(),
         )),
     };
+    // Browsing walks a hierarchy, so the caller's flat media-type filter
+    // (`MOVIE`, `SERIES`, `MOVIE,SERIES` …) must not hide the folder levels that
+    // lead to those items. The parent scope already narrows the rows to the
+    // children of one folder, so the browse set is the same for every library.
     if parent_scope.is_some() {
-        if filter.item_types.is_empty() {
-            filter.item_types = vec!["FOLDER".to_owned(), "VIDEO".to_owned()];
-        } else {
-            filter
-                .item_types
-                .retain(|item_type| matches!(item_type.as_str(), "FOLDER" | "VIDEO"));
-            if filter.item_types.is_empty() {
-                filter.item_types.push("__NO_MATCH__".to_owned());
-            }
-        }
+        filter.item_types = FOLDER_BROWSE_ITEM_TYPES
+            .iter()
+            .map(|item_type| (*item_type).to_owned())
+            .collect();
     }
     if query.item_type.as_deref().is_some_and(|item_types| {
         item_types

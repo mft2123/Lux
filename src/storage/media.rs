@@ -440,6 +440,82 @@ impl Database {
         Ok((folders, total))
     }
 
+    /// Every live `FOLDER` item, resolved against the root and directory its
+    /// identity key names. Reconciliation compares those directories with the
+    /// filesystem; the query stays in `.strm` shape because a folder row is
+    /// keyed by `folder:<library_root_id>:<relative path>`.
+    pub(crate) async fn list_live_folder_locations(
+        &self,
+    ) -> Result<Vec<StoredFolderLocation>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT id, title, identity_key
+                 FROM media_items
+                 WHERE item_type = 'FOLDER'
+                   AND removed_at IS NULL
+                   AND identity_key LIKE 'folder:%'
+                 ORDER BY identity_key, id",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let (library_root_id, relative_path) =
+                    parse_folder_identity_key(row.get("identity_key"))?;
+                Some(StoredFolderLocation {
+                    id: row.get("id"),
+                    title: row.get("title"),
+                    library_root_id,
+                    relative_path,
+                })
+            })
+            .collect())
+    }
+
+    /// Soft-delete items whose directory or file is gone.
+    ///
+    /// Soft-delete rather than `DELETE`: the identity key stays unique, so a
+    /// directory that comes back later revives the same row (every upsert path
+    /// already resets `removed_at`) instead of racing a second row into place.
+    pub(crate) async fn mark_items_removed(
+        &self,
+        item_ids: &[String],
+    ) -> Result<usize, StorageError> {
+        const REMOVE_CHUNK: usize = 200;
+        let mut removed = 0_usize;
+        for chunk in item_ids.chunks(REMOVE_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE media_items
+                 SET removed_at = unixepoch(), updated_at = unixepoch()
+                 WHERE removed_at IS NULL AND id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let result = statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            removed = removed.saturating_add(result.rows_affected() as usize);
+        }
+        Ok(removed)
+    }
+
     pub(crate) async fn find_item_source_locator(
         &self,
         item_id: &str,

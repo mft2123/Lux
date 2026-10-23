@@ -2648,6 +2648,16 @@ async fn reconcile_libraries() {
         &mirror_root,
     )
     .await;
+    // The same pass that discovers boards repairs the browse tree: a level that
+    // was renamed or lifted keeps its `FOLDER` row until someone removes it.
+    let pruned = auto_library::prune_orphan_folders(&services.database).await;
+    if !pruned.is_empty() {
+        tracing::info!(
+            removed = pruned.len(),
+            folders = ?pruned,
+            "archive auto library reconciliation pruned orphan folders"
+        );
+    }
     if !report.worth_logging() {
         tracing::debug!(
             mirror = %mirror_root.display(),

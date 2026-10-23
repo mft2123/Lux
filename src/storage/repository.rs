@@ -3176,9 +3176,30 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
     )
 )";
 
+/// Folder browsing walks the archive layout one level at a time
+/// (`板块/地区/年代/片名 (年份)/`), so the rows it has to show are not only
+/// `VIDEO`: a 电影 library stores `MOVIE` items below the title folder and a
+/// 剧集 board stores `SERIES` at the board root. Judging those by the
+/// `VIDEO`-only rule that the home-video folders use hid every level that had
+/// no direct `VIDEO` child, which is why `国内 → 年代 → 片名` could not be
+/// opened in the UI even though the rows were all there.
 const CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
  AND (
-    (mi.item_type = 'VIDEO' AND mi.has_available_source = 1)
+    (
+        mi.item_type IN ('VIDEO', 'MOVIE', 'EPISODE')
+        AND mi.has_available_source = 1
+    )
+    OR (
+        mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+        AND EXISTS (
+            SELECT 1
+            FROM media_items visible_child
+            WHERE visible_child.removed_at IS NULL
+              AND visible_child.merged_into_item_id IS NULL
+              AND visible_child.has_available_source = 1
+              AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+        )
+    )
     OR (
         mi.item_type = 'FOLDER'
         AND EXISTS (
@@ -3201,7 +3222,7 @@ const CATALOG_FOLDER_BROWSE_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_
             FROM media_items visible_descendant
             WHERE (visible_descendant.parent_id = mi.id
                    OR visible_descendant.parent_id IN (SELECT id FROM folder_descendants))
-              AND visible_descendant.item_type = 'VIDEO'
+              AND visible_descendant.item_type IN ('VIDEO', 'MOVIE', 'EPISODE')
               AND visible_descendant.removed_at IS NULL
               AND visible_descendant.merged_into_item_id IS NULL
               AND visible_descendant.has_available_source = 1
@@ -3341,6 +3362,16 @@ pub(crate) struct StoredFolderScanPath {
     pub(crate) id: String,
     pub(crate) library_id: String,
     pub(crate) parent_id: Option<String>,
+    pub(crate) title: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+}
+
+/// A live `FOLDER` item with the directory its identity key points at.
+/// Reconciliation resolves `library_root_id + relative_path` against the
+/// filesystem to find folders whose directory no longer exists.
+pub(crate) struct StoredFolderLocation {
+    pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) library_root_id: String,
     pub(crate) relative_path: String,
