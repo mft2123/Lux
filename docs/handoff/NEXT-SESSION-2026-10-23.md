@@ -8,7 +8,7 @@ cwd: "C:\\Users\\liqiang\\AppData\\Roaming\\dsh-desktop\\harness"
 resume_focus: "浏览器里过一遍 VISUAL-CHECK-2026-10-23.md 的十条；之后按用户要求把 TG 频道监听 v2 放最后"
 repository: "lux"
 branch: "fix/u11-e2e"
-head: "1272d5f5"
+head: "2115789a"
 worktree_path: "/tmp/lux-u11"
 ---
 
