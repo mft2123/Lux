@@ -1880,9 +1880,23 @@ impl ArchiveService {
                 {
                     let mut metadata_report = nfo::MetadataReport::default();
                     let writer = nfo::MetadataWriter::new(self, false);
-                    writer
-                        .write_special(&pack, &mirror, &parsed.title, year, &mut metadata_report)
-                        .await;
+                    if category == SHORT_DRAMA_BOARD && is_dir {
+                        // Loose `第01集.mp4` names cannot be numbered by the
+                        // scanner, so the mirror gets a Season layout instead.
+                        writer
+                            .write_short_drama(
+                                &pack,
+                                &mirror,
+                                &parsed.title,
+                                year,
+                                &mut metadata_report,
+                            )
+                            .await;
+                    } else {
+                        writer
+                            .write_special(&pack, &mirror, &parsed.title, year, &mut metadata_report)
+                            .await;
+                    }
                     if !metadata_report.failed.is_empty() {
                         tracing::warn!(
                             target = %target.display(),
@@ -3282,6 +3296,61 @@ fn is_short_drama_container(path: &Path) -> bool {
             .file_name()
             .map(|name| name.to_string_lossy() == SHORT_DRAMA_BOARD)
             .unwrap_or(false)
+}
+
+/// The episode number carried by a short-drama file name: `第12集`, `第3话`,
+/// `EP07`, `S01E07`. The mirror copy is renamed from this; the 115 copy keeps
+/// whatever name it arrived with.
+pub(crate) fn short_drama_episode_number(name: &str) -> Option<u32> {
+    let characters = name.chars().collect::<Vec<_>>();
+    for (index, character) in characters.iter().enumerate() {
+        if *character != '第' {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let start = cursor;
+        while cursor < characters.len() && characters[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > start
+            && cursor < characters.len()
+            && matches!(characters[cursor], '集' | '话' | '期' | '回')
+        {
+            let digits = characters[start..cursor].iter().collect::<String>();
+            if let Ok(number) = digits.parse::<u32>() {
+                return Some(number);
+            }
+        }
+    }
+    let lowered = name.to_ascii_lowercase().chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < lowered.len() {
+        if lowered[index] != 'e' {
+            index += 1;
+            continue;
+        }
+        // `S01E07` (e after a digit) and `EP07` (explicit prefix) both count;
+        // a bare `e` inside a word does not.
+        let mut start = index + 1;
+        let explicit_ep = start < lowered.len() && lowered[start] == 'p';
+        if explicit_ep {
+            start += 1;
+        }
+        let mut cursor = start;
+        while cursor < lowered.len() && lowered[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        let preceded_by_digit = index > 0 && lowered[index - 1].is_ascii_digit();
+        let at_boundary = index == 0 || !lowered[index - 1].is_alphanumeric();
+        if cursor > start && (explicit_ep || preceded_by_digit || at_boundary) {
+            let digits = lowered[start..cursor].iter().collect::<String>();
+            if let Ok(number) = digits.parse::<u32>() {
+                return Some(number);
+            }
+        }
+        index = cursor.max(index + 1);
+    }
+    None
 }
 
 pub(crate) fn special_category(name: &str) -> Option<&'static str> {
@@ -4729,6 +4798,20 @@ mod tests {
         let empty = tempfile::tempdir().expect("empty");
         std::fs::create_dir_all(empty.path()).expect("dir");
         assert!(!pack_is_remux(empty.path()));
+    }
+
+    /// AI short dramas arrive with all kinds of episode numbering; the mirror
+    /// name is built from whichever one the file carries.
+    #[test]
+    fn short_drama_episode_numbers_come_from_common_naming() {
+        assert_eq!(short_drama_episode_number("第01集.mp4"), Some(1));
+        assert_eq!(short_drama_episode_number("AI短剧甲 第12集 1080p.mp4"), Some(12));
+        assert_eq!(short_drama_episode_number("剧名.第3话.mp4"), Some(3));
+        assert_eq!(short_drama_episode_number("Show.EP07.mp4"), Some(7));
+        assert_eq!(short_drama_episode_number("Show.S01E07.mp4"), Some(7));
+        assert_eq!(short_drama_episode_number("Show.E01.mkv"), Some(1));
+        assert_eq!(short_drama_episode_number("随便一个名字.mp4"), None);
+        assert_eq!(short_drama_episode_number("The.Movie.2024.mkv"), None);
     }
 
     #[test]

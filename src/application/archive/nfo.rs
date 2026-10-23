@@ -282,6 +282,68 @@ impl<'a> MetadataWriter<'a> {
         }
     }
 
+    /// Short dramas arrive as loose episode files (`第01集.mp4`, `EP07.mp4`) that
+    /// no scanner can number, and 115 keeps those names. The mirror is ours, so
+    /// it gets the shape a scanner understands: `Season 01/<Title> S01E05.strm`
+    /// plus an episode NFO (user decision 2026-10-23).
+    pub(crate) async fn write_short_drama(
+        &self,
+        pack: &Path,
+        mirror: &Path,
+        title: &str,
+        year: Option<i64>,
+        report: &mut MetadataReport,
+    ) {
+        if let Err(error) = std::fs::create_dir_all(mirror) {
+            report
+                .failed
+                .push(format!("{}: 创建镜像目录失败: {error}", mirror.display()));
+            return;
+        }
+        relax_permissions(mirror, true);
+        let videos = video_files(pack);
+        if videos.is_empty() {
+            self.write_file(&mirror.join("movie.nfo"), &minimal_nfo(title, year), report);
+            return;
+        }
+        let season_dir = mirror.join("Season 01");
+        if let Err(error) = std::fs::create_dir_all(&season_dir) {
+            report
+                .failed
+                .push(format!("{}: {error}", season_dir.display()));
+            return;
+        }
+        relax_permissions(&season_dir, true);
+        let mut numbered = videos
+            .into_iter()
+            .map(|video| {
+                let parsed = video
+                    .file_name()
+                    .and_then(|name| super::short_drama_episode_number(&name.to_string_lossy()));
+                (parsed, video)
+            })
+            .collect::<Vec<_>>();
+        // Files that already carry a number keep it; the rest fill the gaps in
+        // name order so `第01集` and `EP02` never collide.
+        numbered.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        for (index, (parsed, video)) in numbered.into_iter().enumerate() {
+            let episode = parsed.unwrap_or(index as u32 + 1);
+            let stem = format!("{title} S01E{episode:02}");
+            if let Some(url) = self.service.media_url(&video) {
+                self.write_file(&season_dir.join(format!("{stem}.strm")), &url, report);
+            }
+            self.write_file(
+                &season_dir.join(format!("{stem}.nfo")),
+                &minimal_episode_nfo(&format!("{title} 第{episode}集"), episode, year),
+                report,
+            );
+        }
+    }
+
     fn write_file(&self, path: &Path, content: &str, report: &mut MetadataReport) -> bool {
         if path.exists() && !self.overwrite {
             report.skipped.push(path.display().to_string());
@@ -382,6 +444,22 @@ pub(crate) fn minimal_nfo(title: &str, year: Option<i64>) -> String {
         push_field(&mut xml, "year", &year.to_string());
     }
     xml.push_str("</movie>\n");
+    xml
+}
+
+/// Episode sidecar for a short drama whose 115 file names carry no season or
+/// episode number.
+pub(crate) fn minimal_episode_nfo(title: &str, episode: u32, year: Option<i64>) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<episodedetails>\n",
+    );
+    push_field(&mut xml, "title", title);
+    push_field(&mut xml, "season", "1");
+    push_field(&mut xml, "episode", &episode.to_string());
+    if let Some(year) = year {
+        push_field(&mut xml, "year", &year.to_string());
+    }
+    xml.push_str("</episodedetails>\n");
     xml
 }
 
