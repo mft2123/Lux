@@ -142,7 +142,11 @@ fn merge_same_named_plans(plans: Vec<LibraryPlan>) -> Vec<LibraryPlan> {
 }
 
 fn kind_for_board(name: &str) -> LibraryKind {
-    if name.contains("电影") {
+    // 影视 REMUX holds every board's remux copies in one library, films and
+    // episodes alike, so the scan classifies each file (2026-10-23).
+    if name.to_ascii_uppercase().contains("REMUX") {
+        LibraryKind::Mixed
+    } else if name.contains("电影") {
         LibraryKind::Movie
     } else if MIXED_BOARDS.iter().any(|board| name.contains(board)) {
         LibraryKind::Mixed

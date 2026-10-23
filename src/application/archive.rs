@@ -867,16 +867,23 @@ impl ArchiveService {
                 .filter(|year| (1888..=2100).contains(year));
             let region = if matched.is_domestic() { "国内" } else { "国外" };
             let category = matched.category_label();
+            // A remux is a second copy of the same title, not a better version
+            // of it: it lives in its own board tree so an encode and a remux can
+            // coexist (user decision 2026-10-23). A pack only counts as remux
+            // when every video in it is tagged, otherwise one stray encode
+            // would split a season across two boards.
+            let remux = if is_dir {
+                pack_is_remux(&entry)
+            } else {
+                name_is_remux(&name)
+            };
             let year_segment = decade_segment(year);
             let safe_title = sanitize_component(&matched.title);
             let title_dir = match year {
                 Some(year) => format!("{safe_title} ({year})"),
                 None => safe_title.clone(),
             };
-            let mut target_dir = self
-                .config
-                .media_dir()
-                .join(category)
+            let mut target_dir = board_dir(&self.config.media_dir(), category, remux)
                 .join(region)
                 .join(&year_segment)
                 .join(&title_dir);
@@ -1584,14 +1591,33 @@ impl ArchiveService {
     ) -> Result<nfo::MetadataReport, String> {
         let mut report = nfo::MetadataReport::default();
         let media = self.config.media_dir();
-        for category_dir in read_dir_entries(&media)? {
-            if !category_dir.is_dir() {
+        // `影视 REMUX/` is a wrapper around the board level, so the walk has to
+        // look one level deeper there instead of treating the wrapper as a board.
+        let mut categories: Vec<(PathBuf, String)> = Vec::new();
+        for entry in read_dir_entries(&media)? {
+            if !entry.is_dir() {
                 continue;
             }
-            let category_name = category_dir
+            let name = entry
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
+            if name_is_remux(&name) {
+                for board in read_dir_entries(&entry)? {
+                    if !board.is_dir() {
+                        continue;
+                    }
+                    let board_name = board
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    categories.push((board, board_name));
+                }
+                continue;
+            }
+            categories.push((entry, name));
+        }
+        for (category_dir, category_name) in categories {
             let series_category = category_name.contains("电视剧")
                 || category_name.contains("综艺")
                 || category_name.contains("纪录片")
@@ -3076,6 +3102,62 @@ fn path_size_at(path: &Path, depth: usize) -> u64 {
         .sum()
 }
 
+/// The board directory a title lands in: remux copies get their own tree so an
+/// encode and a remux of the same title can coexist (user decision 2026-10-23).
+/// `影视 REMUX` is one library whose first level inside is still the board name,
+/// so browsing and sidecars keep the same shape one level down.
+const REMUX_BOARD: &str = "影视 REMUX";
+
+fn board_dir(media_dir: &Path, category: &str, remux: bool) -> PathBuf {
+    if remux {
+        media_dir.join(REMUX_BOARD).join(category)
+    } else {
+        media_dir.join(category)
+    }
+}
+
+/// Whether a file name carries the remux tag. REMUX is a source property, not a
+/// resolution: `1080p.BluRay.REMUX.H264` is a remux and must not be confused
+/// with the 4K encodes the library also holds.
+fn name_is_remux(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("remux")
+}
+
+/// A pack is a remux pack only when every video file in it is tagged: a single
+/// stray encode would otherwise split one season across two libraries.
+fn pack_is_remux(directory: &Path) -> bool {
+    fn walk(directory: &Path, saw_video: &mut bool, every_video_is_remux: &mut bool) {
+        let Ok(reader) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in reader.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_dir() {
+                walk(&path, saw_video, every_video_is_remux);
+                continue;
+            }
+            if video_extension(&path).is_none() {
+                continue;
+            }
+            *saw_video = true;
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !name_is_remux(&name) {
+                *every_video_is_remux = false;
+            }
+        }
+    }
+    let mut saw_video = false;
+    let mut every_video_is_remux = true;
+    walk(directory, &mut saw_video, &mut every_video_is_remux);
+    saw_video && every_video_is_remux
+}
+
 /// A release pack counts as media when it holds a video file up to two levels
 /// deep (pack root or a season subdirectory).
 fn dir_contains_video(directory: &Path) -> bool {
@@ -4085,7 +4167,9 @@ fn fold_full_width(character: char) -> char {
 /// Deepest level walked by the library lookup. A title is a child of a year
 /// directory (depth 3 in the normal chain, depth 2 for 晚会), so nothing deeper
 /// than the title directory is ever read.
-const LIBRARY_LOOKUP_MAX_DEPTH: usize = 3;
+/// 媒体目录 → 类型 → 地区 → 年代 → 片名 is four levels; the `影视 REMUX/`
+/// wrapper adds a fifth, so the walk has to allow it.
+const LIBRARY_LOOKUP_MAX_DEPTH: usize = 5;
 
 /// A title query for the library lookup: the parsed title key plus the year the
 /// query carries (when it has one).
@@ -4541,6 +4625,52 @@ mod tests {
             genres: vec!["科幻".to_owned()],
         };
         assert_eq!(tokusatsu_film.category_label(), "电影");
+    }
+
+    /// REMUX is a source property, not a resolution: a 1080p BluRay remux is a
+    /// remux, and the 4K encodes the library also holds are not (user decision
+    /// 2026-10-23: an encode and a remux coexist in two boards).
+    #[test]
+    fn remux_is_tagged_by_name_not_by_resolution() {
+        assert!(name_is_remux(
+            "Crossing's End.2021.1080p.BluRay.REMUX.H264.8bit.DV.24fps.TrueHD7.1.mkv"
+        ));
+        assert!(name_is_remux("某片.2024.2160p.UHD.BluRay.remux.HDR.mkv"));
+        assert!(!name_is_remux("某片.2024.2160p.WEB-DL.H265.mkv"));
+        assert!(!name_is_remux("某片.2024.1080p.BluRay.H264.mkv"));
+    }
+
+    #[test]
+    fn a_pack_is_only_a_remux_pack_when_every_video_is_tagged() {
+        let root = tempfile::tempdir().expect("pack");
+        let season = root.path().join("Season 01");
+        std::fs::create_dir_all(&season).expect("season");
+        std::fs::write(season.join("某剧.S01E01.1080p.BluRay.REMUX.mkv"), b"x").expect("e1");
+        std::fs::write(season.join("某剧.S01E02.1080p.BluRay.REMUX.mkv"), b"x").expect("e2");
+        std::fs::write(root.path().join("tvshow.nfo"), b"x").expect("nfo");
+        assert!(pack_is_remux(root.path()));
+
+        // One stray encode means the season must not be split across boards.
+        std::fs::write(season.join("某剧.S01E03.1080p.BluRay.H264.mkv"), b"x").expect("e3");
+        assert!(!pack_is_remux(root.path()));
+
+        // A pack without video is not a remux pack either.
+        let empty = tempfile::tempdir().expect("empty");
+        std::fs::create_dir_all(empty.path()).expect("dir");
+        assert!(!pack_is_remux(empty.path()));
+    }
+
+    #[test]
+    fn remux_titles_land_in_their_own_board_tree() {
+        let media = Path::new("/testlib/媒体目录");
+        assert_eq!(
+            board_dir(media, "电影", false),
+            Path::new("/testlib/媒体目录/电影")
+        );
+        assert_eq!(
+            board_dir(media, "电影", true),
+            Path::new("/testlib/媒体目录/影视 REMUX/电影")
+        );
     }
 
     #[test]
