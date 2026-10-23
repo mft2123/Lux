@@ -3102,11 +3102,13 @@ fn path_size_at(path: &Path, depth: usize) -> u64 {
         .sum()
 }
 
-/// The board directory a title lands in: remux copies get their own tree so an
-/// encode and a remux of the same title can coexist (user decision 2026-10-23).
-/// `影视 REMUX` is one library whose first level inside is still the board name,
-/// so browsing and sidecars keep the same shape one level down.
-const REMUX_BOARD: &str = "影视 REMUX";
+/// The directory remux copies land in. One top-level `REMUX/` holds every board's
+/// remux versions, and inside it the chain is the usual
+/// `<类型>/<国内|国外>/<年代>/<片名 (年份)>/` (user decision 2026-10-23).
+/// Resolution is a property of the file name (`2160p` / `1080p`), never a level
+/// of its own: a 1080p remux and a 2160p remux of one film live side by side in
+/// the same title directory.
+pub(crate) const REMUX_BOARD: &str = "REMUX";
 
 fn board_dir(media_dir: &Path, category: &str, remux: bool) -> PathBuf {
     if remux {
@@ -4669,7 +4671,7 @@ mod tests {
         );
         assert_eq!(
             board_dir(media, "电影", true),
-            Path::new("/testlib/媒体目录/影视 REMUX/电影")
+            Path::new("/testlib/媒体目录/REMUX/电影")
         );
     }
 

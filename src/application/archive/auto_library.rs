@@ -20,6 +20,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::REMUX_BOARD;
+
 use crate::{
     application::{
         admin_library_settings::{CreateLibraryInput, create_library},
@@ -38,6 +40,9 @@ const BOARD_ALIASES: &[(&str, &str)] = &[("动漫", "动画")];
 /// around: 特摄 is classified by form now (2026-10-23), so a leftover mirror
 /// directory would only resurrect a board that no longer exists.
 const RETIRED_BOARDS: &[&str] = &["特摄"];
+/// The remux board keeps an ASCII directory name (it is also the archive's path
+/// filter) but shows a Chinese name in the library list.
+const REMUX_BOARD_TITLE: &str = "影视原盘";
 /// Boards whose scan has to classify each file instead of forcing one parser:
 /// an animation or documentary board carries films and episodes alike, and a
 /// 演唱会/晚会 board holds single concert films next to multi-part recordings.
@@ -105,8 +110,10 @@ pub(crate) fn plan_libraries(mirror_root: &Path) -> Vec<LibraryPlan> {
         }
         let name = canonical_board(&board_name).to_owned();
         plans.push(LibraryPlan {
+            // The kind follows the board, the display name may differ: `REMUX`
+            // is a MIXED board shown as 影视原盘.
             kind: kind_for_board(&name),
-            name,
+            name: library_name_for_board(&board_name),
             roots: vec![board],
         });
     }
@@ -120,6 +127,17 @@ fn canonical_board(name: &str) -> &str {
         .find(|(alias, _)| name.contains(alias))
         .map(|(_, canonical)| *canonical)
         .unwrap_or(name)
+}
+
+/// The name the library list shows for a board directory. Only `REMUX` differs:
+/// its directory stays ASCII (the archive filters on it) while the library is
+/// shown as 影视原盘 (user decision 2026-10-23).
+fn library_name_for_board(board_name: &str) -> String {
+    if board_name == REMUX_BOARD {
+        REMUX_BOARD_TITLE.to_owned()
+    } else {
+        canonical_board(board_name).to_owned()
+    }
 }
 
 /// Merge plans that ended up with the same name: 动画 and 动漫 are the same
@@ -407,7 +425,9 @@ fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LibraryPlan, orphan_folder_locations, plan_libraries, provision};
+    use super::{
+        LibraryPlan, library_name_for_board, orphan_folder_locations, plan_libraries, provision,
+    };
     use crate::{
         application::libraries::LibraryService, config::Config, library::LibraryKind,
         storage::{Database, StoredFolderLocation},
@@ -568,6 +588,32 @@ mod tests {
                 ("lifted".to_owned(), "2010s".to_owned()),
             ]
         );
+    }
+
+    /// The remux board keeps the ASCII directory the archive filters on and
+    /// shows a Chinese name in the library list.
+    #[test]
+    fn the_remux_board_shows_a_chinese_name() {
+        assert_eq!(library_name_for_board("REMUX"), "影视原盘");
+        assert_eq!(library_name_for_board("电影"), "电影");
+        // The 动漫 alias still merges into 动画.
+        assert_eq!(library_name_for_board("动漫"), "动画");
+    }
+
+    /// One `REMUX/` directory becomes one MIXED library, whatever boards are
+    /// inside it.
+    #[test]
+    fn the_remux_board_plans_one_mixed_library() {
+        let mirror = tempfile::tempdir().expect("mirror");
+        touch(&mirror.path().join("REMUX/电影/国外/2000s/某片 (2001)/某片.2160p.REMUX.strm"));
+        touch(&mirror
+            .path()
+            .join("REMUX/电视剧/国内/2020s/某剧 (2024)/Season 01/S01E01.1080p.REMUX.strm"));
+        let plans = plan_libraries(mirror.path());
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        assert_eq!(plans[0].name, "影视原盘");
+        assert_eq!(plans[0].kind, LibraryKind::Mixed);
+        assert_eq!(plans[0].roots, vec![mirror.path().join("REMUX")]);
     }
 
     /// A root that is not mounted at all must not prune its whole subtree.
