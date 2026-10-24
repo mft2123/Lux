@@ -320,16 +320,20 @@ impl TelegramSettings {
                 .iter()
                 .any(|channel| channel.enabled && pick(&channel.modes))
         };
-        self.listen_mode = if any(|modes| modes.full) {
+        let automatic = self
+            .channels
+            .iter()
+            .any(|channel| channel.enabled && channel.modes.any_automatic());
+        self.listen_mode = if !automatic {
+            "手动"
+        } else if any(|modes| modes.full) {
             "全量"
         } else if any(|modes| modes.new_release) {
             "上新"
         } else if any(|modes| modes.follow) {
             "追更"
-        } else if any(|modes| modes.remux) {
-            "洗版"
         } else {
-            "手动"
+            "洗版"
         }
         .to_owned();
     }

@@ -1435,6 +1435,18 @@ export class LuxApiClient {
     });
   }
 
+  /**
+   * Channels the Telegram account is in, proxied by Lux (the browser cannot talk
+   * to the sidecar directly). Read-only: nothing is transferred.
+   */
+  telegramChannels() {
+    return this.request<{
+      ok: boolean;
+      channels: { telegramId: string; title: string; username: string }[];
+      detail?: string | null;
+    }>("/api/v1/admin/archive/telegram/channels");
+  }
+
   archiveStatus() {
     return this.request<ArchiveStatus>("/api/v1/admin/archive/status");
   }

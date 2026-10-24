@@ -62,21 +62,48 @@ function categoryOptions(settings?: ArchiveSettings): NotifyCategoryOption[] {
   return known.map((category) => ({ value: category.label, label: category.label }));
 }
 
-const LISTEN_MODES = [
-  { value: "手动", label: "手动", hint: "只记录频道消息，不自动投递；由管理员手动触发。" },
-  { value: "上新", label: "上新", hint: "频道出现新消息时，投递其中的资源链接。" },
-  { value: "追更", label: "追更", hint: "仅当链接命中“追更列表”里的剧集名时投递。" },
-  { value: "洗版", label: "洗版", hint: "仅当链接体积大于库中同名版本时投递。" },
-  { value: "全量", label: "全量", hint: "投递频道里的所有资源链接。" },
+/**
+ * The four automatic bits of a channel. "手动" is not a switch: it is what the
+ * server derives when all four are off, so the UI only shows it as a label.
+ */
+const CHANNEL_MODES = [
+  { key: "newRelease", label: "入新", hint: "库里没有这个作品时投递。" },
+  { key: "follow", label: "追更", hint: "补齐已订阅剧集缺的季/集。" },
+  { key: "full", label: "全量", hint: "入新 + 追更 + 洗版全部打开。" },
+  { key: "remux", label: "洗版", hint: "仅当新版本明确更好时替换。" },
 ] as const;
 
-const LISTEN_MODE_ALIASES: Record<string, string> = {
-  manual: "手动",
-  new: "上新",
-  follow: "追更",
-  wash: "洗版",
-  all: "全量",
-};
+type ChannelModeKey = (typeof CHANNEL_MODES)[number]["key"];
+
+type ChannelDraft = {
+  id: string;
+  title: string;
+  username: string;
+  enabled: boolean;
+} & Record<ChannelModeKey, boolean>;
+
+function channelToDraft(channel: {
+  id: string;
+  title?: string;
+  username?: string;
+  enabled?: boolean;
+  modes?: Partial<Record<ChannelModeKey | "manual", boolean>>;
+}): ChannelDraft {
+  return {
+    id: channel.id,
+    title: channel.title ?? "",
+    username: channel.username ?? "",
+    enabled: channel.enabled ?? true,
+    newRelease: channel.modes?.newRelease ?? false,
+    follow: channel.modes?.follow ?? false,
+    full: channel.modes?.full ?? false,
+    remux: channel.modes?.remux ?? false,
+  };
+}
+
+function isAutomatic(draft: ChannelDraft): boolean {
+  return draft.newRelease || draft.follow || draft.full || draft.remux;
+}
 
 type ArchiveSettingsDraft = {
   tmdbApiKey: string;
@@ -95,8 +122,7 @@ type ArchiveSettingsDraft = {
   apiId: string;
   apiHash: string;
   phone: string;
-  listenMode: string;
-  listenChannels: string;
+  channels: ChannelDraft[];
   followList: string;
   notify: string[];
   /** The value as stored, so an untouched save keeps `null`/object shape. */
@@ -125,8 +151,7 @@ const EMPTY_DRAFT: ArchiveSettingsDraft = {
   apiId: "",
   apiHash: "",
   phone: "",
-  listenMode: "手动",
-  listenChannels: "",
+  channels: [],
   followList: "",
   notify: FALLBACK_NOTIFY_VALUES,
   notifyOriginal: null,
@@ -170,6 +195,12 @@ export function ArchiveSettingsSection() {
   });
   const [draft, setDraft] = useState<ArchiveSettingsDraft>(EMPTY_DRAFT);
   const [feedback, setFeedback] = useState<SectionFeedbackMap>(EMPTY_FEEDBACK);
+  // Channel discovery is a read-only probe; its own loading/error state keeps a
+  // failed fetch from blocking the rest of the Telegram group.
+  const [channelFetch, setChannelFetch] = useState<{ loading: boolean; error: string | null }>({
+    loading: false,
+    error: null,
+  });
   // The form is filled once from the server. A later refetch must not overwrite
   // edits the admin has not saved yet; each save merges its own group back.
   const initialized = useRef(false);
@@ -242,6 +273,64 @@ export function ArchiveSettingsSection() {
     });
   }
 
+  /** Patch one channel of the draft; `id` is the stable key. */
+  function updateChannel(id: string, patch: Partial<ChannelDraft>) {
+    setFeedback((current) => clearSaved(current));
+    setDraft((current) => ({
+      ...current,
+      channels: current.channels.map((channel) =>
+        channel.id === id ? { ...channel, ...patch } : channel,
+      ),
+    }));
+  }
+
+  /**
+   * Pull the account's channels and merge them into the draft: channels already
+   * configured keep their modes, new ones arrive unchecked for the modes but
+   * enabled, and channels no longer in the account stay so an unsubscribe does
+   * not silently drop the configuration.
+   */
+  async function refreshChannels() {
+    setChannelFetch({ loading: true, error: null });
+    try {
+      const result = await api.telegramChannels();
+      if (!result.ok) {
+        setChannelFetch({ loading: false, error: result.detail || "侧车没有返回频道" });
+        return;
+      }
+      setFeedback((current) => clearSaved(current));
+      setDraft((current) => {
+        const known = new Map(current.channels.map((channel) => [channel.id, channel]));
+        const merged = result.channels.map((channel) => {
+          const existing = known.get(channel.telegramId);
+          if (existing) {
+            return {
+              ...existing,
+              title: channel.title || existing.title,
+              username: channel.username || existing.username,
+            };
+          }
+          return channelToDraft({
+            id: channel.telegramId,
+            title: channel.title,
+            username: channel.username,
+            enabled: false,
+          });
+        });
+        const removed = current.channels.filter(
+          (channel) => !result.channels.some((item) => item.telegramId === channel.id),
+        );
+        return { ...current, channels: [...merged, ...removed] };
+      });
+      setChannelFetch({ loading: false, error: null });
+    } catch (error) {
+      setChannelFetch({
+        loading: false,
+        error: error instanceof Error ? error.message : "拉取频道列表失败",
+      });
+    }
+  }
+
   if (!settings.data) {
     return (
       <ArchiveSettingsState
@@ -252,8 +341,6 @@ export function ArchiveSettingsSection() {
   }
 
   const loaded = settings.data;
-  const listenMode =
-    LISTEN_MODES.find((mode) => mode.value === draft.listenMode) ?? LISTEN_MODES[0];
 
   return (
     <section
@@ -625,30 +712,68 @@ export function ArchiveSettingsSection() {
               />
             </label>
           </div>
-          <label>
-            <span>监听模式</span>
-            <small>{listenMode.hint}</small>
-            <select
-              value={draft.listenMode}
-              onChange={(event) => update("listenMode", event.target.value)}
-            >
-              {LISTEN_MODES.map((mode) => (
-                <option key={mode.value} value={mode.value}>{mode.label}</option>
-              ))}
-            </select>
-          </label>
+          <div className="lux-archive-settings-channels">
+            <div className="lux-archive-settings-channels-head">
+              <div>
+                <span>监听频道</span>
+                <small>
+                  勾选要监控的频道，每个频道单独选模式；四个自动模式都关时记为「手动」。
+                  没列出来的频道不会推送。
+                </small>
+              </div>
+              <button
+                className="lux-button lux-button-secondary"
+                type="button"
+                disabled={channelFetch.loading}
+                onClick={() => void refreshChannels()}
+              >
+                {channelFetch.loading ? "拉取中…" : "刷新频道列表"}
+              </button>
+            </div>
+            {channelFetch.error ? (
+              <p className="lux-error-copy" role="alert">{channelFetch.error}</p>
+            ) : null}
+            {draft.channels.length === 0 ? (
+              <p className="lux-archive-settings-hint">
+                还没有频道。点「刷新频道列表」从 Telegram 账号里拉取。
+              </p>
+            ) : (
+              <ul className="lux-archive-settings-channel-list">
+                {draft.channels.map((channel) => (
+                  <li key={channel.id} className="lux-archive-settings-channel">
+                    <label className="lux-archive-settings-channel-main">
+                      <input
+                        type="checkbox"
+                        checked={channel.enabled}
+                        onChange={(event) => updateChannel(channel.id, { enabled: event.target.checked })}
+                      />
+                      <span>{channel.title || channel.id}</span>
+                      <small>{channel.username ? `@${channel.username}` : channel.id}</small>
+                    </label>
+                    <div className="lux-archive-settings-channel-modes">
+                      {CHANNEL_MODES.map((mode) => (
+                        <label key={mode.key} title={mode.hint}>
+                          <input
+                            type="checkbox"
+                            checked={channel[mode.key]}
+                            disabled={!channel.enabled}
+                            onChange={(event) =>
+                              updateChannel(channel.id, { [mode.key]: event.target.checked } as Partial<ChannelDraft>)
+                            }
+                          />
+                          <span>{mode.label}</span>
+                        </label>
+                      ))}
+                      {isAutomatic(channel) ? null : (
+                        <span className="lux-archive-settings-channel-manual">手动</span>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
           <div className="lux-archive-settings-grid">
-            <label>
-              <span>监听频道</span>
-              <small>每行一个频道 @用户名 或数字 id。</small>
-              <textarea
-                rows={3}
-                spellCheck={false}
-                value={draft.listenChannels}
-                placeholder="@channel"
-                onChange={(event) => update("listenChannels", event.target.value)}
-              />
-            </label>
             <label>
               <span>追更列表</span>
               <small>每行一个剧集名；“追更”模式下只有命中这些名字的链接会被投递。</small>
@@ -780,9 +905,7 @@ function draftFromSettings(settings: ArchiveSettings): ArchiveSettingsDraft {
     apiId: settings.telegram.api_id,
     apiHash: "",
     phone: "",
-    listenMode: normalizeListenMode(settings.telegram.listen_mode),
-    listenChannels: settings.telegram.listen_channels.join("\n"),
-    followList: settings.telegram.follow_list.join("\n"),
+    channels: (settings.telegram.channels ?? []).map(channelToDraft),    followList: settings.telegram.follow_list.join("\n"),
     notify: selectedNotifyCategories(settings.telegram.notify, categories),
     notifyOriginal: settings.telegram.notify,
     notifyTouched: false,
@@ -798,7 +921,7 @@ const SECTION_FIELDS: Record<SettingsSection, (keyof ArchiveSettingsDraft)[]> = 
   paths: ["watchDirs", "mirrorRoot", "cd2Prefix", "cd2Mount"],
   wash: ["pollSeconds", "settleSeconds", "washEnabled", "washTolerance"],
   notify: ["notifyEnabled", "botToken", "chatId", "apiKey", "notify", "notifyOriginal", "notifyTouched"],
-  listen: ["apiId", "apiHash", "phone", "listenMode", "listenChannels", "followList"],
+  listen: ["apiId", "apiHash", "phone", "channels", "followList"],
   transfer: ["transferCookie", "transferTarget", "transferSidecar", "transferTimeout"],
 };
 
@@ -871,8 +994,21 @@ function payloadForSection(
     case "listen": {
       const telegram: Partial<ArchiveTelegramSettings> = {
         api_id: draft.apiId.trim(),
-        listen_mode: draft.listenMode,
-        listen_channels: splitLines(draft.listenChannels),
+        // `channels` is the v2 source of truth; `listen_mode`/`listen_channels`
+        // are left to the server, which derives them as a compatibility view.
+        channels: draft.channels.map((channel) => ({
+          id: channel.id,
+          title: channel.title,
+          username: channel.username,
+          enabled: channel.enabled,
+          modes: {
+            newRelease: channel.newRelease,
+            follow: channel.follow,
+            full: channel.full,
+            remux: channel.remux,
+            manual: !isAutomatic(channel),
+          },
+        })),
         follow_list: splitLines(draft.followList),
       };
       if (draft.apiHash.trim()) telegram.api_hash = draft.apiHash.trim();
@@ -1013,12 +1149,6 @@ function selectedNotifyCategories(
     return all.filter((category) => selected.includes(category));
   }
   return all;
-}
-
-function normalizeListenMode(value: string): string {
-  const trimmed = value.trim();
-  return LISTEN_MODE_ALIASES[trimmed.toLowerCase()]
-    ?? (LISTEN_MODES.some((mode) => mode.value === trimmed) ? trimmed : "手动");
 }
 
 function splitLines(value: string): string[] {

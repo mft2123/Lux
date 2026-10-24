@@ -1135,6 +1135,29 @@ export type ApiErrorBody = {
 // keys stay snake_case instead of the camelCase used by the other admin APIs.
 export type ArchiveNotifySelection = string[] | Record<string, boolean> | null;
 
+/** One channel the userbot watches; `manual` is derived server-side. */
+export type ArchiveTelegramChannel = {
+  id: string;
+  title: string;
+  username: string;
+  enabled: boolean;
+  modes: {
+    newRelease: boolean;
+    follow: boolean;
+    full: boolean;
+    remux: boolean;
+    manual: boolean;
+  };
+  automation?: {
+    initialized: boolean;
+    lastMessageId: number;
+    lastRunAt: string;
+    lastStatus: string;
+    lastError: string;
+    transferredCount: number;
+  };
+};
+
 export type ArchiveTelegramSettings = {
   bot_token: string;
   chat_id: string;
@@ -1144,8 +1167,14 @@ export type ArchiveTelegramSettings = {
   /** Shared admin API key the Telegram sidecar calls Lux with. */
   api_key: string;
   notify: ArchiveNotifySelection;
+  /**
+   * Compatibility projection of `channels` (enabled ids only). Written by the
+   * server so an older sidecar keeps working; the UI reads `channels`.
+   */
   listen_mode: string;
   listen_channels: string[];
+  /** Per-channel modes and cursor state (v2 source of truth). */
+  channels: ArchiveTelegramChannel[];
   follow_list: string[];
   enabled?: boolean | null;
   api_base?: string | null;
