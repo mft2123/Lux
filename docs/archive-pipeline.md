@@ -20,8 +20,9 @@
 ## 2. 处理流程
 
 ```
-链接队列 --(每轮消费)--> 115 转存(U11，未实现) --> 转存目录
+链接队列 --(每轮消费)--> transfer115 侧车（分享链接转存 / magnet·ed2k 离线下载）--> 转存目录 / 离线下载
 转存目录 --(稳定≥settle_seconds)--> 待整理 --> 识别(解析+TMDB) --> 判定 --> 媒体目录 / 重复目录 / 洗版目录 / 失败目录
+离线下载   --(115 后台下完、由监听目录接走)--> 转存目录
 ```
 
 0. **链接队列**：`链接队列/` 里的 `*.json` 作业文件先被消费（见 2.1）。这是 Telegram 旁挂
@@ -82,7 +83,10 @@
   `<cd2_prefix>/<target_dir>`；结果按 `transferred` / `failed` / `unsupported` 记账并移入 `已处理/`。
   `auth_required`（cookie 失效）与侧车不可达都**不记账、不移文件**：本轮消费中断（`dry_run` 除外），
   作业留在队列，换 cookie 后下一轮重试——只暂停队列阶段，归档流水线其余部分照常跑。
-  magnet / ed2k 不走侧车，直接记 `unsupported`（115 云下载是后续切片）。
+  magnet / ed2k 走同一个侧车的 `POST /offline`（115 云下载），目标目录是
+  `transfer115.offline_dir`（默认 `离线下载/`，**与 `转存目录/` 分开**：离线任务在 115 后台下载，
+  未完成的目录不能被归档当「已转存」）。提交成功记 `offline` 而不是 `transferred`；115 下完后
+  由 `LUX_ARCHIVE_WATCH_DIRS` 接走，所以 `离线下载/` 必须出现在监听目录里。
   未配置 `sidecar_base` 时退回旧行为：记 `needs_115_client`，不产生 `转存目录/` 条目。
 - **逐条失败隔离**：消费是 best effort，单条作业写状态或移动失败只记 `failed` 并继续下一条，
   不会中断整轮 `run_once`（否则磁盘满、`已处理/` 撞名会让整个归档永久卡死）。
@@ -90,13 +94,122 @@
   `状态.jsonl` 里不会出现第二条记账。
   `已处理/<作业名>` 被同名目录占用视为需要人工处理的异常（记 `failed`、作业留在队列），
   不会偷偷改名绕过；同名文件属于**另一个**作业时才加后缀。
-- 状态文件的状态：`transferred`（已转存/已提交）、`failed`（分享失效、接口报错、或非 115 链接的
-  `unsupported`）、`needs_115_client`（未配置侧车时的合法作业）、`invalid`（被隔离）。
+- 状态文件的状态：`transferred`（已转存/已提交）、`offline`（已提交 115 云下载，**不算**转存完成）、
+  `failed`（分享失效、接口报错、或非 115 链接的 `unsupported`；离线任务提交失败记 `failed` +
+  `transfer: offline_failed`）、`needs_115_client`（未配置侧车时的合法作业）、`invalid`（被隔离）。
   每条记录带 `transfer` 字段（转存结果或条目名）与 `reason`，便于排查。
 - 日志脱敏：链接只打印 `scheme://host`，magnet 只打印 `magnet:?xt=urn:btih:<前8位>…`；
   完整链接与 `password=` 不进日志。
 - 干跑（`dry_run`）只统计与报告，不移动文件、不写状态文件。
 
+## 2.2 Telegram 频道监听（判定链 / 补集 / 回执）
+
+`sidecar/telegram/` 只做「看消息、抽链接、按频道勾选过滤」；**判定不在 Python 里**，而是回 Lux 的
+`POST /admin/archive/telegram/plan` 做——catalog 和权重规则都在 Rust，Python 侧不再有第二份实现
+（否则两边一定会漂）。本节是 v2 的行为规范，设计背景见 `docs/handoff/CHANNEL-MONITORING.md`。
+
+### 2.2.1 频道模型
+
+`telegram.channels[]` 是权威；`listen_mode` / `listen_channels` 只是为兼容旧侧车保留的**派生投影**，
+每次保存按 `channels` 重算（任一启用频道 `full` → `全量`，否则依次取 上新 / 追更 / 手动）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 稳定键 = Telethon `dialog.id`（频道为负数）；标题会改，**不能**当身份 |
+| `title` / `username` | 展示用，不参与匹配 |
+| `enabled` | 是否监控；未勾选的频道不产生任何 ingest |
+| `modes` | `{newRelease, follow, full, remux, manual}`，见下表 |
+| `automation` | 游标与上次运行：`{initialized, lastMessageId, lastRunAt, lastStatus, lastError, transferredCount}` |
+
+模式位可叠加；`manual` 是**派生值**（其余四个全 false 才为 true），不是独立开关：
+
+| key | 界面名 | 允许的动作 |
+| --- | --- | --- |
+| `newRelease` | 入新 | 库里没有这部作品时投递 |
+| `follow` | 追更 | 库里有作品但缺这一季/这一集时补 |
+| `full` | 全量 | 等于入新 + 追更 + 洗版三个都开（不是「无条件全投」） |
+| `remux` | 洗版 | 已有这一集、但新版本严格更好时替换 |
+| `manual` | 手动 | 只登记进状态库、不投递，靠 `replay` 人工放行 |
+
+**首轮只建游标**：新频道第一次上线只记 `lastMessageId = 最新消息`，不处理历史——否则一个老频道会把
+几年存量一次性灌进队列。上限 500 个频道（`MAX_TELEGRAM_CHANNELS`），只为挡住失控的 UI 或手改文件。
+
+### 2.2.2 判定（`POST /admin/archive/telegram/plan`）
+
+请求：
+
+```json
+{"channelId":"-1001234567890","messages":[{"messageId":42,"candidates":[
+  {"title":"都市古仙医 S01E720 1080p","quality":"1080p","sizeBytes":1073741824,"link":"https://115.com/s/x"}]}]}
+```
+
+响应：`{"channelId","cursor","decisions":[{messageId,link,title,season,episode,action,reason,matchedItemId?}],"notes"?}`。
+`action` 只有四个值（`snake_case`）：`new_release`（入新）、`follow`（追更）、`remux`（洗版）、`skip`（跳过），
+每条都带一句人能看懂的 `reason`。`cursor` = 请求里最大的消息 id，侧车等所有决策都执行完才写回它。
+**接口本身不转存任何东西**，也不移动文件。
+
+错误：频道不在 `channels[]` → `404`；`channelId` / 消息结构非法 → `400`；数据库未打开 → `503`；
+读库失败 → `500`。判定接口不可达时，侧车退回本地 `filters` 规则（该挂起的仍挂起），不会「全转」或「全不转」。
+
+逐个候选判定，顺序固定：
+
+1. 库里没有这部作品 → 该频道开 `newRelease`/`full` 才 `new_release`，否则 `skip`。
+2. 是剧集且这季/这集缺失 → 开 `follow`/`full` 则 `follow`，否则 `skip`。
+3. 是剧集但没带季集号（整包）→ 同样交给 `follow`/`full` 判断缺集，否则 `skip`。
+4. 库里已有这一集/这部作品 → 只有 `remux`/`full` 且新版本**严格更好**才 `remux`，否则 `skip`。
+
+「严格更好」= 清晰度档位更高（2160/4K/UHD > 1080 > 720 > 480·576·SD > 未知），或同档位下体积大 10%。
+10% 是 `improvement()` 里写死的尺度，**不读** `wash_tolerance_ratio`（归档洗版的容差是另一个值）。
+无标注的比有标注的低一档，所以「未知 → 1080p」算升级，理由会写明「库里那份没有标注」；同档位同体积一律 `skip`。
+
+两条踩过的实现约束：
+
+- **先归一化标题再查库**：侧车送的是原始发布名（`都市古仙医 S01E221 1080p`），入口先
+  `normalize_candidate()`（复用归档的 `parse_media_name`）再取 titles，否则所有追更都会误判成入新。
+- **STRM 行的 `size` 可能是几百字节**：拿它做洗版体积比较会算出「体积大 3355704598%」。比较前要求
+  两边都 ≥ 1 MiB，否则只比清晰度。
+
+标题匹配是归一化后的**精确相等**（小写、去掉空格/句点/下划线/连字符），候选带年份时还必须与库里年份
+一致——`流浪地球 2019` 不会匹配到 `流浪地球2`。
+
+### 2.2.3 补集（`GET /admin/archive/telegram/missing`）
+
+对 `telegram.follow_list` 里每部剧报出库中缺的集：
+
+```json
+{"series":[{"id":"…","title":"武神主宰","year":2020,
+  "seasons":[{"season":1,"highest":720,"present":50,"missing":[1,2],"missingTotal":670,"truncated":true}],
+  "missingTotal":671}],"notes":["有 1 季的缺集超过 500 集，清单只列前 500 集（总数见 missingTotal）"]}
+```
+
+`year` 可省略；`series` 按 `missingTotal` 从大到小排（最该补的排前面）。Lux 只报缺口，不抓任何东西；
+追更列表里的剧不在库中时只在 `notes` 里说一句，不算缺口。
+
+- 缺口只算 `1..=已播最大集`：没有排期数据，不猜「下一集」之外的内容。
+- 单季 `missing` 最多列 500 条，真实总数在 `missingTotal`，`notes` 说明截断（不写「缺 500 集」糊弄）。
+- 侧车 `complete` 子命令把缺口变成频道搜索：**按剧名搜、按集号正则筛**——Telegram 搜索是整词匹配，
+  搜 `武神主宰 S01E01` 一条都没有，搜 `武神主宰` 才有。
+- 每季最多 200 个缺集参与匹配（`COMPLETION_PER_SEASON`），避免一次刷爆搜索配额。
+
+### 2.2.4 回执三态（同一条链接只转存一次）
+
+侧车按 **URL** 记回执，跨频道也去重（同一链接在 A 频道投过，B 频道不会再投）：
+
+| 状态 | 含义 | 后续 |
+| --- | --- | --- |
+| `planned` | 已判定、尚未投递 | 下一轮可以投 |
+| `uncertain` | 投递结果未知（超时、连接断） | **不自动重发**，只能 `replay --force` 人工放行 |
+| `submitted` | Lux 已接受 | 不再投递 |
+
+上限 10000 条，超了只淘汰最老的 `submitted`；`planned` / `uncertain` 永不淘汰。实测路径（黑洞地址
+`10.255.255.1:9` + 1s 超时）：投递超时 → `uncertain` → 自动重试拒绝重发 → 条目以
+`held/receipt:uncertain` 挂起，等人看。
+
+### 2.2.5 频道清单（`GET /admin/archive/telegram/channels`）
+
+浏览器不能直连旁挂（跨源、无 CORS），所以由 Lux 代理：`LUX_TG_SIDECAR_BASE` 指向旁挂的 8091，
+Lux 转调 `GET {base}/channels`，返回 `{id,title,username,kind,lastMessageAt}`。旁挂侧全量 `iter_dialogs`
+有缓存（`state/dialogs.json`），只有点「刷新频道列表」才真正重拉。
 
 ## 3. 条目与名称解析
 
@@ -358,10 +471,29 @@
     "notify": ["入库", "整理", "失败"],
     "listen_mode": "上新",
     "listen_channels": ["@channel"],
-    "follow_list": ["繁花"]
+    "follow_list": ["繁花"],
+    "channels": [
+      {
+        "id": "-1001234567890",
+        "title": "爱影",
+        "username": "aiying",
+        "enabled": true,
+        "modes": {"newRelease": true, "follow": true, "full": false, "remux": false, "manual": false},
+        "automation": {"initialized": true, "lastMessageId": 4210}
+      }
+    ]
+  },
+  "transfer115": {
+    "target_dir": "转存目录",
+    "offline_dir": "离线下载",
+    "sidecar_base": "http://172.17.0.1:8098"
   }
 }
 ```
+
+`channels` 是 v2 的权威配置（见 2.2.1）；`listen_mode` / `listen_channels` 只是兼容投影，读旧文件时双向
+迁移，写回后以 `channels` 为准。`transfer115.offline_dir` 是 magnet/ed2k 的 115 云下载落点（默认
+`离线下载`，必须同时出现在 `watch_dirs` 里才会被流水线接走，见 2.1）。
 
 `telegram.api_key` 是**旁挂调用 Lux 管理接口**用的密钥（`X-Lux-Api-Key`），与通知 bot 无关；
 旁挂优先读它，缺失时才用 `LUX_TG_API_KEY` 环境变量兜底。
@@ -409,11 +541,21 @@
     - 一侧是另一侧的前缀时，多出来的部分只要不是纯数字就当作发布标签/附带季标记放行
       （`4K`、`HDR`、`第二季`…）；纯数字视为续集序号，不匹配（`流浪地球` 不匹配 `流浪地球2`）。
     - 命中多个时取体积最大的那个；目录树不跟随符号链接、深度上限 3 层。
+- `POST /api/v1/admin/archive/telegram/plan` — 旁挂判定入口（规则见 2.2.2）。Body / 响应见 2.2.2；
+  鉴权同管理接口，频道不在 `channels[]` 里返回 `404`，请求结构非法 `400`，数据库未打开 `503`。
+- `GET /api/v1/admin/archive/telegram/missing` — 补集清单（见 2.2.3），只读，不抓任何东西。
+- `GET /api/v1/admin/archive/telegram/channels` — 代取旁挂的频道清单（见 2.2.5），供设置页勾选。
 
 ## 10. 已知限制
 
-- **115 转存只做了分享链接**：`115.com/s/<code>` 走 transfer115 侧车；magnet / ed2k 记 `unsupported`
-  （115 云下载是后续切片）。侧车与真实 cookie 的端到端验收尚未进行（离线 21 条用例已过）。
+- **115 转存分两条路**：`115.com/s/<code>` 走 transfer115 侧车的 `POST /transfer`；magnet / ed2k 走同一个
+  侧车的 `POST /offline`（115 云下载，落到 `离线下载/`，且必须出现在监听目录里才会被接走）。
+  离线这条路已用真实账号验过（提交成功、测试任务已从 115 删除）；分享链接转存的真实 cookie 端到端仍未验收。
+- **判定的「剧集完整性」只到集号层**：库里没有排期数据，缺口按 `1..=已播最大集` 算；整包只判断
+  「这一集在不在」，不推算季总集数。
+- **补集依赖 Telegram 搜索**：整词匹配，`剧名 S01E03` 搜不到，所以按剧名搜、再按集号正则筛。
+- **回执按 URL 去重**：同一链接换了标题或频道也不会二次转存；要重投只能 `replay --force`。
+- **判定接口是旁挂的硬依赖**：不可达时退回本地 `filters`，此时缺集判断会退化成「按模式放行」。
 - **侧车串行转存**：同一个 115 会话一次只处理一个作业，队列积压时逐个消费。
 - **侧车超时**：Lux 侧 `transfer115.timeout_seconds`（默认 120s，上限 600s）到点即中断，
   作业留在队列下一轮重试；115 侧的大分享可能在 Lux 超时后仍在处理，文件落盘后照常被流水线接走。

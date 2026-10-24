@@ -89,4 +89,7 @@ modes:      normalizeTelegramChannelModes()   // 全 false → manual=true
 
 - Telethon `iter_dialogs` 拉数千个会话较慢（约 1–2 分钟），必须先做缓存 + 手动刷新。
 - `follow` 的「订阅来源」目前是设置里的 `follow_list`；daquan 用的是媒体库订阅状态，后续可对接。
-- 判定发生在**侧车**，需要把 Lux 的库内状态通过 lookup 暴露给它；当前 lookup 只按标题匹配，缺「季/集」维度，需要扩展。
+- ~~判定发生在**侧车**，需要把 Lux 的库内状态通过 lookup 暴露给它~~ → **v2 已改**：判定链在 Lux
+  （`src/application/telegram/`，`POST /admin/archive/telegram/plan`），侧车只负责抽取与执行。本文件 §3
+  的矩阵是当时的 daquan 对齐稿，实现以 `docs/archive-pipeline.md` 2.2.2 为准——差别在于代码里没有
+  「上次 `planned` 且开入新 → 入新」那条分支，缺集一律按 `follow`/`full` 判。
