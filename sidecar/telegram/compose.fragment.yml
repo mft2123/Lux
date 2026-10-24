@@ -8,6 +8,8 @@
 #   （Lux 管理 API key：管理页「API key」或 POST /api/v1/admin/api-key/rotate）
 #   设置文件由 Lux 保存时写成 0640 + 属组 $LUX_ARCHIVE_SETTINGS_GROUP，
 #   本片段用 group_add 让 uid 10001 以附加组身份加入同一 gid（见 README「部署检查清单」）。
+#   反向接线：Lux 侧要设 LUX_TG_SIDECAR_BASE=http://telegram:8091（同网络用服务名，
+#   否则用 http://<nas-ip>:8091），设置页「刷新频道列表」走的 GET /channels 靠它。
 #
 # 首次登录：`docker compose up -d telegram` 后看日志里的验证码提示，
 # 把收到的验证码写进 /vol5/1000/build/lux-telegram/session/code.txt
@@ -16,7 +18,8 @@ services:
   telegram:
     build:
       context: ./sidecar/telegram
-    image: lux-telegram:1
+    # v2（判定链 / 补集 / 回执三态，2026-10-24）的产物打 :2；回滚把 tag 改回 :1 再 up -d。
+    image: lux-telegram:2
     container_name: lux-telegram
     # 非 root：session 授权密钥不该只有 root 能读
     user: "10001:10001"
@@ -30,16 +33,26 @@ services:
       LUX_TG_SESSION_DIR: /app/session
       LUX_TG_STATE_DIR: /app/state
       LUX_TG_LOG_LEVEL: INFO
+      # /healthz 与 /channels 共用这个 HTTP 端口；Lux 侧靠它刷新频道清单，
+      # 不设（默认 0）就是不监听，设置页会拿不到频道。
+      LUX_TG_HEALTH_PORT: "8091"
       LUX_TG_BACKFILL_LIMIT: "200"
       LUX_TG_GAP_LIMIT: "200"
-      # 走 Lux 项目网络时用服务名；单独跑这段 compose 的话改成 http://<nas-ip>:8097
+      # 走 Lux 项目网络时用服务名；单独跑这段 compose 的话，下面三行一起改成
+      # http://<nas-ip>:8097 与对应路径（只改 BASE 不够，PLAN/MISSING 是显式值）。
       LUX_TG_LUX_BASE: http://lux:8097
+      # v2 判定链与补集：显式写出来，排障时不用去推 Python 那边的默认值推导。
+      LUX_TG_PLAN_URL: http://lux:8097/api/v1/admin/archive/telegram/plan
+      LUX_TG_MISSING_URL: http://lux:8097/api/v1/admin/archive/telegram/missing
       # Lux 管理 API key 的两个来源（D1：设置文件优先、env 兜底）：
       #   1) /config/archive-settings.json 的 telegram.api_key —— 权威值，Lux 保存设置时写入
       #   2) 环境变量 LUX_TG_API_KEY —— 只在设置文件里为空时生效（窗口期/临时排障）
       # LUX_TG_API_KEY: ""
       # 有二步验证时一次性传入（平时留空）
       # TG_2FA_PASSWORD: ""
+    ports:
+      # 给同宿主的 Lux 用；不需要从局域网访问就删掉这段，改走 compose 网络。
+      - "8091:8091"
     volumes:
       - /vol5/1000/build/archive-settings.json:/config/archive-settings.json:ro
       - /vol5/1000/build/lux-telegram/session:/app/session
