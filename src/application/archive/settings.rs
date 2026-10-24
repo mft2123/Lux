@@ -53,6 +53,11 @@ pub(crate) const DEFAULT_LISTEN_MODE: &str = "手动";
 /// root: the pipeline's own transfer directory, which the archive stage feeds
 /// into 待整理 exactly like a manual upload.
 pub(crate) const DEFAULT_TRANSFER115_TARGET_DIR: &str = "转存目录";
+/// Default target for 115 cloud download (magnet / ed2k), relative to the
+/// archive root. Kept separate from [`DEFAULT_TRANSFER115_TARGET_DIR`] because
+/// 115 downloads in the background: mixing both streams in one directory makes
+/// "what did the share transfer put here" impossible to answer.
+pub(crate) const DEFAULT_TRANSFER115_OFFLINE_DIR: &str = "离线下载";
 pub(crate) const DEFAULT_TRANSFER115_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TRANSFER115_TIMEOUT_SECONDS: u64 = 600;
 
@@ -93,6 +98,10 @@ pub(crate) struct Transfer115Settings {
     /// root (for example `转存目录`). The sidecar resolves it to a 115 `cid` and
     /// creates it when missing.
     pub(crate) target_dir: String,
+    /// Target directory for cloud-download (magnet / ed2k) tasks, relative to the
+    /// archive root. 115 downloads in the background, so this is deliberately a
+    /// different directory from `target_dir`.
+    pub(crate) offline_dir: String,
     /// Base URL of the transfer115 sidecar; empty disables the transfer stage
     /// and jobs stay `needs_115_client`.
     pub(crate) sidecar_base: String,
@@ -167,6 +176,7 @@ impl Default for Transfer115Settings {
         Self {
             cookie: String::new(),
             target_dir: DEFAULT_TRANSFER115_TARGET_DIR.to_owned(),
+            offline_dir: DEFAULT_TRANSFER115_OFFLINE_DIR.to_owned(),
             sidecar_base: String::new(),
             timeout_seconds: DEFAULT_TRANSFER115_TIMEOUT_SECONDS,
         }
@@ -508,6 +518,9 @@ impl ArchiveSettings {
             if transfer.contains_key("target_dir") {
                 validate_transfer_target_dir(&self.transfer115.target_dir)?;
             }
+            if transfer.contains_key("offline_dir") {
+                validate_transfer_target_dir(&self.transfer115.offline_dir)?;
+            }
         }
         Ok(())
     }
@@ -552,6 +565,7 @@ impl ArchiveSettings {
         }
         validate_sidecar_base(&self.transfer115.sidecar_base)?;
         validate_transfer_target_dir(&self.transfer115.target_dir)?;
+        validate_transfer_target_dir(&self.transfer115.offline_dir)?;
         Ok(())
     }
 
@@ -579,6 +593,9 @@ impl ArchiveSettings {
         }
         if self.transfer115.target_dir.trim().is_empty() {
             self.transfer115.target_dir = DEFAULT_TRANSFER115_TARGET_DIR.to_owned();
+        }
+        if self.transfer115.offline_dir.trim().is_empty() {
+            self.transfer115.offline_dir = DEFAULT_TRANSFER115_OFFLINE_DIR.to_owned();
         }
         self
     }
@@ -636,6 +653,9 @@ impl Transfer115Settings {
         }
         if let Some(value) = string_field(document, "target_dir") {
             settings.target_dir = value;
+        }
+        if let Some(value) = string_field(document, "offline_dir") {
+            settings.offline_dir = value;
         }
         if let Some(value) = string_field(document, "sidecar_base") {
             settings.sidecar_base = value;

@@ -6,6 +6,10 @@ Endpoints (all JSON):
 - ``POST /transfer``  — body ``{job_id, url, title, archive_root, target_dir,
   cd2_prefix}``; answers ``{status, detail, saved}`` where status is one of
   ``transferred`` / ``auth_required`` / ``failed`` / ``unsupported``.
+- ``POST /offline``   — body ``{job_id, url, title, target_dir, cd2_prefix}``
+  for a magnet / ed2k link; answers ``{status, detail}`` where status is one of
+  ``submitted`` / ``auth_required`` / ``failed`` / ``unsupported``. ``submitted``
+  only means 115 accepted the cloud-download task.
 - ``GET /healthz``    — shallow probe (process up, cookie configured). Add
   ``?deep=1`` to validate the cookie against 115.
 - ``GET /``           — one-line description.
@@ -25,7 +29,13 @@ from urllib.parse import parse_qs, urlparse
 
 from p115client.exception import P115AuthenticationError
 
-from transfer115 import STATUS_AUTH_REQUIRED, TransferJob, TransferService, load_cookie
+from transfer115 import (
+    STATUS_AUTH_REQUIRED,
+    OfflineJob,
+    TransferJob,
+    TransferService,
+    load_cookie,
+)
 
 DEFAULT_CONFIG_DIR = "/config"
 DEFAULT_HOST = "0.0.0.0"
@@ -134,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path != "/transfer":
+        if parsed.path not in ("/transfer", "/offline"):
             self._send(404, {"ok": False, "detail": "not found"})
             return
         try:
@@ -152,6 +162,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not isinstance(body, dict) or not isinstance(body.get("url"), str) or not body["url"].strip():
             self._send(400, {"ok": False, "detail": "缺少 url"})
+            return
+        if parsed.path == "/offline":
+            offline_job = OfflineJob(
+                job_id=str(body.get("job_id") or ""),
+                url=body["url"].strip(),
+                title=str(body.get("title") or ""),
+                target_dir=str(body.get("target_dir") or ""),
+                cd2_prefix=str(body.get("cd2_prefix") or ""),
+            )
+            # Only the scheme is logged: a magnet link carries the info hash and
+            # an ed2k link carries the file name.
+            scheme = offline_job.url.split(":", 1)[0] if ":" in offline_job.url else "(no scheme)"
+            print(
+                f"[transfer115] offline job={offline_job.job_id or '(none)'} scheme={scheme}",
+                flush=True,
+            )
+            with TRANSFER_LOCK:
+                result = SERVICE.offline(offline_job)
+            print(
+                f"[transfer115] offline job={offline_job.job_id or '(none)'} status={result.status}",
+                flush=True,
+            )
+            self._send(200, {"status": result.status, "detail": result.detail})
             return
         job = TransferJob(
             job_id=str(body.get("job_id") or ""),

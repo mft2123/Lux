@@ -18,6 +18,26 @@ Telegram → Lux ingest → 链接队列/*.json
 
 ## 契约（与 Lux 侧 `570ccb19` 对齐）
 
+`POST /offline`
+
+magnet / ed2k 走 115 云下载（离线任务），不是分享转存：
+
+```json
+{"job_id": "...", "url": "magnet:?xt=urn:btih:...", "title": "...",
+ "target_dir": "离线下载", "cd2_prefix": "测试库"}
+```
+
+回答 `{status, detail}`：
+
+| status | 含义 | Lux 侧动作 |
+| --- | --- | --- |
+| `submitted` | 115 接受了离线任务（不代表下载完成） | 记 `offline`、移入 `已处理/` |
+| `auth_required` | cookie 失效 | 不记账、留队列重试 |
+| `failed` | 链接格式错/115 拒收 | 记 `failed`、移入 `已处理/` |
+| `unsupported` | 不是 magnet/ed2k | 记 `failed`、移入 `已处理/` |
+
+ed2k 在本地按 `ed2k://|file|<名>|<大小>|<32位哈希>|/` 校验后再发给 115（115 对格式错只回一句「错误的链接」）。
+
 `POST /transfer`
 
 ```json

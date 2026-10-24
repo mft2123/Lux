@@ -111,6 +111,10 @@ pub(crate) const LINK_JOB_STATUS_AUTH_REQUIRED: &str = "auth_required";
 /// U11: the sidecar answered `failed` (or was unreachable). Recorded and moved
 /// to 已处理/ like any consumed job; re-deliver with `force: true`.
 pub(crate) const LINK_JOB_STATUS_FAILED: &str = "failed";
+/// magnet / ed2k: the sidecar submitted a 115 cloud-download task. 115 fetches
+/// in the background, so this only means "accepted" — the files show up in the
+/// offline directory later and the next archive run picks them up from there.
+pub(crate) const LINK_JOB_STATUS_OFFLINE: &str = "offline";
 pub(crate) const LINK_JOB_NEEDS_115_REASON: &str =
     "115 转存客户端未实现（U11）：链接已登记，未下载任何内容";
 /// U11: the transfer stage is configured but this link kind is not handled by
@@ -146,6 +150,11 @@ pub(crate) struct ArchiveConfig {
     pub(crate) transfer115_cookie: String,
     /// Target directory for share transfers, relative to `root` (fixed rule).
     pub(crate) transfer115_target_dir: String,
+    /// Target directory for 115 cloud download (magnet / ed2k), relative to
+    /// `root`. Separate from `transfer115_target_dir` on purpose: the archive
+    /// stage treats 转存目录 as "ready to organize" and an offline task that is
+    /// still downloading must not be mistaken for a finished transfer.
+    pub(crate) transfer115_offline_dir: String,
     pub(crate) transfer115_timeout: Duration,
     /// Where the CD2 mount is visible inside the media server container.
     pub(crate) cd2_container_mount: String,
@@ -189,6 +198,7 @@ impl ArchiveConfig {
             transfer115_base: settings.transfer115.sidecar_base.clone(),
             transfer115_cookie: settings.transfer115.cookie.clone(),
             transfer115_target_dir: settings.transfer115.target_dir.clone(),
+            transfer115_offline_dir: settings.transfer115.offline_dir.clone(),
             transfer115_timeout: Duration::from_secs(settings.transfer115.timeout_seconds),
             settle_seconds: settings.settle_seconds,
             wash_enabled: settings.wash_enabled,
@@ -2186,6 +2196,8 @@ impl ArchiveService {
             if dry_run {
                 let status = if self.transfer115_configured() && is_115_share_link(&job.url) {
                     LINK_JOB_STATUS_TRANSFERRED
+                } else if self.transfer115_configured() && is_offline_link(&job.url) {
+                    LINK_JOB_STATUS_OFFLINE
                 } else if self.transfer115_configured() {
                     LINK_JOB_STATUS_FAILED
                 } else {
@@ -2267,9 +2279,16 @@ impl ArchiveService {
                         return Err(pause);
                     }
                 }
+            } else if self.transfer115_configured() && is_offline_link(&job.url) {
+                // magnet / ed2k: 115 cloud download, not share receive. The
+                // task is accepted asynchronously, so the recorded status is
+                // `offline`, not `transferred`.
+                match self.transfer_115_offline(&job).await {
+                    Ok(outcome) => outcome,
+                    Err(pause) => return Err(pause),
+                }
             } else if self.transfer115_configured() {
-                // magnet / ed2k: the queue accepts them, but the transfer
-                // sidecar only does 115 share links this slice.
+                // Anything else (ftp, 网盘直链…) has no 115 path here.
                 TransferOutcome {
                     status: LINK_JOB_STATUS_FAILED,
                     transfer: "unsupported".to_owned(),
@@ -2520,6 +2539,94 @@ impl ArchiveService {
         }
     }
 
+    /// Submit a magnet / ed2k link as a 115 cloud-download task.
+    ///
+    /// 115 downloads in the background, so a successful answer means "task
+    /// accepted", recorded as `offline`. The files land in the offline
+    /// directory later and the next archive round picks them up from there.
+    async fn transfer_115_offline(&self, job: &LinkJob) -> Result<TransferOutcome, String> {
+        let base = self.config.transfer115_base.trim().trim_end_matches('/');
+        let body = serde_json::json!({
+            "job_id": job.job_id,
+            "url": job.url,
+            "title": job.title,
+            // No archive_root here: cloud download lands in 115 directly, the
+            // sidecar only needs the account-relative target.
+            "target_dir": self.config.transfer115_offline_dir,
+            "cd2_prefix": self.config.cd2_prefix,
+        });
+        let request = self
+            .http
+            .post(format!("{base}/offline"))
+            .json(&body)
+            .timeout(self.config.transfer115_timeout);
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(format!(
+                    "转存侧车 {} 请求失败: {}",
+                    mask_link_for_log(&format!("{base}/offline")),
+                    describe_sidecar_error(&error)
+                ));
+            }
+        };
+        let status = response.status();
+        let payload: serde_json::Value = match response.json().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                return Err(format!("转存侧车响应不是 JSON（HTTP {status}）: {error}"));
+            }
+        };
+        let answer = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let detail = payload
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        match answer.as_str() {
+            "submitted" => Ok(TransferOutcome {
+                status: LINK_JOB_STATUS_OFFLINE,
+                transfer: "offline".to_owned(),
+                reason: if detail.is_empty() {
+                    "已提交 115 离线下载任务，等待 115 下载完成".to_owned()
+                } else {
+                    detail
+                },
+            }),
+            "auth_required" => Err(format!(
+                "115 cookie 无效或已过期（{}）：请在设置里更新 cookie，作业留在队列等待重试",
+                if detail.is_empty() { "auth_required" } else { &detail }
+            )),
+            "failed" => Ok(TransferOutcome {
+                status: LINK_JOB_STATUS_FAILED,
+                transfer: "offline_failed".to_owned(),
+                reason: if detail.is_empty() {
+                    "转存侧车报告离线下载任务提交失败".to_owned()
+                } else {
+                    detail
+                },
+            }),
+            "unsupported" => Ok(TransferOutcome {
+                status: LINK_JOB_STATUS_FAILED,
+                transfer: "unsupported".to_owned(),
+                reason: if detail.is_empty() {
+                    LINK_JOB_UNSUPPORTED_REASON.to_owned()
+                } else {
+                    detail
+                },
+            }),
+            _ => Err(format!(
+                "转存侧车返回了无法理解的状态 {answer:?}（HTTP {status}）"
+            )),
+        }
+    }
+
     fn reject_link_job(
         &self,
         report: &mut LinkQueueReport,
@@ -2609,6 +2716,7 @@ impl ArchiveService {
             pending_link_jobs: count_link_jobs(&self.config.link_queue_dir()),
             transfer115_configured: transfer115_ready,
             transfer115_target_dir: self.config.transfer115_target_dir.clone(),
+            transfer115_offline_dir: self.config.transfer115_offline_dir.clone(),
             settle_seconds: self.config.settle_seconds,
             wash_enabled: self.config.wash_enabled,
             wash_tolerance_ratio: self.config.wash_tolerance_ratio,
@@ -3896,6 +4004,9 @@ pub(crate) struct ArchiveStatus {
     /// archive root.
     #[serde(default)]
     pub(crate) transfer115_target_dir: String,
+    /// Target directory for 115 cloud download (magnet / ed2k).
+    #[serde(default)]
+    pub(crate) transfer115_offline_dir: String,
     /// Job files waiting in the queue right now.
     #[serde(default)]
     pub(crate) pending_link_jobs: usize,
@@ -4239,8 +4350,9 @@ struct TransferOutcome {
 /// both halves must agree on what counts as a 115 share.
 const SHARE_LINK_HOSTS: [&str; 4] = ["115cdn.com", "anxia.com", "115.link", "115.com.cn"];
 
-/// Only 115 share links go to the transfer sidecar; magnet / ed2k are queued
-/// but parked as `unsupported` until 115 cloud download lands.
+/// Only 115 share links go to the share-receive endpoint. magnet / ed2k are a
+/// different 115 API (cloud download) and take their own path; everything else
+/// is parked as `unsupported`.
 fn is_115_share_link(url: &str) -> bool {
     let lowered = url.trim().to_ascii_lowercase();
     if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
@@ -4256,6 +4368,15 @@ fn is_115_share_link(url: &str) -> bool {
         .next()
         .unwrap_or_default();
     host == "115.com" || host.ends_with(".115.com") || SHARE_LINK_HOSTS.contains(&host)
+}
+
+/// magnet / ed2k links go to 115 cloud download instead of share receive.
+///
+/// The queue accepts them since U11 and parked them as `unsupported`; the
+/// sidecar now submits them as offline tasks when the transfer stage is on.
+fn is_offline_link(url: &str) -> bool {
+    let lowered = url.trim().to_ascii_lowercase();
+    lowered.starts_with("magnet:?") || lowered.starts_with("ed2k://")
 }
 
 /// One-line description of a reqwest failure for the pause reason. The URL is
@@ -5088,6 +5209,7 @@ mod tests {
             transfer115_base: String::new(),
             transfer115_cookie: String::new(),
             transfer115_target_dir: "转存目录".to_owned(),
+            transfer115_offline_dir: "离线下载".to_owned(),
             transfer115_timeout: Duration::from_secs(5),
             settle_seconds: 0,
             wash_enabled: true,
@@ -5126,6 +5248,7 @@ mod tests {
     struct StubLog {
         hits: usize,
         last_body: serde_json::Value,
+        last_path: String,
     }
 
     impl StubSidecar {
@@ -5193,6 +5316,11 @@ mod tests {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     slot.hits += 1;
+                    slot.last_path = received
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
                         slot.last_body = parsed;
                     }
@@ -5227,6 +5355,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.hits
+        }
+
+        fn last_path(&self) -> String {
+            let slot = self
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.last_path.clone()
         }
     }
 
@@ -5742,6 +5878,50 @@ mod tests {
         config
     }
 
+    /// magnet / ed2k go to 115 cloud download: the sidecar gets `/offline`, the
+    /// job is recorded `offline` (not `transferred`) and moves to 已处理/.
+    #[tokio::test]
+    async fn a_magnet_link_becomes_an_offline_task() {
+        let server = StubSidecar::start("submitted");
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
+        let queued = service
+            .enqueue_link_job(link_job("magnet:?xt=urn:btih:0123456789abcdef"))
+            .expect("queued");
+
+        let report = service.ingest_link_queue(false).await.expect("consumed");
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_OFFLINE);
+        assert_eq!(report.accepted[0].transfer, "offline");
+
+        // A magnet link must not travel to the share-receive endpoint.
+        assert_eq!(server.last_path(), "/offline");
+        let seen = server.last_body();
+        assert_eq!(seen["job_id"], queued.job_id);
+        assert_eq!(seen["url"], "magnet:?xt=urn:btih:0123456789abcdef");
+        assert_eq!(seen["target_dir"], "离线下载");
+        // Cloud download lands in 115 directly: no archive root and no cookie.
+        assert!(seen.get("archive_root").is_none(), "{seen}");
+        assert!(!seen.to_string().contains("SEID=3"), "cookie leaked: {seen}");
+
+        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
+        assert!(state.contains(LINK_JOB_STATUS_OFFLINE), "{state}");
+        assert_eq!(service.status().pending_link_jobs, 0);
+    }
+
+    /// The link classifier splits the two 115 APIs and nothing else.
+    #[test]
+    fn offline_and_share_links_are_classified_separately() {
+        assert!(is_offline_link("magnet:?xt=urn:btih:abc"));
+        assert!(is_offline_link("  MAGNET:?xt=urn:btih:abc  "));
+        assert!(is_offline_link("ed2k://|file|a.mkv|1024|0123456789abcdef0123456789abcdef|/"));
+        assert!(!is_offline_link("https://115.com/s/abc"));
+        assert!(!is_offline_link("ftp://example.com/a.mkv"));
+        assert!(!is_offline_link("https://example.com/magnet:?x"));
+        assert!(is_115_share_link("https://115.com/s/abc"));
+        assert!(!is_115_share_link("magnet:?xt=urn:btih:abc"));
+    }
+
     /// U11: a 115 share link is handed to the sidecar and recorded
     /// `transferred`; the job moves to 已处理/ and the state line carries what
     /// the sidecar saved.
@@ -5843,31 +6023,6 @@ mod tests {
         );
     }
 
-    /// U11: magnet / ed2k links stay accepted by the queue but the transfer
-    /// sidecar only does 115 share links this slice: they are recorded
-    /// `failed` with the `unsupported` marker, not silently dropped.
-    #[tokio::test]
-    async fn a_magnet_link_is_parked_as_unsupported() {
-        let server = StubSidecar::start("transferred");
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let service = ArchiveService::new_for_tests(transfer_config(tmp.path(), &server.base()));
-        service
-            .enqueue_link_job(link_job("magnet:?xt=urn:btih:abc"))
-            .expect("queued");
-
-        let report = service.ingest_link_queue(false).await.expect("consumed");
-        assert_eq!(report.accepted.len(), 1);
-        assert_eq!(report.accepted[0].status, LINK_JOB_STATUS_FAILED);
-        assert_eq!(report.accepted[0].transfer, "unsupported");
-        let state = std::fs::read_to_string(service.config.link_state_file()).expect("state file");
-        assert!(state.contains(LINK_JOB_UNSUPPORTED_REASON), "{state}");
-        assert_eq!(
-            server.hits(),
-            0,
-            "the sidecar is never asked about a magnet link"
-        );
-    }
-
     /// U11: an unreachable sidecar pauses the stage: the job is neither
     /// recorded nor moved, so the next round retries it.
     #[tokio::test]
@@ -5920,7 +6075,7 @@ mod tests {
         );
         assert_eq!(
             statuses.get("magnet:?xt=urn:btih:dry"),
-            Some(&LINK_JOB_STATUS_FAILED)
+            Some(&LINK_JOB_STATUS_OFFLINE)
         );
         assert_eq!(server.hits(), 0, "a dry run never calls the sidecar");
         assert_eq!(service.status().pending_link_jobs, 2);

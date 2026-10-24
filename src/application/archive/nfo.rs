@@ -998,6 +998,7 @@ mod tests {
             transfer115_base: String::new(),
             transfer115_cookie: String::new(),
             transfer115_target_dir: "转存目录".to_owned(),
+            transfer115_offline_dir: "离线下载".to_owned(),
             transfer115_timeout: std::time::Duration::from_secs(5),
         };
         let service = ArchiveService::new_for_tests(config);

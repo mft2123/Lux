@@ -12,8 +12,10 @@ from p115client.exception import P115AuthenticationError, P115Error
 from transfer115.service import (
     STATUS_AUTH_REQUIRED,
     STATUS_FAILED,
+    STATUS_SUBMITTED,
     STATUS_TRANSFERRED,
     STATUS_UNSUPPORTED,
+    OfflineJob,
     TransferJob,
     TransferService,
     load_cookie,
@@ -68,6 +70,22 @@ class FakeClient:
         if self.receive_error:
             raise self.receive_error
         return {"state": "success", "data": {}}
+
+    def clouddownload_task_add_url(self, payload):
+        self.calls.append(("clouddownload_task_add_url", dict(payload)))
+        if getattr(self, "offline_error", None):
+            raise self.offline_error
+        return {"state": "success", "data": {"task_id": "task-9"}}
+
+
+def offline_job(url="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", target="离线下载", prefix="测试库"):
+    return OfflineJob(
+        job_id="job-2",
+        url=url,
+        title="某片",
+        target_dir=target,
+        cd2_prefix=prefix,
+    )
 
 
 def job(url="https://115.com/s/sw123abc?password=abcd", target="转存目录", prefix="测试库"):
@@ -302,6 +320,68 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(result.status, STATUS_TRANSFERRED)
         self.assertIn("已转存 1 个条目", result.detail)
 
+
+class OfflineDownloadTests(unittest.TestCase):
+    """magnet / ed2k go to 115 cloud download, not to share receive."""
+
+    def service(self, client):
+        return TransferService(cookie="UID=1; CID=2; SEID=3; KID=4", client_factory=lambda: client)
+
+    def test_magnet_is_submitted_to_cloud_download(self):
+        client = FakeClient()
+        result = self.service(client).offline(offline_job())
+
+        self.assertEqual(result.status, STATUS_SUBMITTED)
+        self.assertIn("离线下载", result.detail)
+        calls = [call for call in client.calls if call[0] == "clouddownload_task_add_url"]
+        self.assertEqual(len(calls), 1)
+        payload = calls[0][1]
+        self.assertTrue(payload["url"].startswith("magnet:?"))
+        # 目标目录按 cd2_prefix/target_dir 逐级解析，不能传空 cid。
+        self.assertTrue(payload["wp_path_id"])
+        self.assertNotIn("share_receive", [call[0] for call in client.calls])
+
+    def test_ed2k_is_submitted(self):
+        link = "ed2k://|file|%s|1024|0123456789abcdef0123456789abcdef|/" % "某片.mkv"
+        client = FakeClient()
+        result = self.service(client).offline(offline_job(url=link))
+
+        self.assertEqual(result.status, STATUS_SUBMITTED)
+        self.assertTrue([call for call in client.calls if call[0] == "clouddownload_task_add_url"])
+
+    def test_malformed_ed2k_fails_before_touching_115(self):
+        client = FakeClient()
+        result = self.service(client).offline(offline_job(url="ed2k://|file|某个文件|/"))
+
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("ed2k 链接格式无效", result.detail)
+        self.assertEqual(client.calls, [])
+
+    def test_other_links_are_unsupported(self):
+        client = FakeClient()
+        result = self.service(client).offline(offline_job(url="https://115.com/s/sw123abc"))
+
+        self.assertEqual(result.status, STATUS_UNSUPPORTED)
+        self.assertEqual(client.calls, [])
+
+    def test_dead_cookie_is_auth_required(self):
+        client = FakeClient(login_error=P115AuthenticationError("登录状态已失效"))
+        result = self.service(client).offline(offline_job())
+
+        self.assertEqual(result.status, STATUS_AUTH_REQUIRED)
+
+    def test_upstream_rejection_is_reported_as_failed(self):
+        link = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+
+        class RejectingClient(FakeClient):
+            def clouddownload_task_add_url(self, payload):
+                self.calls.append(("clouddownload_task_add_url", dict(payload)))
+                return {"state": False, "error": "该链接已存在"}
+
+        result = self.service(RejectingClient()).offline(offline_job(url=link))
+
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("该链接已存在", result.detail)
 
 if __name__ == "__main__":
     unittest.main()

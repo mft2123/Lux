@@ -24,6 +24,10 @@ STATUS_TRANSFERRED = "transferred"
 STATUS_FAILED = "failed"
 STATUS_AUTH_REQUIRED = "auth_required"
 STATUS_UNSUPPORTED = "unsupported"
+#: A cloud-download (magnet / ed2k) task was accepted by 115. It is not a
+#: share transfer: 115 downloads in the background and the files appear in the
+#: target directory later, so Lux records "offline" and moves on.
+STATUS_SUBMITTED = "submitted"
 
 #: Hosts whose ``/s/<code>`` paths are 115 share links. The Rust side only sends
 #: 115.com links here, but the sidecar accepts the whole family so a link posted
@@ -74,6 +78,40 @@ class TransferResult:
     status: str
     detail: str = ""
     saved: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class OfflineJob:
+    """Exactly what Lux sends in the ``POST /offline`` body."""
+
+    job_id: str
+    url: str
+    title: str
+    target_dir: str
+    cd2_prefix: str
+
+
+#: ``ed2k://|file|<name>|<size>|<hash>|/`` — 115 answers a malformed link with a
+#: bare "错误的链接", so the shape is checked here where a useful message can be
+#: returned instead. Mirrors daquan's ``parseEd2kLink`` validation.
+ED2K_LINK = re.compile(r"^ed2k://\|file\|([^|]+)\|(\d+)\|([0-9a-fA-F]{32})\|/?$", re.IGNORECASE)
+
+
+def validate_ed2k_link(url: str) -> None:
+    """Raise ``TransferRejected`` when an ed2k link is malformed."""
+    value = (url or "").strip()
+    if not value.lower().startswith("ed2k://"):
+        return
+    if not ED2K_LINK.match(value):
+        raise TransferRejected(
+            "ed2k 链接格式无效：应为 ed2k://|file|<文件名>|<字节大小>|<32位哈希>|/"
+        )
+
+
+def is_offline_link(url: str) -> bool:
+    """True for the two link kinds 115 cloud download accepts from Lux."""
+    value = (url or "").strip().lower()
+    return value.startswith("magnet:?") or value.startswith("ed2k://")
 
 
 def parse_share_link(url: str) -> ShareLink | None:
@@ -191,6 +229,22 @@ def _new_id_of(payload: Any) -> str:
         return ""
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     return _id_of(data)
+
+
+def _offline_task_id(payload: Any) -> str:
+    """Best-effort task identifier of a cloud-download add answer.
+
+    115 has shipped several shapes for this endpoint (``task_id``, ``info_hash``,
+    a nested ``data``), so this only feeds the log line — never control flow.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    for key in ("task_id", "taskId", "info_hash", "hash", "sign"):
+        value = data.get(key)
+        if value not in (None, "", 0):
+            return str(value)
+    return ""
 
 
 @dataclass
@@ -323,6 +377,45 @@ class TransferService:
             }
         )
         _raise_for_state(payload)
+
+    def offline(self, job: OfflineJob) -> TransferResult:
+        """Submit a magnet / ed2k link as a 115 cloud-download task.
+
+        115 downloads in the background; success here only means the task was
+        accepted. Lux records it as ``offline`` and stops retrying — the file
+        shows up in the target directory when 115 finishes.
+        """
+        url = (job.url or "").strip()
+        if not is_offline_link(url):
+            return TransferResult(
+                STATUS_UNSUPPORTED,
+                "不是磁力/ed2k 链接（离线下载只处理 magnet:? 和 ed2k://|file|… 两种）",
+            )
+        try:
+            validate_ed2k_link(url)
+            client = self.client()
+            self.check_login(client)
+            target = "/".join(
+                part.strip("/") for part in (job.cd2_prefix, job.target_dir) if part and part.strip("/")
+            )
+            if not target:
+                raise TransferRejected("离线下载目标目录为空")
+            cid = self.resolve_target_cid(client, target)
+            payload = client.clouddownload_task_add_url({"url": url, "wp_path_id": cid})
+            _raise_for_state(payload)
+            task = _offline_task_id(payload)
+            detail = f"已提交离线下载任务（目标目录 cid={cid}）"
+            if task:
+                detail = f"{detail}：{task}"
+            return TransferResult(STATUS_SUBMITTED, detail)
+        except P115AuthenticationError as error:
+            return TransferResult(STATUS_AUTH_REQUIRED, f"115 cookie 无效或已过期: {error}")
+        except TransferRejected as error:
+            return TransferResult(STATUS_FAILED, error.detail)
+        except P115Error as error:
+            return TransferResult(STATUS_FAILED, f"115 接口错误: {error}")
+        except Exception as error:  # pragma: no cover - defensive boundary
+            return TransferResult(STATUS_FAILED, f"离线下载失败: {type(error).__name__}: {error}")
 
     def _confirm_saved(self, client: Any, cid: str, expected: Sequence[str]) -> str:
         """Wait briefly for the share to land, so the log says what happened.

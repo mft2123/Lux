@@ -8,23 +8,31 @@ shows the files and Lux's archive pipeline picks them up from 转存目录.
 from .service import (
     STATUS_AUTH_REQUIRED,
     STATUS_FAILED,
+    STATUS_SUBMITTED,
     STATUS_TRANSFERRED,
     STATUS_UNSUPPORTED,
+    OfflineJob,
     TransferJob,
     TransferResult,
     TransferService,
+    is_offline_link,
     load_cookie,
     parse_share_link,
+    validate_ed2k_link,
 )
 
 __all__ = [
     "STATUS_AUTH_REQUIRED",
     "STATUS_FAILED",
+    "STATUS_SUBMITTED",
     "STATUS_TRANSFERRED",
     "STATUS_UNSUPPORTED",
+    "OfflineJob",
     "TransferJob",
     "TransferResult",
     "TransferService",
+    "is_offline_link",
     "load_cookie",
     "parse_share_link",
+    "validate_ed2k_link",
 ]
