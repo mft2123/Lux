@@ -1632,6 +1632,15 @@ pub(crate) async fn admin_archive_telegram_plan(
         remux: channel.modes.remux,
     };
 
+    // Normalise first: the sidecar sends raw release names (`都市古仙医 S01E221
+    // 1080p`), and the catalog lookup below needs the bare work title.
+    let mut request = request;
+    for message in &mut request.messages {
+        for candidate in &mut message.candidates {
+            crate::application::telegram::normalize_candidate(candidate);
+        }
+    }
+
     let titles: Vec<String> = request
         .messages
         .iter()
@@ -1665,7 +1674,7 @@ pub(crate) async fn admin_archive_telegram_plan(
         }
     };
 
-    Json(crate::application::telegram::plan(&request, modes, &library)).into_response()
+    Json(crate::application::telegram::plan(request, modes, &library)).into_response()
 }
 
 /// Cheap guard rails before touching the database: a runaway sidecar must not

@@ -371,15 +371,45 @@ pub(crate) fn decide_one(
     )
 }
 
+/// Clean a candidate title and fill the fields the sidecar could not parse.
+///
+/// The sidecar sends the raw release name (`都市古仙医 S01E221 1080p`) as the
+/// title. Matching needs the work title alone, so the same parser the archive
+/// pipeline uses strips the tags and fills season / episode / year when the
+/// caller left them out.
+pub(crate) fn normalize_candidate(candidate: &mut PlanCandidate) {
+    let Some(parsed) = crate::application::archive::parse_media_name(&candidate.title) else {
+        return;
+    };
+    let cleaned = parsed.title.trim();
+    if !cleaned.is_empty() {
+        candidate.title = cleaned.to_owned();
+    }
+    if candidate.year.is_none() {
+        candidate.year = parsed.year;
+    }
+    if candidate.season.is_none() {
+        candidate.season = parsed.season.map(i64::from);
+    }
+    if candidate.episode.is_none() {
+        candidate.episode = parsed.episode.map(i64::from);
+    }
+}
+
 /// Decide every candidate in a request.
 ///
 /// The cursor is the highest message id seen, so a sidecar can record progress
 /// even when nothing was transferred.
 pub(crate) fn plan(
-    request: &PlanRequest,
+    mut request: PlanRequest,
     modes: ChannelModes,
     library: &[LibraryWork],
 ) -> PlanResponse {
+    for message in &mut request.messages {
+        for candidate in &mut message.candidates {
+            normalize_candidate(candidate);
+        }
+    }
     let mut decisions = Vec::new();
     let mut cursor = 0;
     let mut notes = Vec::new();
@@ -603,12 +633,54 @@ mod tests {
                 },
             ],
         };
-        let response = plan(&request, modes(false, false, false, false), &[]);
+        let response = plan(request, modes(false, false, false, false), &[]);
         assert_eq!(response.cursor, 9);
         assert_eq!(response.decisions.len(), 1);
         assert_eq!(response.decisions[0].action, PlanAction::Skip);
         assert_eq!(response.notes.len(), 1);
         assert!(response.notes[0].contains("没有识别出资源链接"));
+    }
+
+    /// The sidecar sends raw release names; they must match the library title
+    /// and fill the season/episode the sidecar could not see.
+    #[test]
+    fn release_names_are_normalised_before_matching() {
+        let library = vec![series("都市古仙医", &[(1, 220)], "1080p")];
+        let request = PlanRequest {
+            channel_id: "-1".to_owned(),
+            messages: vec![PlanMessage {
+                message_id: 5,
+                candidates: vec![candidate("都市古仙医 S01E221 1080p", None, None, "1080p")],
+            }],
+        };
+
+        let response = plan(request, modes(false, true, false, false), &library);
+        let decision = &response.decisions[0];
+        assert_eq!(decision.action, PlanAction::Follow);
+        assert_eq!(decision.title, "都市古仙医");
+        assert_eq!(decision.season, Some(1));
+        assert_eq!(decision.episode, Some(221));
+        assert!(decision.reason.contains("S01E221"), "{}", decision.reason);
+    }
+
+    /// A release name that also carries the year must still match a library
+    /// copy of the same year.
+    #[test]
+    fn release_names_with_a_year_still_match() {
+        let mut work = movie("流浪地球", "1080p");
+        work.production_year = Some(2019);
+        let library = vec![work];
+        let request = PlanRequest {
+            channel_id: "-1".to_owned(),
+            messages: vec![PlanMessage {
+                message_id: 6,
+                candidates: vec![candidate("流浪地球.2019.2160p", None, None, "2160p")],
+            }],
+        };
+
+        let response = plan(request, modes(false, false, false, true), &library);
+        assert_eq!(response.decisions[0].action, PlanAction::Remux);
+        assert_eq!(response.decisions[0].title, "流浪地球");
     }
 
     /// Same resolution: only a meaningfully larger file counts, and the reason

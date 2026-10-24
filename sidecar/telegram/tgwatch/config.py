@@ -27,6 +27,7 @@ DEFAULT_INBOX_DIR = "/watch-inbox"
 DEFAULT_LUX_BASE = "http://lux:8097"
 DEFAULT_INGEST_PATH = "/api/v1/admin/archive/ingest"
 DEFAULT_LOOKUP_PATH = "/api/v1/admin/archive/lookup"
+DEFAULT_PLAN_PATH = "/api/v1/admin/archive/telegram/plan"
 DEFAULT_WASH_TOLERANCE = 0.02
 
 SINK_HTTP = "http"
@@ -74,6 +75,8 @@ class SidecarConfig:
     sink: str = SINK_HTTP
     ingest_url: str = DEFAULT_LUX_BASE + DEFAULT_INGEST_PATH
     lookup_url: str = DEFAULT_LUX_BASE + DEFAULT_LOOKUP_PATH
+    #: 判定接口：入新/追更/洗版由 Lux 用 catalog 判定，旁挂只执行。
+    plan_url: str = DEFAULT_LUX_BASE + DEFAULT_PLAN_PATH
     api_key: str = ""
     backfill_limit: int = 200
     gap_limit: int = 200
@@ -129,6 +132,7 @@ class SidecarConfig:
             "inbox_dir": str(self.inbox_dir),
             "ingest_url": mask_url(self.ingest_url),
             "lookup_url": mask_url(self.lookup_url),
+            "plan_url": mask_url(self.plan_url),
             "api_key": mask_secret(self.api_key),
             "backfill_limit": self.backfill_limit,
             "gap_limit": self.gap_limit,
@@ -325,6 +329,7 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
     base = (_env("LUX_TG_LUX_BASE") or DEFAULT_LUX_BASE).rstrip("/")
     ingest_url = _env("LUX_TG_INGEST_URL") or f"{base}{DEFAULT_INGEST_PATH}"
     lookup_url = _env("LUX_ARCHIVE_LOOKUP_URL") or f"{base}{DEFAULT_LOOKUP_PATH}"
+    plan_url = _env("LUX_TG_PLAN_URL") or f"{base}{DEFAULT_PLAN_PATH}"
     # D1：文件优先、env 兜底。Lux 保存设置时会把 key 写进 telegram.api_key，
     # 那才是唯一权威值；LUX_TG_API_KEY 只补「文件里还没填」的窗口期。
     api_key = str(section.get("api_key") or "").strip() or _env("LUX_TG_API_KEY")
@@ -369,6 +374,7 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
         sink=sink,
         ingest_url=ingest_url,
         lookup_url=lookup_url,
+        plan_url=plan_url,
         api_key=api_key,
         backfill_limit=backfill_limit,
         gap_limit=gap_limit,

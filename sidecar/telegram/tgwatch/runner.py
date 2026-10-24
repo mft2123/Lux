@@ -22,6 +22,7 @@ from datetime import datetime
 from . import config as config_mod
 from . import filters
 from . import links as links_mod
+from . import planner as planner_mod
 from . import sink as sink_mod
 from . import store as store_mod
 
@@ -453,16 +454,20 @@ class Watcher:
         store: store_mod.Store,
         sink,
         lookup: LibraryLookup | None = None,
+        planner: "planner_mod.Planner | None" = None,
     ):
         self.config = config
         self.store = store
         self.sink = sink
         self.lookup = lookup or LibraryLookup(config.lookup_url, config.api_key, config.http_timeout)
+        self.planner = planner
         self.counts = {"messages": 0, "delivered": 0, "held": 0, "skipped": 0, "failed": 0, "dead": 0}
         self._semaphore = asyncio.Semaphore(DELIVER_CONCURRENCY)
         self._stop = asyncio.Event()
         # peer_key → ChannelConfig；启动解析频道时填充
         self.by_key: dict[str, config_mod.ChannelConfig] = {}
+        # 频道 key → Lux 设置里的频道 id（数字 id），判定接口用它找模式位
+        self.channel_ids: dict[str, str] = {}
 
     # ---- 消息处理（核心，可单测） ----
 
@@ -503,6 +508,15 @@ class Watcher:
         for link in accepted:
             title = links_mod.link_title(link, incoming.text, fallback_to_text=allow_text_fallback)
             outcomes.append((link, title, await self._decide_link(channel, mode, title, size_bytes)))
+
+        # 判定交给 Lux：入新/追更/洗版要查 catalog，这边没有那份数据。Lux 不可达时
+        # 保留本地结论（该挂起的仍然挂起），绝不因为接口挂了就开始乱投递。
+        planned = await self._plan(channel, outcomes, size_bytes)
+        if planned:
+            outcomes = [
+                (link, title, planned.get(link.url, decision))
+                for link, title, decision in outcomes
+            ]
 
         msg_status, msg_reason = _message_outcome([decision for _, _, decision in outcomes])
         self.store.record_message(
@@ -593,6 +607,47 @@ class Watcher:
             wash_tolerance=self.config.wash_tolerance,
             link_count=1,
         )
+
+    async def _plan(
+        self,
+        channel: config_mod.ChannelConfig,
+        outcomes: list[tuple[links_mod.Link, str, filters.Decision]],
+        size_bytes: int | None,
+    ) -> dict[str, filters.Decision]:
+        """问 Lux 这条消息里的链接该不该转存；返回 `{链接: 结论}`。
+
+        没配置判定接口、频道没在 Lux 里登记，或者接口挂了，都返回空字典：
+        调用方保留本地规则，行为至少和以前一样。
+        """
+        if self.planner is None:
+            return {}
+        channel_id = self.channel_ids.get(channel.key())
+        if not channel_id:
+            log.debug("%s 没有对应的 Lux 频道 id，跳过判定接口", channel.key())
+            return {}
+        candidates = [
+            planner_mod.candidate_for(link.url, title, size_bytes)
+            for link, title, _ in outcomes
+            if title
+        ]
+        if not candidates:
+            return {}
+        try:
+            # 判定是同步 HTTP：挪到线程里，别卡住事件循环。
+            planned = await asyncio.to_thread(self.planner.plan, channel_id, candidates)
+        except planner_mod.PlannerError as error:
+            log.warning("%s 判定接口不可用（%s），退回本地规则", channel.key(), error)
+            return {}
+        decisions: dict[str, filters.Decision] = {}
+        for link, _, _ in outcomes:
+            hit = planned.get(link.url)
+            if hit is None:
+                continue
+            decisions[link.url] = filters.Decision(
+                filters.STATUS_DELIVER if hit.deliver else filters.STATUS_SKIP,
+                f"plan:{hit.action}:{hit.reason}"[:200],
+            )
+        return decisions
 
     async def deliver(self, item_ids: list[int]) -> int:
         """逐条投递；返回本轮失败（含落死信）的条数。"""
@@ -792,6 +847,21 @@ async def _backfill_newest(client, watcher: "Watcher", channel, entity, limit: i
     return len(messages)
 
 
+async def _establish_cursor(client, watcher: "Watcher", channel, entity) -> int:
+    """首轮只建游标。
+
+    新加的频道第一次上线时，把游标钉在**最新一条**消息上，然后什么都不处理。
+    否则一个成熟频道的几万条历史会顺着转存流程灌进 115（也正是 daquan 的
+    `firstRun: 只取 1 条` 那条规矩）。
+    """
+    async for message in client.iter_messages(entity, limit=1):
+        cursor = watcher.store.advance_message_id(channel.key(), message.id)
+        log.info("%s 首轮只建游标（最新消息 %s），不回灌历史", channel.key(), cursor)
+        return cursor
+    log.info("%s 没有可读消息，游标留空（下一条消息会直接处理）", channel.key())
+    return 0
+
+
 async def _gap_backfill(client, watcher: "Watcher", channel, entity, limit: int) -> int:
     """按游标补拉宕机期间的消息（`min_id` = 已处理的最大消息 id）。"""
     last_id = watcher.store.last_message_id(channel.key())
@@ -834,7 +904,14 @@ async def run(config: config_mod.SidecarConfig) -> None:
     if config.dry_run:
         log.warning("dry-run 已开启：只判定与记录，不写下游")
 
-    watcher = Watcher(config, store, sink, LibraryLookup(config.lookup_url, config.api_key, config.http_timeout))
+    planner = planner_mod.Planner(config.plan_url, config.api_key, config.http_timeout)
+    watcher = Watcher(
+        config,
+        store,
+        sink,
+        LibraryLookup(config.lookup_url, config.api_key, config.http_timeout),
+        planner,
+    )
     client = None
     try:
         try:
@@ -858,14 +935,27 @@ async def run(config: config_mod.SidecarConfig) -> None:
             key = peer_key(entity, utils.get_peer_id(entity))
             watcher.by_key[key] = channel
             watcher.by_key[channel.key()] = channel
+            # Lux 的频道设置用数字 id 做主键，判定接口按它找模式位。
+            watcher.channel_ids[channel.key()] = str(utils.get_peer_id(entity))
             resolved.append((channel, entity))
             log.info("监听 %s → %s（%s）", channel.key(), key, channel.mode)
 
         if not resolved:
             raise RunnerError("所有频道都解析失败：检查 listen_channels 是否正确、账号是否在频道内")
 
+        # 首轮只建游标：没有游标的频道先把位置钉在最新一条，历史一条都不处理。
+        fresh: set[str] = set()
         for channel, entity in resolved:
-            if channel.mode != filters.MODE_FULL:
+            if watcher.store.last_message_id(channel.key()) > 0:
+                continue
+            try:
+                if await _establish_cursor(client, watcher, channel, entity) > 0:
+                    fresh.add(channel.key())
+            except Exception:  # noqa: BLE001 - 建游标失败不该拖死常驻
+                log.exception("建立 %s 初始游标失败", channel.key())
+
+        for channel, entity in resolved:
+            if channel.mode != filters.MODE_FULL or channel.key() in fresh:
                 continue
             try:
                 await _backfill_newest(client, watcher, channel, entity, config.backfill_limit)

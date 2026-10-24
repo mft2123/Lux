@@ -349,7 +349,9 @@ class ProblemTest(unittest.TestCase):
                 cfg = config_mod.load(path)
             problems = " ".join(config_mod.runtime_problems(cfg))
             warnings = " ".join(config_mod.runtime_warnings(cfg))
-        self.assertIn("listen_channels 为空", problems)
+        # 空频道是警告而不是硬错误：设置页要先能列出频道才有得勾选（见 config.runtime_problems
+        # 的注释），这里断言的是当前约定而不是旧行为。
+        self.assertIn("listen_channels 为空", warnings)
         self.assertIn("session 不存在", problems)
         self.assertIn("手动", warnings)
 
