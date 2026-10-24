@@ -60,6 +60,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_archive_telegram_probe),
         )
         .route(
+            "/api/v1/admin/archive/telegram/channels",
+            get(admin_archive_telegram_channels),
+        )
+        .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
         )
@@ -1562,10 +1566,76 @@ pub(crate) async fn admin_archive_telegram_probe(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let base = std::env::var("LUX_TG_SIDECAR_BASE")
-        .unwrap_or_else(|_| "http://telegram:8091".to_owned());
-    let base = base.trim().trim_end_matches('/').to_owned();
+    let base = telegram_sidecar_base();
     Json(probe_sidecar_health(&base).await).into_response()
+}
+
+/// The Telegram sidecar base, shared by every endpoint that talks to it.
+///
+/// Same rules as the notify module: a plain origin, overridable by env for
+/// deployments where the container name differs (`http://telegram:8091` is the
+/// compose default).
+fn telegram_sidecar_base() -> String {
+    std::env::var("LUX_TG_SIDECAR_BASE")
+        .unwrap_or_else(|_| "http://telegram:8091".to_owned())
+        .trim()
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// `GET /admin/archive/telegram/channels` — the account's channel list.
+///
+/// The browser cannot talk to the sidecar directly (different origin, no CORS
+/// headers), so Lux proxies the call. The sidecar only returns channel identity:
+/// nothing is transferred and no cursor moves.
+pub(crate) async fn admin_archive_telegram_channels(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let base = telegram_sidecar_base();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(40))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return api_error(
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                lux::ApiErrorCode::Internal,
+                &format!("无法创建 HTTP 客户端: {error}"),
+            )
+            .into_response();
+        }
+    };
+    match client.get(format!("{base}/channels")).send().await {
+        Ok(response) => {
+            let http_status = response.status();
+            let payload: serde_json::Value = match response.json().await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::BAD_GATEWAY,
+                        lux::ApiErrorCode::Internal,
+                        &format!("Telegram 侧车响应不是 JSON（HTTP {http_status}）: {error}"),
+                    )
+                    .into_response();
+                }
+            };
+            Json(payload).into_response()
+        }
+        Err(error) => api_error(
+            &headers,
+            StatusCode::BAD_GATEWAY,
+            lux::ApiErrorCode::Internal,
+            &format!("Telegram 侧车不可达（{base}）: {error}"),
+        )
+        .into_response(),
+    }
 }
 
 pub(crate) async fn admin_archive_run(    headers: HeaderMap,
