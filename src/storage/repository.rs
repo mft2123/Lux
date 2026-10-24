@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 #[path = "catalog.rs"]
 mod catalog;
+pub(crate) use catalog::TelegramLibraryRow;
 #[path = "database_cleanup.rs"]
 mod database_cleanup;
 #[path = "database_diagnostics.rs"]

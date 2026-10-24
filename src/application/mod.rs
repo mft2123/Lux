@@ -72,6 +72,7 @@ pub mod strm_playback;
 pub mod strm_probe;
 pub mod strm_probe_policy;
 pub mod strm_target;
+pub mod telegram;
 pub(crate) mod thumbnail_policy;
 pub mod thumbnails;
 pub mod user_avatars;

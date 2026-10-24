@@ -18,6 +18,21 @@ pub(crate) struct PendingGlobalCollectionSync {
     pub(crate) generation: i64,
 }
 
+/// One library work as the Telegram planner sees it.
+///
+/// `sources` keeps every `(quality_label, size)` pair: ranking them is the
+/// planner's job (it owns the quality scale), storage only reports what is
+/// there.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TelegramLibraryRow {
+    pub(crate) id: String,
+    pub(crate) item_type: String,
+    pub(crate) title: String,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) episodes: Vec<(i64, i64)>,
+    pub(crate) sources: Vec<(Option<String>, i64)>,
+}
+
 struct GlobalCollectionSyncMember {
     movie_provider: String,
     movie_provider_id: String,
@@ -1652,6 +1667,124 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    /// Snapshot of the library for the Telegram planner.
+    ///
+    /// One batch per poll round: every candidate title is looked up at once, the
+    /// episode list and all sources come back with the works so the decision
+    /// logic never queries per candidate.
+    pub(crate) async fn telegram_library_snapshot(
+        &self,
+        titles: &[String],
+    ) -> Result<Vec<TelegramLibraryRow>, StorageError> {
+        let wanted: Vec<String> = titles
+            .iter()
+            .map(|title| title.trim().to_lowercase())
+            .filter(|title| !title.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", wanted.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT mi.id, mi.item_type, mi.title, mi.production_year
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.removed_at IS NULL
+               AND mi.item_type IN ('MOVIE', 'SERIES')
+               AND lower(trim(mi.title)) IN ({placeholders})"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+        for title in &wanted {
+            statement = statement.bind(title);
+        }
+        let rows = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut works: Vec<TelegramLibraryRow> = rows
+            .into_iter()
+            .map(|row| TelegramLibraryRow {
+                id: row.get("id"),
+                item_type: row.get("item_type"),
+                title: row.get("title"),
+                production_year: row.get("production_year"),
+                episodes: Vec::new(),
+                sources: Vec::new(),
+            })
+            .collect();
+        if works.is_empty() {
+            return Ok(works);
+        }
+
+        let ids: Vec<String> = works.iter().map(|work| work.id.clone()).collect();
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "SELECT series_id, season_number, episode_number
+             FROM media_items
+             WHERE item_type = 'EPISODE' AND removed_at IS NULL
+               AND series_id IN ({placeholders})
+               AND season_number IS NOT NULL AND episode_number IS NOT NULL"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+        for id in &ids {
+            statement = statement.bind(id);
+        }
+        let mut episodes: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        for row in statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let series_id: String = row.get("series_id");
+            let season: i64 = row.get("season_number");
+            let episode: i64 = row.get("episode_number");
+            episodes.entry(series_id).or_default().push((season, episode));
+        }
+
+        let sql = format!(
+            "SELECT item_id, quality_label, size FROM media_sources
+             WHERE item_id IN ({placeholders})"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+        for id in &ids {
+            statement = statement.bind(id);
+        }
+        let mut sources: HashMap<String, Vec<(Option<String>, i64)>> = HashMap::new();
+        for row in statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let item_id: String = row.get("item_id");
+            let quality: Option<String> = row.get("quality_label");
+            let size: Option<i64> = row.get("size");
+            sources
+                .entry(item_id)
+                .or_default()
+                .push((quality, size.unwrap_or_default()));
+        }
+
+        for work in &mut works {
+            work.episodes = episodes.remove(&work.id).unwrap_or_default();
+            work.sources = sources.remove(&work.id).unwrap_or_default();
+        }
+        Ok(works)
     }
 
     pub(crate) async fn list_catalog_children(

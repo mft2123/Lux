@@ -64,6 +64,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_archive_telegram_channels),
         )
         .route(
+            "/api/v1/admin/archive/telegram/plan",
+            post(admin_archive_telegram_plan),
+        )
+        .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
         )
@@ -1581,6 +1585,154 @@ fn telegram_sidecar_base() -> String {
         .trim()
         .trim_end_matches('/')
         .to_owned()
+}
+
+/// `POST /admin/archive/telegram/plan` — decide 入新 / 追更 / 洗版 / 跳过.
+///
+/// The sidecar sends the candidates it parsed from new channel messages; Lux
+/// answers with one decision and one reason per link. Nothing is transferred
+/// here: the sidecar acts on the answer and writes back the cursor.
+pub(crate) async fn admin_archive_telegram_plan(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<crate::application::telegram::PlanRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if let Some(problem) = telegram_plan_request_problem(&request) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &problem,
+        )
+        .into_response();
+    }
+
+    let settings = crate::application::archive::ArchiveSettings::load();
+    let Some(channel) = settings
+        .telegram
+        .channels
+        .iter()
+        .find(|channel| channel.id == request.channel_id)
+    else {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::InvalidRequest,
+            &format!("频道 {} 不在监听列表里", request.channel_id),
+        )
+        .into_response();
+    };
+    let modes = crate::application::telegram::ChannelModes {
+        new_release: channel.modes.new_release,
+        follow: channel.modes.follow,
+        full: channel.modes.full,
+        remux: channel.modes.remux,
+    };
+
+    let titles: Vec<String> = request
+        .messages
+        .iter()
+        .flat_map(|message| message.candidates.iter().map(|candidate| candidate.title.clone()))
+        .collect();
+
+    let Some(database) = state.database.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "媒体库不可用（数据库尚未打开）",
+        )
+        .into_response();
+    };
+
+    let library = if titles.is_empty() {
+        Vec::new()
+    } else {
+        match database.telegram_library_snapshot(&titles).await {
+            Ok(rows) => rows.into_iter().map(telegram_library_work).collect(),
+            Err(error) => {
+                return api_error(
+                    &headers,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    lux::ApiErrorCode::Internal,
+                    &format!("读取媒体库失败: {error}"),
+                )
+                .into_response();
+            }
+        }
+    };
+
+    Json(crate::application::telegram::plan(&request, modes, &library)).into_response()
+}
+
+/// Cheap guard rails before touching the database: a runaway sidecar must not
+/// be able to ask about a million titles in one call.
+fn telegram_plan_request_problem(request: &crate::application::telegram::PlanRequest) -> Option<String> {
+    const MAX_MESSAGES: usize = 200;
+    const MAX_CANDIDATES_PER_MESSAGE: usize = 50;
+    const MAX_TITLE_CHARS: usize = 200;
+    const MAX_LINK_CHARS: usize = 2048;
+
+    if request.messages.len() > MAX_MESSAGES {
+        return Some(format!("一次最多 {MAX_MESSAGES} 条消息"));
+    }
+    for message in &request.messages {
+        if message.candidates.len() > MAX_CANDIDATES_PER_MESSAGE {
+            return Some(format!(
+                "消息 {} 的候选链接太多（上限 {MAX_CANDIDATES_PER_MESSAGE}）",
+                message.message_id
+            ));
+        }
+        for candidate in &message.candidates {
+            if candidate.title.trim().is_empty() {
+                return Some(format!("消息 {} 有候选链接缺少标题", message.message_id));
+            }
+            if candidate.title.chars().count() > MAX_TITLE_CHARS {
+                return Some(format!("消息 {} 的标题过长", message.message_id));
+            }
+            if candidate.link.chars().count() > MAX_LINK_CHARS {
+                return Some(format!("消息 {} 的链接过长", message.message_id));
+            }
+        }
+    }
+    None
+}
+
+/// Fold a storage row into the planner's view: the best source is the highest
+/// quality tier, with the largest file breaking ties.
+fn telegram_library_work(
+    row: crate::storage::TelegramLibraryRow,
+) -> crate::application::telegram::LibraryWork {
+    let mut best_quality: Option<String> = None;
+    let mut best_rank = 0u8;
+    let mut best_size = 0i64;
+    for (quality, size) in &row.sources {
+        let rank = quality
+            .as_deref()
+            .map(crate::application::telegram::quality_rank)
+            .unwrap_or_default();
+        let better = match &best_quality {
+            None => true,
+            Some(_) => rank > best_rank || (rank == best_rank && *size > best_size),
+        };
+        if better {
+            best_rank = rank;
+            best_size = *size;
+            best_quality = quality.clone();
+        }
+    }
+    crate::application::telegram::LibraryWork {
+        id: row.id,
+        item_type: row.item_type,
+        title: row.title,
+        production_year: row.production_year,
+        episodes: row.episodes,
+        best_quality,
+        best_size,
+    }
 }
 
 /// `GET /admin/archive/telegram/channels` — the account's channel list.
