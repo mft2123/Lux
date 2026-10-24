@@ -30,6 +30,15 @@ pub(crate) struct PlanCandidate {
     pub(crate) link: String,
 }
 
+/// Response of `GET /admin/archive/telegram/missing`.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MissingResponse {
+    pub(crate) series: Vec<SeriesGap>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notes: Vec<String>,
+}
+
 /// One channel message; a message may carry several candidates.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,8 +116,106 @@ impl ChannelModes {
     fn allows_remux(self) -> bool {
         self.remux || self.full
     }
+}
 
+/// One season of a followed series and the episode numbers it is missing.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SeasonGap {
+    pub(crate) season: i64,
+    /// Highest episode number present, i.e. the size of the season as we know it.
+    pub(crate) highest: i64,
+    pub(crate) present: usize,
+    /// Missing numbers, capped at [`MAX_SEASON_GAP`] entries.
+    pub(crate) missing: Vec<i64>,
+    /// How many episodes are actually missing; equals `missing.len()` unless
+    /// the list was truncated (a 700-episode short drama can miss hundreds).
+    pub(crate) missing_total: usize,
+    pub(crate) truncated: bool,
+}
 
+/// A followed series with at least one gap.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SeriesGap {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) year: Option<i64>,
+    pub(crate) seasons: Vec<SeasonGap>,
+    /// Total missing episodes across seasons.
+    pub(crate) missing_total: usize,
+}
+
+/// Most gap entries one response may carry; a broken season must not produce a
+/// megabyte-long JSON or make the sidecar search thousands of queries.
+pub(crate) const MAX_SEASON_GAP: i64 = 500;
+
+/// Episodes missing from a season, assuming the library knows the season's
+/// length from the highest episode number it has.
+///
+/// This only reports gaps **inside** `1..=highest`: a season that stopped at
+/// episode 12 because only 12 aired has no gap, and an episode that aired after
+/// the last one we own is not guessed (we have no airing schedule here). Being
+/// silent about the tail is deliberate — inventing "E13" out of nothing makes
+/// the sidecar search for something that does not exist yet.
+pub(crate) fn season_gap(season: i64, episodes: &[i64]) -> Option<SeasonGap> {
+    let highest = episodes.iter().copied().max()?;
+    if highest <= 0 {
+        return None;
+    }
+    let mut present: Vec<i64> = episodes
+        .iter()
+        .copied()
+        .filter(|episode| *episode > 0 && *episode <= highest)
+        .collect();
+    present.sort_unstable();
+    present.dedup();
+    let all_missing: Vec<i64> = (1..=highest)
+        .filter(|episode| present.binary_search(episode).is_err())
+        .collect();
+    if all_missing.is_empty() {
+        return None;
+    }
+    let missing_total = all_missing.len();
+    let truncated = missing_total > MAX_SEASON_GAP as usize;
+    let missing: Vec<i64> = all_missing
+        .into_iter()
+        .take(MAX_SEASON_GAP as usize)
+        .collect();
+    Some(SeasonGap {
+        season,
+        highest,
+        present: present.len(),
+        missing,
+        missing_total,
+        truncated,
+    })
+}
+
+/// Gaps of one series; seasons without gaps are dropped.
+pub(crate) fn series_gaps(work: &LibraryWork) -> Option<SeriesGap> {
+    if !work.is_series() {
+        return None;
+    }
+    let mut by_season: std::collections::BTreeMap<i64, Vec<i64>> = std::collections::BTreeMap::new();
+    for (season, episode) in &work.episodes {
+        by_season.entry(*season).or_default().push(*episode);
+    }
+    let seasons: Vec<SeasonGap> = by_season
+        .iter()
+        .filter_map(|(season, episodes)| season_gap(*season, episodes))
+        .collect();
+    if seasons.is_empty() {
+        return None;
+    }
+    Some(SeriesGap {
+        id: work.id.clone(),
+        title: work.title.clone(),
+        year: work.production_year,
+        missing_total: seasons.iter().map(|gap| gap.missing_total).sum(),
+        seasons,
+    })
 }
 
 /// One library work the planner can match against.
@@ -639,6 +746,77 @@ mod tests {
         assert_eq!(response.decisions[0].action, PlanAction::Skip);
         assert_eq!(response.notes.len(), 1);
         assert!(response.notes[0].contains("没有识别出资源链接"));
+    }
+
+    /// Gaps are only reported inside `1..=highest`: a season that ended at 12
+    /// because only 12 aired has no gap, and we never invent E13.
+    #[test]
+    fn season_gaps_are_inside_the_known_range() {
+        let gap = season_gap(1, &[1, 2, 4]).expect("有缺口");
+        assert_eq!(gap.highest, 4);
+        assert_eq!(gap.present, 3);
+        assert_eq!(gap.missing, vec![3]);
+        assert_eq!(gap.missing_total, 1);
+        assert!(!gap.truncated);
+
+        assert!(season_gap(1, &[1, 2, 3]).is_none());
+        assert!(season_gap(1, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).is_none());
+        assert!(season_gap(1, &[]).is_none());
+    }
+
+    /// A long short-drama season must report the real total and say the list is
+    /// truncated, instead of quietly claiming "缺 500 集".
+    #[test]
+    fn huge_gaps_are_counted_honestly_and_truncated() {
+        // 只有第 700 集，1..699 全缺。
+        let gap = season_gap(1, &[700]).expect("缺 699 集");
+        assert_eq!(gap.missing_total, 699);
+        assert_eq!(gap.missing.len(), MAX_SEASON_GAP as usize);
+        assert!(gap.truncated);
+    }
+
+    /// Duplicates and out-of-order rows from the database must not create
+    /// phantom gaps.
+    #[test]
+    fn duplicates_and_order_do_not_create_phantom_gaps() {
+        // 1..3 都在（重复、乱序都无妨）→ 没有缺口，返回 None。
+        assert!(season_gap(2, &[3, 1, 2, 2, 1]).is_none());
+
+        // 乱序 + 确实缺 2：仍然只报 2。
+        let gap = season_gap(2, &[3, 1, 3]).expect("缺 2");
+        assert_eq!(gap.present, 2);
+        assert_eq!(gap.missing, vec![2]);
+    }
+
+    /// A series with several seasons reports each one, ordered by season.
+    #[test]
+    fn series_gaps_cover_every_season() {
+        let work = LibraryWork {
+            id: "s1".to_owned(),
+            item_type: "SERIES".to_owned(),
+            title: "繁花".to_owned(),
+            production_year: Some(2023),
+            // 第二季齐了，第一季缺第 2 集。
+            episodes: vec![(2, 1), (2, 2), (2, 3), (1, 1), (1, 3)],
+            best_quality: Some("1080p".to_owned()),
+            best_size: 0,
+        };
+        let gaps = series_gaps(&work).expect("有缺口");
+        assert_eq!(gaps.missing_total, 1);
+        assert_eq!(gaps.seasons.len(), 1);
+        assert_eq!(gaps.seasons[0].season, 1);
+        assert_eq!(gaps.seasons[0].missing, vec![2]);
+        assert_eq!(gaps.year, Some(2023));
+    }
+
+    #[test]
+    fn movies_and_complete_series_have_no_gaps() {
+        let mut movie = movie("流浪地球", "1080p");
+        movie.episodes = vec![(1, 1)];
+        assert!(series_gaps(&movie).is_none());
+
+        let complete = series("繁花", &[(1, 1), (1, 2), (1, 3)], "1080p");
+        assert!(series_gaps(&complete).is_none());
     }
 
     /// The sidecar sends raw release names; they must match the library title

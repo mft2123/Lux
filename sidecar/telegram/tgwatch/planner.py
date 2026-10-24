@@ -33,6 +33,45 @@ class PlannerError(RuntimeError):
     """Lux 判定接口不可用（网络、HTTP 错误或返回的不是 JSON）。"""
 
 
+class CompletionClient:
+    """补集清单：Lux 报「哪部剧缺哪几集」，旁挂负责去频道里搜。
+
+    只读接口；拿到清单后要不要搜、搜到要不要转存，都是调用方的决定
+    （`complete` 默认 dry-run）。
+    """
+
+    def __init__(self, url: str, api_key: str = "", timeout: float = 20.0, transport=None):
+        self.url = url
+        self.api_key = api_key
+        self.timeout = timeout
+        self._transport = transport or self._get_json
+
+    def missing(self) -> dict:
+        payload = self._transport()
+        if not isinstance(payload, dict):
+            raise PlannerError("补集接口返回的不是对象")
+        return payload
+
+    def _get_json(self) -> dict:
+        headers = {}
+        if self.api_key:
+            headers["X-Lux-Api-Key"] = self.api_key
+        request = urllib.request.Request(self.url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
+                raw = response.read()
+        except urllib.error.HTTPError as error:
+            raise PlannerError(f"补集接口 HTTP {error.code}") from error
+        except urllib.error.URLError as error:
+            raise PlannerError(f"补集接口不可达：{error.reason}") from error
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise PlannerError("补集接口返回的不是 JSON") from error
+        if not isinstance(payload, dict):
+            raise PlannerError("补集接口返回的不是对象")
+        return payload
+
 @dataclass(frozen=True)
 class Planned:
     action: str

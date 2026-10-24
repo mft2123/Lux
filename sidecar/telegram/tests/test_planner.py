@@ -118,5 +118,27 @@ class PlanTests(unittest.TestCase):
         self.assertIn("JSON", str(caught.exception))
 
 
+class CompletionTests(unittest.TestCase):
+    def test_missing_reads_the_series_list(self):
+        payload = {"series": [{"id": "s1", "title": "繁花", "seasons": [{"season": 1, "missing": [2]}]}]}
+        client = planner.CompletionClient("http://lux/missing", "k", transport=lambda: payload)
+        self.assertEqual(client.missing()["series"][0]["title"], "繁花")
+
+    def test_missing_rejects_non_object(self):
+        client = planner.CompletionClient("http://lux/missing", transport=lambda: ["nope"])
+        with self.assertRaises(planner.PlannerError):
+            client.missing()
+
+    def test_missing_maps_http_error(self):
+        import unittest.mock as mock
+
+        error = urllib.error.HTTPError("http://lux/missing", 503, "down", {}, None)
+        client = planner.CompletionClient("http://lux/missing", "k")
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(planner.PlannerError) as caught:
+                client.missing()
+        self.assertIn("503", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

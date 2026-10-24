@@ -68,6 +68,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_archive_telegram_plan),
         )
         .route(
+            "/api/v1/admin/archive/telegram/missing",
+            get(admin_archive_telegram_missing),
+        )
+        .route(
             "/api/v1/admin/strm-probe-jobs/{job_id}",
             get(admin_get_strm_probe_job),
         )
@@ -1675,6 +1679,92 @@ pub(crate) async fn admin_archive_telegram_plan(
     };
 
     Json(crate::application::telegram::plan(request, modes, &library)).into_response()
+}
+
+/// `GET /admin/archive/telegram/missing` — 补集清单.
+///
+/// For every series in the follow list, report the episodes the library is
+/// missing. The sidecar turns this into channel searches (`剧名 S01E03`); Lux
+/// only reports the gaps, it never fetches anything here.
+pub(crate) async fn admin_archive_telegram_missing(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let settings = crate::application::archive::ArchiveSettings::load();
+    let titles: Vec<String> = settings
+        .telegram
+        .follow_list
+        .iter()
+        .map(|title| title.trim().to_owned())
+        .filter(|title| !title.is_empty())
+        .collect();
+    let mut response = crate::application::telegram::MissingResponse::default();
+    if titles.is_empty() {
+        response.notes.push(
+            "追更列表为空：在设置里填「追更列表」，或在频道上开追更模式后由判定链自动发现缺集"
+                .to_owned(),
+        );
+        return Json(response).into_response();
+    }
+
+    let Some(database) = state.database.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "媒体库不可用（数据库尚未打开）",
+        )
+        .into_response();
+    };
+    let rows = match database.telegram_library_snapshot(&titles).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return api_error(
+                &headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                lux::ApiErrorCode::Internal,
+                &format!("读取媒体库失败: {error}"),
+            )
+            .into_response();
+        }
+    };
+    let found: std::collections::HashSet<String> = rows
+        .iter()
+        .map(|row| row.title.trim().to_lowercase())
+        .collect();
+    for title in &titles {
+        if !found.contains(&title.to_lowercase()) {
+            response
+                .notes
+                .push(format!("追更列表里的《{title}》不在媒体库里"));
+        }
+    }
+    for row in rows {
+        let work = telegram_library_work(row);
+        if let Some(gaps) = crate::application::telegram::series_gaps(&work) {
+            response.series.push(gaps);
+        }
+    }
+    // Largest gaps first: that is what the operator wants to fix.
+    response
+        .series
+        .sort_by(|left, right| right.missing_total.cmp(&left.missing_total));
+    let truncated = response
+        .series
+        .iter()
+        .flat_map(|series| series.seasons.iter())
+        .filter(|season| season.truncated)
+        .count();
+    if truncated > 0 {
+        let cap = crate::application::telegram::MAX_SEASON_GAP;
+        response.notes.push(format!(
+            "有 {truncated} 季的缺集超过 {cap} 集，清单只列前 {cap} 集（总数见 missingTotal）"
+        ));
+    }
+    Json(response).into_response()
 }
 
 /// Cheap guard rails before touching the database: a runaway sidecar must not

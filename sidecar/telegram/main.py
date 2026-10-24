@@ -68,6 +68,21 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--status", default="held,failed,pending", help="按状态选（逗号分隔）")
     replay.add_argument("--limit", type=int, default=200)
     replay.add_argument("--dry-run", action="store_true", help="只列出，不投递")
+
+    complete = sub.add_parser(
+        "complete", help="补集：按 Lux 的缺集清单在频道里搜对应集（默认 dry-run）"
+    )
+    complete.add_argument(
+        "--submit",
+        action="store_true",
+        help="真的提交转存（不加只搜索和判定，不写下游）",
+    )
+    complete.add_argument(
+        "--search-limit",
+        type=int,
+        default=50,
+        help="每个剧名在每个频道最多取几条消息（再按集号筛）",
+    )
     return parser
 
 
@@ -232,6 +247,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "replay":
             return asyncio.run(_cmd_replay(config, args))
+        if args.command == "complete":
+            return asyncio.run(
+                runner.complete(
+                    dataclasses.replace(config, dry_run=not args.submit),
+                    submit=args.submit,
+                    search_limit=args.search_limit,
+                )
+            )
         print(f"未知命令: {args.command}", file=sys.stderr)
         return 2
     except runner.RunnerError as error:

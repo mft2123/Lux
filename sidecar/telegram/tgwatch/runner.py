@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -996,8 +997,155 @@ async def run(config: config_mod.SidecarConfig) -> None:
         store.close()
 
 
-async def deliver_pending(
-    config: config_mod.SidecarConfig, item_ids: list[int] | None, statuses, limit: int
+#: 补集每次最多为一部剧的同一季保留几个缺集去做匹配，避免一次把几百集都记进来。
+COMPLETION_PER_SEASON = 200
+
+_EPISODE_IN_TEXT = re.compile(r"[Ss](\d{1,3})\s*[._-]?\s*[Ee](\d{1,4})")
+_CN_EPISODE_IN_TEXT = re.compile(r"第\s*(\d{1,4})\s*[集话]")
+
+
+def completion_plan(payload: dict) -> list[tuple[str, set[tuple[int, int]]]]:
+    """把 Lux 的缺集清单翻成 `(作品名, {(季, 集)})`，一部剧一条。
+
+    **按剧名搜、按集号筛**：Telegram 的搜索是整词匹配，`武神主宰 S01E01` 在
+    频道里搜不到东西（消息正文里还夹着画质、体积、标签），而搜 `武神主宰`
+    能命中。所以每部剧只发一次搜索，返回的消息再用集号正则去筛。
+    """
+    plan: list[tuple[str, set[tuple[int, int]]]] = []
+    for series in payload.get("series") or []:
+        title = str(series.get("title") or "").strip()
+        if not title:
+            continue
+        wanted: set[tuple[int, int]] = set()
+        for season in series.get("seasons") or []:
+            try:
+                season_number = int(season.get("season") or 0)
+            except (TypeError, ValueError):
+                continue
+            missing = [
+                int(value)
+                for value in season.get("missing") or []
+                if isinstance(value, (int, float))
+            ]
+            for episode in sorted(missing)[:COMPLETION_PER_SEASON]:
+                wanted.add((season_number, episode))
+        if wanted:
+            plan.append((title, wanted))
+    return plan
+
+
+def episodes_in_text(text: str) -> set[tuple[int, int]]:
+    """消息里出现的 `(季, 集)`：支持 `S01E03`、`S1.E3`，裸 `第3集` 记为季 0。"""
+    found: set[tuple[int, int]] = set()
+    for match in _EPISODE_IN_TEXT.finditer(text or ""):
+        found.add((int(match.group(1)), int(match.group(2))))
+    for match in _CN_EPISODE_IN_TEXT.finditer(text or ""):
+        found.add((0, int(match.group(1))))
+    return found
+
+
+async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, search_limit: int = 50) -> int:
+    """补集：按 Lux 的缺集清单，在监听频道里搜对应集。
+
+    搜到的消息走**和常驻完全一样**的处理管线（判定接口 → 转存/挂起），所以
+    补集不会绕开「入新/追更/洗版」的判定，也不会绕开重复消息去重。默认
+    dry-run：只打印会做什么，不写下游。
+    """
+    if not config.channels:
+        log.error("没有监听频道：补集需要至少一个频道")
+        return 2
+    if not submit:
+        log.warning("补集为 dry-run：只搜索与判定，不转存（加 --submit 才真的提交）")
+
+    missing_client = planner_mod.CompletionClient(
+        config.missing_url, config.api_key, config.http_timeout
+    )
+    try:
+        payload = await asyncio.to_thread(missing_client.missing)
+    except planner_mod.PlannerError as error:
+        log.error("拿不到缺集清单：%s", error)
+        return 2
+    plan = completion_plan(payload)
+    for note in payload.get("notes") or []:
+        log.warning("Lux: %s", note)
+    if not plan:
+        log.info("没有缺集：追更列表里的剧要么齐了，要么不在库里")
+        return 0
+    total_missing = sum(len(missing) for _, missing in plan)
+    log.info("缺集清单：%d 部剧、%d 集（每部剧一次搜索）", len(plan), total_missing)
+
+    TelegramClient, events, utils = _telethon()
+    harden_permissions(config)
+    store = store_mod.Store(config.state_db)
+    sink = sink_mod.build(config)
+    planner = planner_mod.Planner(config.plan_url, config.api_key, config.http_timeout)
+    watcher = Watcher(
+        config,
+        store,
+        sink,
+        LibraryLookup(config.lookup_url, config.api_key, config.http_timeout),
+        planner,
+    )
+    client = None
+    try:
+        with session_errors(config):
+            client = TelegramClient(str(config.session_path), config.api_id, config.api_hash)
+            await _authorize(client, config)
+        resolved: list[tuple[config_mod.ChannelConfig, object]] = []
+        for channel in config.channels:
+            try:
+                entity = await _resolve_channel(client, channel)
+            except RunnerError as error:
+                log.error("%s", error)
+                continue
+            watcher.channel_ids[channel.key()] = str(utils.get_peer_id(entity))
+            resolved.append((channel, entity))
+        if not resolved:
+            raise RunnerError("所有频道都解析失败：补集无从搜索")
+
+        scanned = 0
+        matched = 0
+        for channel, entity in resolved:
+            for title, missing in plan:
+                try:
+                    messages = [
+                        message
+                        async for message in client.iter_messages(
+                            entity, search=title, limit=search_limit
+                        )
+                    ]
+                except Exception:  # noqa: BLE001 - 单个搜索失败不该中断整轮
+                    log.exception("搜索 %s 失败", title)
+                    continue
+                scanned += len(messages)
+                hits = 0
+                for message in reversed(messages):
+                    found_episodes = episodes_in_text(getattr(message, "text", "") or "")
+                    overlap = found_episodes & missing
+                    if not overlap:
+                        continue
+                    hits += 1
+                    log.info(
+                        "%s 在 %s 命中 %s",
+                        title,
+                        channel.key(),
+                        ", ".join(f"S{s:02}E{e:02}" for s, e in sorted(overlap)),
+                    )
+                    await watcher.process(incoming_from_message(message, channel.key()), channel)
+                matched += hits
+                if not hits:
+                    log.debug("%s 在 %s 的 %d 条消息里没有缺的那几集", title, channel.key(), len(messages))
+        log.info(
+            "补集结束：扫 %d 条消息、命中 %d 条，统计 %s", scanned, matched, watcher.counts
+        )
+        return 0
+    finally:
+        if client is not None:
+            await client.disconnect()
+        store.close()
+
+
+async def deliver_pending(    config: config_mod.SidecarConfig, item_ids: list[int] | None, statuses, limit: int
 ) -> int:
     """`replay` 子命令：把 held/failed/pending 推到下游（"管理员触发时才处理"）。"""
     harden_permissions(config)

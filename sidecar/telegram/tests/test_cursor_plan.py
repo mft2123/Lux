@@ -164,5 +164,41 @@ class FakeSink:
         return {"sink": self.name}
 
 
+class CompletionPlanTest(unittest.TestCase):
+    def test_plan_is_one_entry_per_series_with_episode_set(self):
+        payload = {
+            "series": [
+                {
+                    "title": "繁花",
+                    "seasons": [
+                        {"season": 1, "missing": [3, 1, 2]},
+                        {"season": 2, "missing": [5]},
+                    ],
+                },
+                {"title": "  ", "seasons": [{"season": 1, "missing": [1]}]},
+                {"title": "无季", "seasons": []},
+            ]
+        }
+        plan = runner.completion_plan(payload)
+        self.assertEqual(len(plan), 1)
+        title, missing = plan[0]
+        self.assertEqual(title, "繁花")
+        self.assertEqual(missing, {(1, 1), (1, 2), (1, 3), (2, 5)})
+
+    def test_empty_payload_has_no_plan(self):
+        self.assertEqual(runner.completion_plan({}), [])
+        self.assertEqual(runner.completion_plan({"series": []}), [])
+
+    def test_episodes_are_read_out_of_message_text(self):
+        text = "🎥 国漫: 武神主宰 (2020) S01E702 热更 2160p WEB-DL"
+        self.assertEqual(runner.episodes_in_text(text), {(1, 702)})
+        self.assertEqual(runner.episodes_in_text("某剧 S1.E3 1080p"), {(1, 3)})
+        self.assertEqual(runner.episodes_in_text("第12集 更新"), {(0, 12)})
+        self.assertEqual(
+            runner.episodes_in_text("S01E01 与 S01E02"), {(1, 1), (1, 2)}
+        )
+        self.assertEqual(runner.episodes_in_text("没有集号"), set())
+
+
 if __name__ == "__main__":
     unittest.main()
