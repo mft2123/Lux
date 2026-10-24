@@ -3140,8 +3140,13 @@ impl NfoWriteService {
             "EPISODE" => find_episode_nfo_target(&media_path, &directory).await,
             "VIDEO" => media_path.with_extension("nfo"),
             "SERIES" => {
-                let series_dir = series_directory(&root, &source.relative_path)
-                    .ok_or_else(|| NfoWriteError::PathOutsideRoot(directory.clone()))?;
+                // 没有 `Season NN/` 的历史镜像：剧集目录就是媒体文件所在目录，
+                // 但不能落在库根上。
+                let series_dir = match series_directory(&root, &source.relative_path) {
+                    Some(series_dir) => series_dir,
+                    None if directory != root => directory.clone(),
+                    None => return Err(NfoWriteError::PathOutsideRoot(directory.clone())),
+                };
                 let series_dir = fs::canonicalize(&series_dir)
                     .await
                     .map_err(|error| io_error(&series_dir, error))?;

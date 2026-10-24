@@ -82,8 +82,13 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
             source_ids
         }
         _ => {
-            fail_scan_local_metadata_batch(database, &batch_id, "invalid source reference batch")
-                .await;
+            fail_scan_local_metadata_batch(
+                database,
+                &batch_id,
+                "invalid source reference batch",
+                local_metadata_retry_at(),
+            )
+            .await;
             return None;
         }
     };
@@ -97,8 +102,13 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
                 item_ids
             }
             _ => {
-                fail_scan_local_metadata_batch(database, &batch_id, "invalid NFO exclusion list")
-                    .await;
+                fail_scan_local_metadata_batch(
+                    database,
+                    &batch_id,
+                    "invalid NFO exclusion list",
+                    local_metadata_retry_at(),
+                )
+                .await;
                 return None;
             }
         };
@@ -210,6 +220,7 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
                 &batch_id,
                 &error,
                 &excluded,
+                local_metadata_retry_at(),
             )
             .await;
             None
@@ -218,8 +229,15 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
             error,
             excluded: None,
         }) => {
-            tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
-            fail_scan_local_metadata_batch(database, &batch_id, &error).await;
+            let next_attempt_at = local_metadata_retry_at()
+                .filter(|_| !local_metadata_failure_is_permanent(&error));
+            tracing::warn!(
+                batch_id,
+                %error,
+                retry = next_attempt_at.is_some(),
+                "local image batch failed"
+            );
+            fail_scan_local_metadata_batch(database, &batch_id, &error, next_attempt_at).await;
             None
         }
     }
@@ -316,33 +334,79 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_batch(
                     batch_id,
                     "local metadata completion failed",
                     &non_retryable_item_ids,
+                    local_metadata_retry_at(),
                 )
                 .await;
             }
         },
         Err(error) => {
-            tracing::warn!(batch_id, %error, "local NFO batch failed and will be retried");
-            fail_scan_local_metadata_batch_with_non_retryable_item_ids(
-                database,
-                batch_id,
-                &error,
-                &non_retryable_item_ids,
-            )
-            .await;
+            if local_metadata_failure_is_permanent(&error) {
+                tracing::warn!(
+                    batch_id,
+                    %error,
+                    "local metadata batch failed permanently; marked terminal instead of retrying"
+                );
+                fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+                    database,
+                    batch_id,
+                    &error,
+                    &non_retryable_item_ids,
+                    None,
+                )
+                .await;
+            } else {
+                tracing::warn!(batch_id, %error, "local NFO batch failed and will be retried");
+                fail_scan_local_metadata_batch_with_non_retryable_item_ids(
+                    database,
+                    batch_id,
+                    &error,
+                    &non_retryable_item_ids,
+                    local_metadata_retry_at(),
+                )
+                .await;
+            }
         }
     }
 }
 
-async fn fail_scan_local_metadata_batch(database: &Database, batch_id: &str, error: &str) {
-    let retry_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-        })
-        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
-        .unwrap_or(i64::MAX);
+/// 重试的前提是「下次可能成功」。路径违例、没有本地源、格式不支持这类错误是确定的，
+/// 每 30 秒重来一次只会刷日志、永远补不上元数据——必须一次性终止并把错误留在批次上。
+fn local_metadata_failure_is_permanent(error: &str) -> bool {
+    const PERMANENT_MARKERS: &[&str] = &[
+        // ImageWriteError::PathOutsideRoot / NfoWriteError::PathOutsideRoot。
+        // 历史镜像少了 `Season NN/` 时，剧集目录会解析不出来，报的就是这一条。
+        "is outside the allowed image roots",
+        "is outside the library root",
+        // 条目已经没有任何本地源，重试也不可能补出来
+        "has no local source",
+        "unsupported image type",
+        "image content is invalid",
+    ];
+    PERMANENT_MARKERS
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
+fn local_metadata_retry_at() -> Option<i64> {
+    Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+            })
+            .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
+            .unwrap_or(i64::MAX),
+    )
+}
+
+async fn fail_scan_local_metadata_batch(
+    database: &Database,
+    batch_id: &str,
+    error: &str,
+    next_attempt_at: Option<i64>,
+) {
     if let Err(storage_error) = database
-        .fail_scan_local_metadata_batch(batch_id, error, Some(retry_at))
+        .fail_scan_local_metadata_batch(batch_id, error, next_attempt_at)
         .await
     {
         tracing::warn!(batch_id, %storage_error, "local metadata batch retry could not be saved");
@@ -354,20 +418,14 @@ async fn fail_scan_local_metadata_batch_with_non_retryable_item_ids(
     batch_id: &str,
     error: &str,
     non_retryable_item_ids: &[String],
+    next_attempt_at: Option<i64>,
 ) {
-    let retry_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-        })
-        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
-        .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
         .fail_scan_local_metadata_batch_with_non_retryable_item_ids(
             batch_id,
             error,
             non_retryable_item_ids,
-            Some(retry_at),
+            next_attempt_at,
         )
         .await
     {
@@ -477,21 +535,26 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill
                     &page,
                     "local metadata backfill completion failed",
                     &non_retryable_item_ids,
+                    local_metadata_retry_at(),
                 )
                 .await;
             }
         },
         Err(error) => {
+            let next_attempt_at = local_metadata_retry_at()
+                .filter(|_| !local_metadata_failure_is_permanent(&error));
             tracing::warn!(
                 library_root_id = %page.library_root_id,
                 %error,
-                "local metadata backfill NFO failed and will be retried"
+                retry = next_attempt_at.is_some(),
+                "local metadata backfill NFO failed"
             );
             fail_scan_local_metadata_backfill_page(
                 database,
                 &page,
                 &error,
                 &non_retryable_item_ids,
+                next_attempt_at,
             )
             .await;
         }
@@ -503,20 +566,14 @@ pub(in crate::application::scanner) async fn fail_scan_local_metadata_backfill_p
     page: &StoredScanLocalMetadataBackfillPage,
     error: &str,
     non_retryable_item_ids: &[String],
+    next_attempt_at: Option<i64>,
 ) {
-    let retry_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-        })
-        .checked_add(SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS)
-        .unwrap_or(i64::MAX);
     if let Err(storage_error) = database
         .fail_scan_local_metadata_backfill_page_with_exclusions(
             page,
             error,
             non_retryable_item_ids,
-            Some(retry_at),
+            next_attempt_at,
         )
         .await
     {
@@ -1091,12 +1148,22 @@ async fn process_scan_local_metadata_backfill_page(
             });
         }
         Err(error) => {
+            let next_attempt_at = local_metadata_retry_at()
+                .filter(|_| !local_metadata_failure_is_permanent(&error));
             tracing::warn!(
                 library_root_id = %page.library_root_id,
                 %error,
-                "local metadata backfill image stage failed and will be retried"
+                retry = next_attempt_at.is_some(),
+                "local metadata backfill image stage failed"
             );
-            fail_scan_local_metadata_backfill_page(&context.database, &page, &error, &[]).await;
+            fail_scan_local_metadata_backfill_page(
+                &context.database,
+                &page,
+                &error,
+                &[],
+                next_attempt_at,
+            )
+            .await;
         }
     }
 }
@@ -1697,7 +1764,40 @@ impl ScanJobService {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_failed_local_metadata_items, retryable_local_metadata_source_ids};
+    use super::{
+        local_metadata_failure_is_permanent, merge_failed_local_metadata_items,
+        retryable_local_metadata_source_ids,
+    };
+
+    #[test]
+    fn deterministic_metadata_failures_are_terminal_instead_of_retried() {
+        // 这些错误重试一辈子也不会成功，必须一次终止。
+        for error in [
+            "image path '/library/短剧/甲/AI短剧甲.S01E01.1080p.strm' is outside the allowed image roots",
+            "metadata path '/library/x.nfo': path is outside the library root",
+            "media item has no local source",
+            "unsupported image type: backdrop",
+            "image content is invalid for image/png",
+        ] {
+            assert!(
+                local_metadata_failure_is_permanent(error),
+                "should be terminal: {error}"
+            );
+        }
+
+        // 瞬时错误继续重试：IO、数据库忙、网络。
+        for error in [
+            "metadata path '/library/a.nfo': Input/output error",
+            "database is locked",
+            "connection reset by peer",
+            "local image item(s) failed",
+        ] {
+            assert!(
+                !local_metadata_failure_is_permanent(error),
+                "should stay retryable: {error}"
+            );
+        }
+    }
 
     #[test]
     fn image_phase_skips_non_retryable_sources() {

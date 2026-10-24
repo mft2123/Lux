@@ -228,7 +228,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       ...(folderFilter ? { folder: folderFilter } : {}),
     }),
     initialPageParam: 1,
-    enabled: Boolean(libraryId && library),
+    enabled: Boolean(libraryId) && (Boolean(library) || isGlobalCollectionLibrary),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
       const pageSize = lastPage.pageSize ?? 24;
@@ -250,8 +250,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
 
   if (libraries.isPending) return <LibraryPageLoadingState />;
   if (pages.error && !pages.data) return <section className="lux-page-state"><h1>媒体库加载失败</h1><p>{pages.error.message}</p></section>;
-  if (!library) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
-  if (pages.isPending) return <LibraryPageLoadingState libraryName={library.name} />;
+  // 合集是虚拟系统库：它故意不出现在 GET /libraries 里（后端 access 层也拒绝通用浏览），
+  // 只能通过自己的 BOX_SET 卡片接口读。所以这页不能因为它不在库列表里就判「媒体库不存在」。
+  if (!library && !isGlobalCollectionLibrary) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
+  if (pages.isPending) return <LibraryPageLoadingState libraryName={library?.name} />;
 
   const loadedItems = pages.data?.pages.flatMap((page) => page.items ?? []) ?? [];
   const total = pages.data?.pages[0]?.total ?? 0;
@@ -329,7 +331,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     <section className="lux-page lux-page-narrow">
       {folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
       <div className="lux-page-heading">
-        <h1>{library?.name || "媒体库"}</h1>
+        <h1>{library?.name || (isGlobalCollectionLibrary ? "合集" : "媒体库")}</h1>
         <p>{metadataStatus ? `${total} 项待确认内容` : isGlobalCollectionLibrary ? `${total} 个系列 · 按默认上映顺序` : folderPath.length ? `${folderPath.at(-1)?.title ?? "目录"} · ${total} 项内容` : `${total} 项内容`}</p>
       </div>
       {!isGlobalCollectionLibrary ? <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
@@ -356,7 +358,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       </div> : null}
       {!isGlobalCollectionLibrary ? <div className="lux-library-sort-toolbar" aria-label="媒体库排序">
         <div className="lux-library-sort-control"><span>元数据</span><LuxSelect value={metadataStatus ?? "ALL"} options={metadataOptions} onChange={changeMetadataStatus} aria-label="元数据状态" /></div>
-        {folderFilterOptions.length > 1 && (
+        {!folderPath.length && folderFilterOptions.length > 1 && (
           <div className="lux-library-sort-control"><span>目录</span><LuxSelect value={folderFilter || "ALL"} options={folderFilterOptions} onChange={changeFolderFilter} aria-label="目录筛选" /></div>
         )}
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>

@@ -1422,8 +1422,21 @@ impl ImageWriteService {
             return Err(ImageWriteError::PathOutsideRoot(media_path));
         }
         let directory = if item_type == "SERIES" {
-            series_directory(&root, &source.relative_path)
-                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
+            match series_directory(&root, &source.relative_path) {
+                Some(directory) => directory,
+                // 历史镜像可能没有 `Season NN/` 这一层（早期短剧/外部工具整理的库）。
+                // 这时媒体文件所在目录就是剧集目录，照常写回；但绝不退回库根，
+                // 否则会把 poster 写到整个库的根目录上。
+                None => {
+                    let parent = media_path
+                        .parent()
+                        .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?;
+                    if parent == root {
+                        return Err(ImageWriteError::PathOutsideRoot(media_path));
+                    }
+                    parent.to_owned()
+                }
+            }
         } else {
             media_path
                 .parent()

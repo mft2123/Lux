@@ -228,6 +228,21 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
     )
 }
 
+/// 目录浏览时文件夹必须排在前面：按名字排序时，`国内` 这类 CJK 目录名会排到
+/// 一百多个片名之后（动画库就是 140 项里的最后一页），唯一的入口等于看不见。
+fn catalog_item_order_with_folders_first(
+    browse: bool,
+    sort_by: CatalogSort,
+    descending: bool,
+) -> String {
+    let order = catalog_item_order(sort_by, descending);
+    if browse {
+        format!("CASE WHEN mi.item_type = 'FOLDER' THEN 0 ELSE 1 END ASC, {order}")
+    } else {
+        order.to_owned()
+    }
+}
+
 fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> &'static str {
     match (sort_by, descending) {
         (CatalogSort::DateCreated, true) => {
@@ -2110,7 +2125,11 @@ impl Database {
                 CatalogBind::Real(value) => count_statement.bind(*value),
             };
         }
-        let item_order = catalog_item_order(filter.sort_by, filter.descending);
+        let item_order = catalog_item_order_with_folders_first(
+            filter.parent_id_scope.is_some(),
+            filter.sort_by,
+            filter.descending,
+        );
         let query = format!(
             "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -9046,9 +9065,40 @@ fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
-        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
+        CatalogSort, Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
+        catalog_item_order_with_folders_first, postgres_recent_catalog_rows_by_library_query,
+        sqlite_recent_catalog_rows_by_library_query,
     };
+
+    #[test]
+    fn folder_browsing_sorts_directories_before_leaf_items() {
+        // 目录浏览（parent scope）时文件夹必须排在最前，否则按名字排序会把
+        // 「国内」这种 CJK 目录甩到一百多个片名之后，唯一的入口等于看不见。
+        let browse = catalog_item_order_with_folders_first(true, CatalogSort::Name, false);
+        let flat = catalog_item_order_with_folders_first(false, CatalogSort::Name, false);
+        assert!(
+            browse.starts_with("CASE WHEN mi.item_type = 'FOLDER' THEN 0 ELSE 1 END ASC, "),
+            "unexpected browse order: {browse}"
+        );
+        assert!(
+            browse.ends_with(&flat),
+            "sort key must be preserved: browse={browse} flat={flat}"
+        );
+
+        // 非浏览的列表/搜索不受影响。
+        assert!(!flat.contains("item_type = 'FOLDER'"), "flat order changed: {flat}");
+
+        // 其它排序同样保留，只是前面多一个文件夹分组键。
+        for sort in [
+            CatalogSort::DateCreated,
+            CatalogSort::PremiereDate,
+            CatalogSort::ProductionYear,
+            CatalogSort::Rating,
+        ] {
+            let ordered = catalog_item_order_with_folders_first(true, sort, true);
+            assert!(ordered.starts_with("CASE WHEN mi.item_type = 'FOLDER'"));
+        }
+    }
 
     #[test]
     fn recommendation_stats_cleanup_uses_an_indexable_exists_lookup() {
