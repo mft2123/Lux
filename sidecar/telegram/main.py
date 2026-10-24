@@ -68,6 +68,11 @@ def _build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--status", default="held,failed,pending", help="按状态选（逗号分隔）")
     replay.add_argument("--limit", type=int, default=200)
     replay.add_argument("--dry-run", action="store_true", help="只列出，不投递")
+    replay.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略回执再发一次（用于确认过 uncertain 那条其实没转存）",
+    )
 
     complete = sub.add_parser(
         "complete", help="补集：按 Lux 的缺集清单在频道里搜对应集（默认 dry-run）"
@@ -194,7 +199,7 @@ async def _cmd_replay(config: config_mod.SidecarConfig, args) -> int:
             return 0
         finally:
             store.close()
-    count = await runner.deliver_pending(config, args.ids, statuses, args.limit)
+    count = await runner.deliver_pending(config, args.ids, statuses, args.limit, force=args.force)
     print(f"已处理 {count} 条")
     return 0
 

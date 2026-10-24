@@ -5,7 +5,7 @@ import unittest
 
 from tests import support
 from tgwatch import config as config_mod
-from tgwatch import filters, planner as planner_mod, runner, store as store_mod
+from tgwatch import filters, planner as planner_mod, runner, sink as sink_mod, store as store_mod
 
 
 HIDDEN = [{"type": "MessageEntityTextUrl", "offset": 0, "length": 9, "url": "https://115.com/s/abc"}]
@@ -198,6 +198,160 @@ class CompletionPlanTest(unittest.TestCase):
             runner.episodes_in_text("S01E01 与 S01E02"), {(1, 1), (1, 2)}
         )
         self.assertEqual(runner.episodes_in_text("没有集号"), set())
+
+
+class ReceiptTest(unittest.TestCase):
+    """回执三态：submitted 不重发、uncertain 不自动重发、清理不淘汰未完成。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+        self.store = store_mod.Store(self.tmp / "state.db")
+        self.addCleanup(self.store.close)
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def test_plan_then_submit(self):
+        previous = self.store.plan_receipt("https://115.com/s/a", "@chan", 42, "某剧")
+        self.assertEqual(previous, "")
+        self.assertEqual(self.store.receipt("https://115.com/s/a")["status"], store_mod.RECEIPT_PLANNED)
+
+        self.store.mark_receipt("https://115.com/s/a", store_mod.RECEIPT_SUBMITTED)
+        # 第二次登记返回 submitted：调用方据此跳过发送。
+        self.assertEqual(
+            self.store.plan_receipt("https://115.com/s/a", "@chan", 42, "某剧"),
+            store_mod.RECEIPT_SUBMITTED,
+        )
+
+    def test_uncertain_survives_and_is_reported(self):
+        self.store.plan_receipt("https://115.com/s/b", "@chan", 1, None)
+        self.store.mark_receipt("https://115.com/s/b", store_mod.RECEIPT_UNCERTAIN)
+        self.assertEqual(
+            self.store.plan_receipt("https://115.com/s/b", "@chan", 1, None),
+            store_mod.RECEIPT_UNCERTAIN,
+        )
+        self.assertEqual(self.store.receipt_counts().get(store_mod.RECEIPT_UNCERTAIN), 1)
+
+    def test_trim_only_evicts_submitted(self):
+        for index in range(6):
+            url = f"https://115.com/s/{index}"
+            self.store.plan_receipt(url, "@chan", index, None)
+            if index >= 4:
+                continue  # 最后两条保持 planned
+            self.store.mark_receipt(url, store_mod.RECEIPT_SUBMITTED)
+        # 上限压到 3：应删掉最老的 submitted，planned 一条都不能动。
+        removed = self.store.trim_receipts(cap=3)
+        self.assertEqual(removed, 3)
+        counts = self.store.receipt_counts()
+        self.assertEqual(counts.get(store_mod.RECEIPT_SUBMITTED), 1)
+        self.assertEqual(counts.get(store_mod.RECEIPT_PLANNED), 2)
+
+    def test_trim_never_evicts_uncertain(self):
+        for index in range(3):
+            self.store.plan_receipt(f"https://115.com/s/u{index}", "@chan", index, None)
+            self.store.mark_receipt(f"https://115.com/s/u{index}", store_mod.RECEIPT_UNCERTAIN)
+        self.assertEqual(self.store.trim_receipts(cap=1), 0)
+        self.assertEqual(self.store.receipt_counts().get(store_mod.RECEIPT_UNCERTAIN), 3)
+
+
+class DeliverReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def config(self):
+        return config_mod.SidecarConfig(
+            api_id=1,
+            api_hash="hash",
+            api_key="k",
+            session_dir=self.tmp / "session",
+            state_dir=self.tmp / "state",
+            inbox_dir=self.tmp / "inbox",
+            default_mode=filters.MODE_NEW,
+            channels=(config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_NEW),),
+        )
+
+    def build(self, sink):
+        config = self.config()
+        store = store_mod.Store(config.state_db)
+        self.addCleanup(store.close)
+        watcher = runner.Watcher(config, store, sink, None, None)
+        return watcher, store, config
+
+    def message(self):
+        return runner.IncomingMessage(
+            channel="@chan",
+            chat_id=-100123,
+            msg_id=7,
+            date="2026-10-18T00:00:00+00:00",
+            text="某剧 第二季 4K",
+            entities=HIDDEN,
+        )
+
+    def test_success_writes_a_submitted_receipt_and_blocks_a_second_send(self):
+        sink = FakeSink()
+        watcher, store, config = self.build(sink)
+        asyncio.run(watcher.process(self.message(), config.channels[0]))
+        self.assertEqual(len(sink.sent), 1)
+        self.assertEqual(
+            store.receipt("https://115.com/s/abc")["status"], store_mod.RECEIPT_SUBMITTED
+        )
+
+        # 同一链接再入队（例如 replay）：回执说不重发。
+        item_id = store.items_by_status((store_mod.STATUS_DELIVERED,))[0]["id"]
+        store.set_status(int(item_id), store_mod.STATUS_PENDING)
+        asyncio.run(watcher.deliver([int(item_id)]))
+        self.assertEqual(len(sink.sent), 1, "submitted 的链接不该再发一次")
+
+    def test_timeout_marks_uncertain_and_stops_automatic_retry(self):
+        class FlakySink(FakeSink):
+            def __init__(self):
+                super().__init__()
+                self.fail = sink_mod.SinkError("Lux 超时: 15s", uncertain=True)
+                self.attempts = 0
+
+            async def send(self, item):
+                self.attempts += 1
+                raise self.fail
+
+        sink = FlakySink()
+        watcher, store, config = self.build(sink)
+        asyncio.run(watcher.process(self.message(), config.channels[0]))
+        self.assertEqual(sink.attempts, 1)
+        self.assertEqual(
+            store.receipt("https://115.com/s/abc")["status"], store_mod.RECEIPT_UNCERTAIN
+        )
+
+        # 自动重试不应再发（结果未知），条目被挂起等人工确认。
+        asyncio.run(watcher.retry_once())
+        self.assertEqual(sink.attempts, 1, "uncertain 不该被自动重发")
+        held = store.items_by_status((store_mod.STATUS_HELD,))
+        self.assertTrue(any(item["reason"] == "receipt:uncertain" for item in held))
+
+        # 人工确认后 --force 才允许再发。
+        asyncio.run(watcher.deliver([int(held[0]["id"])], force=True))
+        self.assertEqual(sink.attempts, 2)
+
+    def test_connection_refused_is_retryable_not_uncertain(self):
+        class DownSink(FakeSink):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            async def send(self, item):
+                self.attempts += 1
+                raise sink_mod.SinkError("连接 Lux 失败: Connection refused")
+
+        sink = DownSink()
+        watcher, store, config = self.build(sink)
+        asyncio.run(watcher.process(self.message(), config.channels[0]))
+        self.assertEqual(
+            store.receipt("https://115.com/s/abc")["status"], store_mod.RECEIPT_PLANNED
+        )
+        asyncio.run(watcher.retry_once())
+        self.assertEqual(sink.attempts, 2, "没发出去的错误应该重试")
 
 
 if __name__ == "__main__":

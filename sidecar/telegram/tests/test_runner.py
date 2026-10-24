@@ -677,7 +677,10 @@ class GapBackfillTest(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(client.calls[0]["min_id"], 5)
         urls = [item["url"] for item in sink.sent]
-        self.assertEqual(len(urls), 2)
+        # 两条消息带的是同一个分享链接：回执（阶段 4）保证同一条链接只转存一次，
+        # 但两条消息都各自入库，避免丢掉「这条消息出现过」的事实。
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(store.stats()["items"], 2)
         self.assertEqual(store.last_message_id(config.channels[0].key()), 7)
 
     def test_no_cursor_means_no_gap_pull(self):

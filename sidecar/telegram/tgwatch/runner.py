@@ -650,18 +650,49 @@ class Watcher:
             )
         return decisions
 
-    async def deliver(self, item_ids: list[int]) -> int:
-        """逐条投递；返回本轮失败（含落死信）的条数。"""
+    async def deliver(self, item_ids: list[int], *, force: bool = False) -> int:
+        """逐条投递；返回本轮失败（含落死信）的条数。
+
+        每条链接先过回执（receipts）：
+        - `submitted`：已经转存过，直接标记 delivered，不重发（同一条链接只该转存一次）
+        - `uncertain`：上次发出去但结果未知，**不自动重发**（除非 `force`）——
+          宁可让管理员确认一次，也不要静默转存两遍
+        """
         failures = 0
         for item_id in item_ids:
             item = self.store.get_item(item_id)
             if not item or item["status"] == store_mod.STATUS_DELIVERED:
+                continue
+            url = str(item["url"])
+            if force:
+                self.store.clear_receipt(url)
+            previous = self.store.plan_receipt(
+                url, str(item["channel"]), int(item["msg_id"]), item.get("title")
+            )
+            if previous == store_mod.RECEIPT_SUBMITTED:
+                log.info(
+                    "已经提交过（回执 submitted），跳过 item=%s url=%s", item_id, _short_url(url)
+                )
+                self.store.set_status(item_id, store_mod.STATUS_DELIVERED, "receipt:submitted")
+                continue
+            if previous == store_mod.RECEIPT_UNCERTAIN and not force:
+                log.warning(
+                    "上次投递结果未知（回执 uncertain），不自动重发 item=%s url=%s；"
+                    "确认没有转存后用 `replay --id %s --force` 再试",
+                    item_id,
+                    _short_url(url),
+                    item_id,
+                )
+                self.store.set_status(item_id, store_mod.STATUS_HELD, "receipt:uncertain")
+                self.counts["held"] += 1
                 continue
             async with self._semaphore:
                 try:
                     await self.sink.send(item)
                 except sink_mod.SinkError as error:
                     failures += 1
+                    if getattr(error, "uncertain", False):
+                        self.store.mark_receipt(url, store_mod.RECEIPT_UNCERTAIN)
                     self._record_failure(item, error)
                 except Exception as error:  # noqa: BLE001 - 序列化等意外也必须落状态（SC18）
                     failures += 1
@@ -671,7 +702,9 @@ class Watcher:
                     )
                 else:
                     self.counts["delivered"] += 1
+                    self.store.mark_receipt(url, store_mod.RECEIPT_SUBMITTED)
                     self.store.set_status(item_id, store_mod.STATUS_DELIVERED)
+            self.store.trim_receipts()
         return failures
 
     def _record_failure(self, item: dict, error: sink_mod.SinkError) -> None:
@@ -1145,9 +1178,18 @@ async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, se
         store.close()
 
 
-async def deliver_pending(    config: config_mod.SidecarConfig, item_ids: list[int] | None, statuses, limit: int
+async def deliver_pending(
+    config: config_mod.SidecarConfig,
+    item_ids: list[int] | None,
+    statuses,
+    limit: int,
+    *,
+    force: bool = False,
 ) -> int:
-    """`replay` 子命令：把 held/failed/pending 推到下游（"管理员触发时才处理"）。"""
+    """`replay` 子命令：把 held/failed/pending 推到下游（"管理员触发时才处理"）。
+
+    `force=True` 忽略回执（含 uncertain）：管理员确认过"上次没转存"之后再放行。
+    """
     harden_permissions(config)
     store = store_mod.Store(config.state_db)
     sink = sink_mod.build(config)
@@ -1164,7 +1206,7 @@ async def deliver_pending(    config: config_mod.SidecarConfig, item_ids: list[i
             log.info("没有可投递的条目")
             return 0
         log.info("投递 %d 条", len(ids))
-        await watcher.deliver(ids)
+        await watcher.deliver(ids, force=force)
         return len(ids)
     finally:
         store.close()

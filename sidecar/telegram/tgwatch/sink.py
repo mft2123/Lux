@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -39,11 +40,16 @@ class SinkError(RuntimeError):
 
     `permanent=True` 表示重试也不会成功（Lux 400 链接非法 / 403 无权限），
     runner 直接把它落死信（review SC4）；其余错误进重试队列。
+
+    `uncertain=True` 表示请求**可能已经到了 Lux**（超时、连接被重置），结果
+    未知：这条要记成 uncertain 回执并停止自动重试，否则同一条链接可能被转存
+    两次。连接被拒绝、DNS 失败这类明显没发出去的错误不算 uncertain。
     """
 
-    def __init__(self, message: str, *, permanent: bool = False):
+    def __init__(self, message: str, *, permanent: bool = False, uncertain: bool = False):
         super().__init__(message)
         self.permanent = permanent
+        self.uncertain = uncertain
 
 
 def payload(item: dict) -> dict:
@@ -124,9 +130,13 @@ class HttpSink:
                 ) from error
             raise SinkError(f"HTTP {error.code}: {detail[:200]}") from error
         except urllib.error.URLError as error:
-            raise SinkError(f"连接 Lux 失败: {error.reason}") from error
+            # 连接被拒绝 / DNS 解析失败：请求肯定没发出去，重试是安全的。
+            # 其余（socket 超时、连接被重置）请求可能已经到达 Lux，结果未知。
+            if isinstance(error.reason, (ConnectionRefusedError, socket.gaierror)):
+                raise SinkError(f"连接 Lux 失败: {error.reason}") from error
+            raise SinkError(f"连接 Lux 失败: {error.reason}", uncertain=True) from error
         except TimeoutError as error:
-            raise SinkError(f"Lux 超时: {self.timeout}s") from error
+            raise SinkError(f"Lux 超时: {self.timeout}s", uncertain=True) from error
 
     async def send(self, item: dict) -> None:
         body = json.dumps(payload(item), ensure_ascii=False).encode("utf-8")

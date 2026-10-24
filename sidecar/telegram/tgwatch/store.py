@@ -61,6 +61,20 @@ CREATE TABLE IF NOT EXISTS channel_state (
     last_message_id  INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT NOT NULL
 );
+
+-- 回执：一条链接只该被转存一次。planned → submitted 是正常路径；
+-- uncertain 表示发出去但不知道结果，永不自动重发、也永不被清理淘汰。
+CREATE TABLE IF NOT EXISTS receipts (
+    url         TEXT PRIMARY KEY,
+    channel     TEXT NOT NULL,
+    msg_id      INTEGER NOT NULL,
+    title       TEXT,
+    status      TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_status ON receipts (status);
 """
 
 STATUS_PENDING = "pending"
@@ -71,6 +85,18 @@ STATUS_DEAD = "dead"
 STATUS_SKIPPED = "skipped"
 
 RETRYABLE = (STATUS_PENDING, STATUS_HELD, STATUS_FAILED)
+
+# ---- 回执三态（daquan 的 telegram receipts）----
+# planned   已决定转存，还没发出去
+# uncertain 发出去了但结果未知（超时/连接被重置）：**不自动重试**，否则可能转存两次
+# submitted Lux 已受理（含 duplicate）：永不再发
+RECEIPT_PLANNED = "planned"
+RECEIPT_UNCERTAIN = "uncertain"
+RECEIPT_SUBMITTED = "submitted"
+
+#: 回执上限。清理只淘汰最老的 submitted，planned/uncertain 一律保留 —— 不确定的
+#: 那条正是最需要留在眼前的东西。
+RECEIPT_CAP = 10000
 
 
 def _now() -> str:
@@ -220,6 +246,86 @@ class Store:
             self._conn.commit()
             return int(changed)
 
+    # ---- 回执三态（一条链接只该被转存一次）----
+
+    def receipt(self, url: str) -> dict | None:
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            row = cursor.execute("SELECT * FROM receipts WHERE url = ?", (url,)).fetchone()
+            return dict(row) if row else None
+
+    def plan_receipt(self, url: str, channel: str, msg_id: int, title: str | None) -> str:
+        """把链接登记成 planned，并返回**登记前的状态**（没有则空串）。
+
+        调用方靠返回值决定要不要发：`submitted` 直接跳过，`uncertain` 也不自动
+        重发（先人工确认），其余照常。
+        """
+        now = _now()
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            row = cursor.execute("SELECT status FROM receipts WHERE url = ?", (url,)).fetchone()
+            previous = str(row["status"]) if row else ""
+            if previous in (RECEIPT_SUBMITTED, RECEIPT_UNCERTAIN):
+                cursor.execute(
+                    "UPDATE receipts SET attempts = attempts + 1, updated_at = ? WHERE url = ?",
+                    (now, url),
+                )
+            elif previous == RECEIPT_PLANNED:
+                cursor.execute(
+                    "UPDATE receipts SET attempts = attempts + 1, updated_at = ? WHERE url = ?",
+                    (now, url),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO receipts (url, channel, msg_id, title, status, attempts, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                    (url, channel, int(msg_id), title, RECEIPT_PLANNED, now, now),
+                )
+            self._conn.commit()
+            return previous
+
+    def mark_receipt(self, url: str, status: str) -> None:
+        if status not in (RECEIPT_PLANNED, RECEIPT_UNCERTAIN, RECEIPT_SUBMITTED):
+            raise ValueError(f"未知回执状态: {status}")
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            cursor.execute(
+                "UPDATE receipts SET status = ?, updated_at = ? WHERE url = ?",
+                (status, _now(), url),
+            )
+            self._conn.commit()
+
+    def clear_receipt(self, url: str) -> None:
+        """人工放行：把回执删掉，下一条重试会重新走 planned。"""
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            cursor.execute("DELETE FROM receipts WHERE url = ?", (url,))
+            self._conn.commit()
+
+    def receipt_counts(self) -> dict[str, int]:
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            rows = cursor.execute(
+                "SELECT status, COUNT(*) AS n FROM receipts GROUP BY status"
+            ).fetchall()
+            return {row["status"]: row["n"] for row in rows}
+
+    def trim_receipts(self, cap: int = RECEIPT_CAP) -> int:
+        """超过上限时只淘汰最老的 submitted。
+
+        planned / uncertain 永远保留：未完成的和结果未知的正是要留住的那几条，
+        淘汰它们等于允许同一条链接再转存一次。
+        """
+        with self._lock, closing(self._conn.cursor()) as cursor:
+            total = cursor.execute("SELECT COUNT(*) AS n FROM receipts").fetchone()["n"]
+            excess = int(total) - int(cap)
+            if excess <= 0:
+                return 0
+            cursor.execute(
+                "DELETE FROM receipts WHERE url IN ("
+                "  SELECT url FROM receipts WHERE status = ? ORDER BY updated_at ASC, url ASC LIMIT ?"
+                ")",
+                (RECEIPT_SUBMITTED, excess),
+            )
+            removed = cursor.rowcount
+            self._conn.commit()
+            return int(removed)
+
     def stats(self) -> dict:
         with self._lock, closing(self._conn.cursor()) as cursor:
             messages = cursor.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
@@ -229,6 +335,9 @@ class Store:
                 " WHERE status = ? GROUP BY reason ORDER BY n DESC, reason ASC LIMIT 5",
                 (STATUS_DEAD,),
             ).fetchall()
+            receipts = cursor.execute(
+                "SELECT status, COUNT(*) AS n FROM receipts GROUP BY status"
+            ).fetchall()
         by_status = {row["status"]: row["n"] for row in rows}
         return {
             "messages": messages,
@@ -237,6 +346,7 @@ class Store:
             # 死信要能在 `status` 里看到「多少条 + 为什么」，否则 rollback 时无从下手
             "dead": by_status.get(STATUS_DEAD, 0),
             "dead_reasons": {row["reason"] or "unknown": row["n"] for row in dead},
+            "receipts": {row["status"]: row["n"] for row in receipts},
         }
 
     # ---- 频道游标（宕机期间的消息靠它补拉） ----
