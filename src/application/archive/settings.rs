@@ -128,9 +128,22 @@ pub(crate) struct TelegramSettings {
     /// switches, or `null` for "everything on". Owned by the notify module.
     pub(crate) notify: Value,
     /// One of [`LISTEN_MODES`] (or its English alias).
+    ///
+    /// Compatibility projection of [`Self::channels`]: the old single-mode
+    /// field is derived on every save so an older sidecar still understands the
+    /// file. New code reads and writes `channels`.
     pub(crate) listen_mode: String,
     /// Channels the userbot listens to (`@username` or numeric id).
+    ///
+    /// Compatibility projection of [`Self::channels`] (enabled channels only).
     pub(crate) listen_channels: Vec<String>,
+    /// Per-channel listening configuration: the source of truth since v2.
+    ///
+    /// Each channel carries its own mode bits and its own cursor state, so a
+    /// slow channel no longer holds back a fast one and "追更" can be enabled
+    /// for one channel only.
+    #[serde(default)]
+    pub(crate) channels: Vec<TelegramChannel>,
     /// Series the 追更 mode keeps watching.
     pub(crate) follow_list: Vec<String>,
     // Keys owned by the notify module: kept so a save from this module never
@@ -183,6 +196,164 @@ impl Default for Transfer115Settings {
     }
 }
 
+/// Most channels one settings file may carry. Telegram accounts can join
+/// hundreds; the cap only stops a runaway UI or a hand-edited file.
+const MAX_TELEGRAM_CHANNELS: usize = 500;
+
+/// One Telegram channel the userbot watches.
+///
+/// `id` is the stable key (`dialog.id`, negative for channels); the title
+/// changes and must never be used as identity.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TelegramChannel {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) username: String,
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) modes: TelegramChannelModes,
+    #[serde(default)]
+    pub(crate) automation: TelegramChannelAutomation,
+}
+
+/// The five mode bits of one channel (daquan's `normalizeTelegramChannelModes`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TelegramChannelModes {
+    /// 入新: transfer when the library does not have the work at all.
+    pub(crate) new_release: bool,
+    /// 追更: fill missing seasons/episodes of a subscribed series.
+    pub(crate) follow: bool,
+    /// 全量: all of 入新 + 追更 + 洗版.
+    pub(crate) full: bool,
+    /// 洗版: replace an existing entry only when the incoming version wins.
+    pub(crate) remux: bool,
+    /// 手动: **derived**, true only when the other four are false.
+    pub(crate) manual: bool,
+}
+
+impl TelegramChannelModes {
+    /// `manual` is never an independent switch: it means "nothing automatic".
+    fn normalized(mut self) -> Self {
+        self.manual = !(self.new_release || self.follow || self.full || self.remux);
+        self
+    }
+
+    /// Map the legacy single-mode string onto the five bits.
+    fn from_listen_mode(mode: &str) -> Self {
+        let normalized = mode.trim().to_ascii_lowercase();
+        Self {
+            new_release: matches!(normalized.as_str(), "上新" | "new"),
+            follow: matches!(normalized.as_str(), "追更" | "follow"),
+            full: matches!(normalized.as_str(), "全量" | "all"),
+            remux: matches!(normalized.as_str(), "洗版" | "wash"),
+            manual: false,
+        }
+        .normalized()
+    }
+
+    fn any_automatic(&self) -> bool {
+        self.new_release || self.follow || self.full || self.remux
+    }
+}
+
+/// Per-channel cursor and last-run bookkeeping.
+///
+/// `last_message_id` is the cursor: messages up to and including it are done.
+/// The first run only records the newest id and transfers nothing, so a fresh
+/// channel does not dump its whole history into the queue.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TelegramChannelAutomation {
+    pub(crate) initialized: bool,
+    pub(crate) last_message_id: i64,
+    pub(crate) last_run_at: String,
+    pub(crate) last_status: String,
+    pub(crate) last_error: String,
+    pub(crate) transferred_count: i64,
+}
+
+impl TelegramSettings {
+    /// Build the v2 channel list from the legacy single-mode pair.
+    ///
+    /// Old configuration carried one global mode for every channel; mapping it
+    /// one-to-one keeps the previous behaviour after the upgrade.
+    fn channels_from_legacy(ids: &[String], mode: &str) -> Vec<TelegramChannel> {
+        let modes = TelegramChannelModes::from_listen_mode(mode);
+        ids.iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .map(|id| TelegramChannel {
+                id: id.to_owned(),
+                title: String::new(),
+                username: id.trim_start_matches('@').to_owned(),
+                enabled: true,
+                modes: modes.clone(),
+                automation: TelegramChannelAutomation::default(),
+            })
+            .collect()
+    }
+
+    /// Keep the legacy projection in sync with `channels`.
+    ///
+    /// The fields are still written so an older sidecar (which only knows
+    /// `listen_channels` + `listen_mode`) keeps working during the transition.
+    fn project_legacy(&mut self) {
+        self.listen_channels = self
+            .channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .map(|channel| channel.id.clone())
+            .collect();
+        // With no channels there is nothing to project: keep `listen_mode` as
+        // configured so a template written before any channel exists does not
+        // silently flip to 手动.
+        if self.channels.is_empty() {
+            return;
+        }
+        let any = |pick: fn(&TelegramChannelModes) -> bool| {
+            self.channels
+                .iter()
+                .any(|channel| channel.enabled && pick(&channel.modes))
+        };
+        self.listen_mode = if any(|modes| modes.full) {
+            "全量"
+        } else if any(|modes| modes.new_release) {
+            "上新"
+        } else if any(|modes| modes.follow) {
+            "追更"
+        } else if any(|modes| modes.remux) {
+            "洗版"
+        } else {
+            "手动"
+        }
+        .to_owned();
+    }
+
+    /// Drop unusable channels, dedupe by id and normalise the mode bits.
+    fn sanitize_channels(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.channels = self
+            .channels
+            .drain(..)
+            .filter_map(|mut channel| {
+                channel.id = channel.id.trim().to_owned();
+                if channel.id.is_empty() || !seen.insert(channel.id.clone()) {
+                    return None;
+                }
+                channel.modes = channel.modes.clone().normalized();
+                Some(channel)
+            })
+            .take(MAX_TELEGRAM_CHANNELS)
+            .collect();
+        self.project_legacy();
+    }
+}
+
 impl Default for TelegramSettings {
     fn default() -> Self {
         Self {
@@ -195,6 +366,7 @@ impl Default for TelegramSettings {
             notify: Value::Null,
             listen_mode: DEFAULT_LISTEN_MODE.to_owned(),
             listen_channels: Vec::new(),
+            channels: Vec::new(),
             follow_list: Vec::new(),
             enabled: None,
             api_base: None,
@@ -504,6 +676,11 @@ impl ArchiveSettings {
                 LISTEN_MODES.join(" / ")
             ));
         }
+        if let Some(Value::Object(telegram)) = document.get("telegram")
+            && telegram.contains_key("channels")
+        {
+            validate_channels(&self.telegram.channels)?;
+        }
         if let Some(Value::Object(transfer)) = document.get("transfer115") {
             if transfer.contains_key("timeout_seconds")
                 && self.transfer115.timeout_seconds > MAX_TRANSFER115_TIMEOUT_SECONDS
@@ -558,6 +735,7 @@ impl ArchiveSettings {
                 LISTEN_MODES.join(" / ")
             ));
         }
+        validate_channels(&self.telegram.channels)?;
         if self.transfer115.timeout_seconds > MAX_TRANSFER115_TIMEOUT_SECONDS {
             return Err(format!(
                 "转存超时必须在 0 到 {MAX_TRANSFER115_TIMEOUT_SECONDS} 秒之间"
@@ -597,6 +775,9 @@ impl ArchiveSettings {
         if self.transfer115.offline_dir.trim().is_empty() {
             self.transfer115.offline_dir = DEFAULT_TRANSFER115_OFFLINE_DIR.to_owned();
         }
+        // Channels are the source of truth: drop empty/duplicate ids, fold the
+        // derived `manual` bit and refresh the legacy projection.
+        self.telegram.sanitize_channels();
         self
     }
 
@@ -697,6 +878,25 @@ impl TelegramSettings {
         if let Some(value) = string_list_field(document, "listen_channels") {
             settings.listen_channels = value;
         }
+        // v2: `channels` is the source of truth. A document that still speaks
+        // the legacy pair (an older UI, or a hand-edited file) is migrated on
+        // the spot; `channels` wins when both are present.
+        if let Some(value) = document.get("channels") {
+            settings.channels = parse_telegram_channels(value);
+        } else if document.contains_key("listen_channels") || document.contains_key("listen_mode") {
+            // An older UI saves the whole telegram group on every edit, most of
+            // the time without touching the listen fields. Migrate only when
+            // those values actually changed, so a no-op save cannot wipe the
+            // per-channel modes configured through the v2 API.
+            let legacy_changed = settings.listen_channels != base.listen_channels
+                || settings.listen_mode != base.listen_mode;
+            if legacy_changed {
+                settings.channels = TelegramSettings::channels_from_legacy(
+                    &settings.listen_channels,
+                    &settings.listen_mode,
+                );
+            }
+        }
         if let Some(value) = string_list_field(document, "follow_list") {
             settings.follow_list = value;
         }
@@ -724,6 +924,10 @@ impl TelegramSettings {
         if let Some(value) = optional_i64(document, "timezone_offset_hours") {
             settings.timezone_offset_hours = value;
         }
+        // Whatever the document spoke (channels or the legacy pair), the legacy
+        // fields are rewritten as a projection of `channels` so the file never
+        // carries two contradictory views.
+        settings.project_legacy();
         settings
     }
 }
@@ -847,6 +1051,25 @@ pub(crate) fn mask_secret(value: &str) -> String {
 fn is_listen_mode(value: &str) -> bool {
     let value = value.trim();
     LISTEN_MODES.contains(&value) || LISTEN_MODE_ALIASES.contains(&value.to_ascii_lowercase().as_str())
+}
+
+/// A channel needs a stable id; duplicates and blanks are a client bug, so they
+/// are rejected (400) instead of being silently dropped on write.
+fn validate_channels(channels: &[TelegramChannel]) -> Result<(), String> {
+    if channels.len() > MAX_TELEGRAM_CHANNELS {
+        return Err(format!("频道数量不能超过 {MAX_TELEGRAM_CHANNELS} 个"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for channel in channels {
+        let id = channel.id.trim();
+        if id.is_empty() {
+            return Err("频道 id 不能为空".to_owned());
+        }
+        if !seen.insert(id) {
+            return Err(format!("频道 {id} 重复"));
+        }
+    }
+    Ok(())
 }
 
 /// The notification API base is a plain origin: credentials, paths, queries and
@@ -1174,6 +1397,100 @@ fn u64_field(document: &Map<String, Value>, key: &str) -> Option<u64> {
     }
 }
 
+/// Parse the v2 `channels` array. Anything unusable is dropped here; the
+/// sanitizer dedupes and normalises afterwards.
+fn parse_telegram_channels(value: &Value) -> Vec<TelegramChannel> {
+    value
+        .as_array()
+        .map(|items| items.iter().filter_map(parse_telegram_channel).collect())
+        .unwrap_or_default()
+}
+
+fn parse_telegram_channel(value: &Value) -> Option<TelegramChannel> {
+    let object = value.as_object()?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if id.is_empty() {
+        return None;
+    }
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let modes = object
+        .get("modes")
+        .and_then(Value::as_object)
+        .map(|modes| {
+            let flag = |key: &str| {
+                modes
+                    .get(key)
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            };
+            TelegramChannelModes {
+                new_release: flag("newRelease"),
+                follow: flag("follow"),
+                full: flag("full"),
+                remux: flag("remux"),
+                manual: false,
+            }
+            .normalized()
+        })
+        .unwrap_or_else(|| TelegramChannelModes::default().normalized());
+    let automation = object
+        .get("automation")
+        .and_then(Value::as_object)
+        .map(|automation| TelegramChannelAutomation {
+            initialized: automation
+                .get("initialized")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            last_message_id: automation
+                .get("lastMessageId")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            last_run_at: automation
+                .get("lastRunAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            last_status: automation
+                .get("lastStatus")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            last_error: automation
+                .get("lastError")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            transferred_count: automation
+                .get("transferredCount")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        })
+        .unwrap_or_default();
+    Some(TelegramChannel {
+        id,
+        title: text("title"),
+        username: text("username"),
+        enabled: object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        modes,
+        automation,
+    })
+}
+
 fn f64_field(document: &Map<String, Value>, key: &str) -> Option<f64> {
     match document.get(key)? {
         Value::Number(number) => number.as_f64(),
@@ -1219,6 +1536,118 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn settings_from(document: serde_json::Value) -> ArchiveSettings {
+        ArchiveSettings::from_document(&ArchiveSettings::default(), &document)
+    }
+
+    /// v2 migration: an old file carries one global mode for every channel.
+    #[test]
+    fn legacy_listen_settings_migrate_to_per_channel_modes() {
+        let settings = settings_from(json!({
+            "telegram": {
+                "listen_channels": ["@aiying", "-1001234567890"],
+                "listen_mode": "全量",
+            }
+        }));
+
+        assert_eq!(settings.telegram.channels.len(), 2);
+        let first = &settings.telegram.channels[0];
+        assert_eq!(first.id, "@aiying");
+        assert_eq!(first.username, "aiying");
+        assert!(first.enabled);
+        assert!(first.modes.full);
+        assert!(!first.modes.manual);
+        // The projection keeps the legacy pair readable for an older sidecar.
+        assert_eq!(settings.telegram.listen_mode, "全量");
+        assert_eq!(settings.telegram.listen_channels.len(), 2);
+    }
+
+    /// Per-channel document is the source of truth and wins over the legacy pair.
+    #[test]
+    fn per_channel_modes_are_preserved_and_project_back() {
+        let settings = settings_from(json!({
+            "telegram": {
+                "listen_channels": ["@ignored"],
+                "listen_mode": "上新",
+                "channels": [
+                    {"id": "-1001", "title": "爱影", "enabled": true,
+                     "modes": {"newRelease": true, "follow": true}},
+                    {"id": "-1002", "title": "备用", "enabled": false,
+                     "modes": {"full": true},
+                     "automation": {"initialized": true, "lastMessageId": 42}},
+                ],
+            }
+        }));
+
+        assert_eq!(settings.telegram.channels.len(), 2);
+        let active = &settings.telegram.channels[0];
+        assert!(active.modes.new_release && active.modes.follow);
+        assert!(!active.modes.full && !active.modes.remux && !active.modes.manual);
+        let disabled = &settings.telegram.channels[1];
+        assert!(!disabled.enabled);
+        assert!(disabled.modes.full);
+        assert_eq!(disabled.automation.last_message_id, 42);
+
+        // Only enabled channels are projected into the legacy list.
+        assert_eq!(settings.telegram.listen_channels, vec!["-1001".to_owned()]);
+        assert_eq!(settings.telegram.listen_mode, "上新");
+    }
+
+    /// A no-op save from the older UI must not wipe per-channel modes.
+    #[test]
+    fn unchanged_legacy_fields_keep_the_configured_channels() {
+        let v2 = settings_from(json!({
+            "telegram": {"channels": [
+                {"id": "-1001", "modes": {"newRelease": true}},
+                {"id": "-1002", "modes": {"follow": true}},
+            ]}
+        }));
+        assert_eq!(v2.telegram.channels.len(), 2);
+
+        // The old UI re-saves the whole group with the projected values.
+        let round_trip = ArchiveSettings::from_document(
+            &v2,
+            &json!({
+                "telegram": {
+                    "listen_channels": v2.telegram.listen_channels,
+                    "listen_mode": v2.telegram.listen_mode,
+                    "bot_token": "123:abc",
+                }
+            }),
+        );
+        assert_eq!(round_trip.telegram.channels.len(), 2);
+        assert!(round_trip.telegram.channels[1].modes.follow);
+        assert_eq!(round_trip.telegram.bot_token, "123:abc");
+    }
+
+    /// `manual` is derived: all four automatic bits off means manual on.
+    #[test]
+    fn manual_is_derived_from_the_other_four_bits() {
+        let settings = settings_from(json!({
+            "telegram": {"channels": [{"id": "-1", "modes": {}}]}
+        }));
+        let modes = &settings.telegram.channels[0].modes;
+        assert!(modes.manual);
+        assert!(!modes.any_automatic());
+    }
+
+    /// Duplicate or blank ids are a client bug: reject instead of silently
+    /// dropping a channel the operator thinks they configured.
+    #[test]
+    fn blank_and_duplicate_channel_ids_are_rejected() {
+        let settings = settings_from(json!({
+            "telegram": {"channels": [{"id": "-1"}, {"id": "-1"}]}
+        }));
+        let error = validate_channels(&settings.telegram.channels).expect_err("duplicate");
+        assert!(error.contains("重复"), "{error}");
+
+        assert!(validate_channels(&[TelegramChannel {
+            id: "  ".to_owned(),
+            ..Default::default()
+        }])
+        .is_err());
+    }
 
     fn temporary_directory(tag: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("lux-archive-settings-{tag}-{}", std::process::id()));
