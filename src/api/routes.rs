@@ -1,9 +1,19 @@
 use super::*;
+use axum::http::header::ACCEPT;
 use tower::{ServiceExt, service_fn};
 
 const CATALOG_WORKER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PERFORMANCE_PROBE_HEADER: &str = "x-lux-performance-probe";
 const PERFORMANCE_PROBE_VALUE: &str = "v1";
+// 路由归属（改之前先读完这条注释）：
+//   /api/**   → API 命名空间，只给客户端调用，永远不返回页面
+//   /emby/**  → Emby 命名空间，始终大小写不敏感
+//   其余路径   → Web 命名空间，是浏览器的地盘
+//
+// Web 命名空间里的「文档导航」不再进入 Emby 兼容路由，而是在入口统一按「首页」处理：
+// 由静态服务返回 index.html，浏览器地址栏不变，SPA 起来后按真实 URL 渲染。
+// 因此任何 API 路由（包括根路径上那些大小写不敏感的 Emby 路由）都不可能抢走浏览器
+// 地址栏里的页面；非导航的 API 流量仍走原来的 Emby 大小写兼容改写。
 // Keep the existing per-pool concurrency for Home while isolating it from
 // unrelated catalog traffic that could otherwise hold every shared worker.
 const MAX_CONCURRENT_HOME_REQUESTS: usize = MAX_CONCURRENT_CATALOG_REQUESTS;
@@ -155,7 +165,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 .propagate_x_request_id(),
         )
         .layer(middleware::from_fn(web_asset_cache_policy));
-    case_insensitive_emby_router(app, emby_path_templates)
+    web_and_emby_router(app, emby_path_templates)
 }
 
 struct EmbyRoutePatterns {
@@ -203,16 +213,86 @@ impl EmbyRoutePatterns {
     }
 }
 
-fn case_insensitive_emby_router(router: Router, path_templates: Vec<String>) -> Router {
+/// 最外层路由：Web 命名空间的文档导航交给 SPA 外壳，其余流量才做 Emby 大小写兼容改写。
+///
+/// 这样「浏览器地址栏里的页面」和「API 路由」在入口就被分开，不再依赖路径长得像谁；
+/// 新增任何 web 路由（甚至和 Emby 路由同名）都不会被 API 抢走。
+fn web_and_emby_router(router: Router, path_templates: Vec<String>) -> Router {
     let path_patterns = Arc::new(EmbyRoutePatterns::new(path_templates));
     Router::new().fallback_service(service_fn(move |mut request: Request<Body>| {
         let router = router.clone();
         let path_patterns = path_patterns.clone();
         async move {
-            normalize_emby_request_path(request.uri_mut(), &path_patterns);
+            if is_web_document_navigation(&request) {
+                tracing::debug!(
+                    path = %request.uri().path(),
+                    "serving the SPA shell for a browser navigation"
+                );
+                *request.uri_mut() = axum::http::Uri::from_static("/");
+            } else {
+                normalize_emby_request_path(request.uri_mut(), &path_patterns);
+            }
             router.oneshot(request).await
         }
     }))
+}
+
+/// 判断这一条请求是不是「浏览器在打开一个页面」。
+///
+/// 判据按优先级：
+/// 1. 只有 GET/HEAD 可能是导航，API 的写请求永远不是；
+/// 2. `/api` 与 `/emby` 是纯 API 命名空间，浏览器导航也不进 SPA；
+/// 3. 末段带扩展名的是静态文件（`/logo.svg`、`/assets/x.js`），按文件处理；
+/// 4. 有 Fetch Metadata 就看 `Sec-Fetch-Mode: navigate` / `Sec-Fetch-Dest: document`，
+///    有但两者都不是（例如 JS 发起的 `cors` 请求）就不算导航；
+/// 5. 老浏览器/命令行没有 Fetch Metadata 时，退回看 `Accept` 里有没有 `text/html`。
+fn is_web_document_navigation(request: &Request<Body>) -> bool {
+    if !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD) {
+        return false;
+    }
+    let path = request.uri().path();
+    if is_web_api_namespace(path) || path_has_file_extension(path) {
+        return false;
+    }
+    request_opens_document(request.headers())
+}
+
+fn is_web_api_namespace(path: &str) -> bool {
+    let head = path.strip_prefix('/').unwrap_or(path);
+    let segment = head.split('/').next().unwrap_or_default();
+    segment.eq_ignore_ascii_case("api") || segment.eq_ignore_ascii_case("emby")
+}
+
+fn path_has_file_extension(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|segment| segment.contains('.'))
+}
+
+fn request_opens_document(headers: &HeaderMap) -> bool {
+    if header_equals(headers, "sec-fetch-mode", "navigate")
+        || header_equals(headers, "sec-fetch-dest", "document")
+    {
+        return true;
+    }
+    if headers.contains_key("sec-fetch-mode") || headers.contains_key("sec-fetch-dest") {
+        return false;
+    }
+    headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|item| item.trim().starts_with("text/html"))
+        })
+}
+
+fn header_equals(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
 }
 
 fn normalize_emby_request_path(uri: &mut axum::http::Uri, path_patterns: &EmbyRoutePatterns) {
@@ -513,6 +593,7 @@ fn catalog_route_class(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Method;
 
     #[test]
     fn emby_case_normalization_preserves_dynamic_segments_and_query() {
@@ -540,6 +621,131 @@ mod tests {
         normalize_emby_request_path(&mut uri, &path_patterns);
 
         assert_eq!(uri, original);
+    }
+
+    #[test]
+    fn browser_navigations_are_served_by_the_spa_shell() {
+        // 浏览器地址栏 / 刷新 / 分享链接能出现的页面路径，全部算导航。
+        for path in [
+            "/",
+            "/libraries",
+            "/libraries/01a15e7e-6341-7f41-893a-b32972a68b0f",
+            "/items/01a16884-bf43-77a0-9b27-042b4ee5505e",
+            "/Collections/01a16884-bf43-77a0-9b27-042b4ee5505e",
+            "/watch/01a16884-bf43-77a0-9b27-042b4ee5505e",
+            "/people/01a16884-bf43-77a0-9b27-042b4ee5505e",
+            "/admin/settings",
+            "/account/01a16884",
+            "/__does_not_exist__",
+        ] {
+            assert!(
+                is_web_document_navigation(&navigation_request(Method::GET, path)),
+                "{path} 是浏览器导航，必须交给 SPA 外壳"
+            );
+        }
+    }
+
+    #[test]
+    fn emby_shaped_navigations_no_longer_reach_the_api_router() {
+        // 大小写不同的 Emby 路径，只要是被浏览器打开的页面，也归 Web。
+        // 这正是 2026-10-24 之前的回归现场：/items/:id 被改写成 /Items/{id} 后 401。
+        for path in [
+            "/items/01a16884-bf43-77a0-9b27-042b4ee5505e",
+            "/Items/01a16884-bf43-77a0-9b27-042b4ee5505e",
+            "/users/abc/items/def",
+            "/Sessions",
+        ] {
+            assert!(
+                is_web_document_navigation(&navigation_request(Method::GET, path)),
+                "{path} 被当成导航时不能进 Emby 路由"
+            );
+        }
+    }
+
+    #[test]
+    fn api_and_emby_namespaces_never_serve_the_spa_shell() {
+        for path in [
+            "/api",
+            "/api/v1/items/01a1",
+            "/API/v1/me",
+            "/emby",
+            "/emby/Items/01a1",
+            "/Emby/items/01a1",
+        ] {
+            assert!(
+                !is_web_document_navigation(&navigation_request(Method::GET, path)),
+                "{path} 属于 API 命名空间，不能返回页面"
+            );
+        }
+    }
+
+    #[test]
+    fn static_files_keep_being_served_as_files() {
+        for path in [
+            "/logo.svg",
+            "/favicon.ico",
+            "/assets/index-a1b2c3d4.js",
+            "/assets/app.5f3c2525.css",
+        ] {
+            assert!(
+                !is_web_document_navigation(&navigation_request(Method::GET, path)),
+                "{path} 是静态文件，按文件处理"
+            );
+        }
+    }
+
+    #[test]
+    fn api_clients_keep_the_emby_compat_rewrite() {
+        // 非导航流量：Emby 客户端照样能大小写不敏感地命中路由。
+        let json = Request::builder()
+            .method(Method::GET)
+            .uri("/items/01a1")
+            .header(ACCEPT, "application/json")
+            .body(Body::empty())
+            .expect("request");
+        assert!(!is_web_document_navigation(&json));
+
+        // JS 发起的 cors 请求即使带 text/html 也不是导航。
+        let cors = Request::builder()
+            .method(Method::GET)
+            .uri("/items/01a1")
+            .header(ACCEPT, "text/html")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-dest", "empty")
+            .body(Body::empty())
+            .expect("request");
+        assert!(!is_web_document_navigation(&cors));
+
+        // 写请求永远不是导航（Emby 的 POST /Items/{id} 之类）。
+        let post = Request::builder()
+            .method(Method::POST)
+            .uri("/items/01a1")
+            .header(ACCEPT, "text/html")
+            .body(Body::empty())
+            .expect("request");
+        assert!(!is_web_document_navigation(&post));
+    }
+
+    #[test]
+    fn navigation_without_fetch_metadata_falls_back_to_accept() {
+        let legacy = Request::builder()
+            .method(Method::GET)
+            .uri("/items/01a1")
+            .header(ACCEPT, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+            .body(Body::empty())
+            .expect("request");
+        assert!(is_web_document_navigation(&legacy));
+    }
+
+    fn navigation_request(method: Method, path: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .expect("request")
     }
 
     #[test]
