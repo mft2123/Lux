@@ -63,6 +63,10 @@ def make_config(tmp: Path, **overrides) -> config_mod.SidecarConfig:
         inbox_dir=tmp / "inbox",
         default_mode=filters.MODE_NEW,
         channels=(config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_NEW),),
+        # 补集测试要快：不真睡 5 秒，也不让默认单轮预算截断测试里的清单
+        complete_pause=0.0,
+        complete_max_searches=0,
+        complete_max_hits=0,
     )
     base.update(overrides)
     return config_mod.SidecarConfig(**base)
@@ -1090,8 +1094,27 @@ class RecordingWatcher:
         self.seen.append((incoming.msg_id, channel.key()))
 
 
+class FloodClient:
+    """搜索一开口就被 Telegram FloodWait 拒（异常带 seconds）。"""
+
+    def __init__(self, seconds=300):
+        self.seconds = seconds
+        self.calls = 0
+
+    async def iter_messages(self, entity, **kwargs):
+        self.calls += 1
+
+        class FloodWait(RuntimeError):
+            pass
+
+        error = FloodWait(f"FLOOD_WAIT_{self.seconds}")
+        error.seconds = self.seconds
+        raise error
+        yield  # pragma: no cover - 占位：让函数成为 async 生成器
+
+
 class CompleteSearchTest(unittest.TestCase):
-    """`_complete_search` / `_periodic_complete`：抽出后的补集核与常驻定时循环。"""
+    """`_complete_search` / `_periodic_complete`：补集核、防风控节流与常驻定时循环。"""
 
     def setUp(self):
         self.tmp = support.mkdtemp()
@@ -1107,27 +1130,105 @@ class CompleteSearchTest(unittest.TestCase):
             FakeMessage(3, "不相关消息"),
         ]
         watcher = RecordingWatcher()
-        scanned, matched = asyncio.run(
+        result = asyncio.run(
             runner._complete_search(
                 FakeClient(messages), watcher, [(self.channel, object())], [("某剧", {(1, 3)})], 50
             )
         )
-        self.assertEqual((scanned, matched), (3, 1))
+        self.assertEqual((result.scanned, result.matched, result.attempted), (3, 1, 1))
+        self.assertEqual(result.flood_seconds, 0.0)
         self.assertEqual(watcher.seen, [(2, "chan")])
 
     def test_search_survives_a_failing_query(self):
         class ExplodingClient:
             async def iter_messages(self, entity, **kwargs):
                 raise RuntimeError("search down")
-                yield  # noqa: B027 - 占位：让函数成为 async 生成器
+                yield  # pragma: no cover - 占位：让函数成为 async 生成器
 
         watcher = RecordingWatcher()
-        scanned, matched = asyncio.run(
+        result = asyncio.run(
             runner._complete_search(
                 ExplodingClient(), watcher, [(self.channel, object())], [("某剧", {(1, 3)})], 50
             )
         )
-        self.assertEqual((scanned, matched), (0, 0))
+        self.assertEqual((result.scanned, result.matched, result.attempted), (0, 0, 1))
+        self.assertEqual(watcher.seen, [])
+
+    def test_search_budget_splits_a_big_list_across_rounds(self):
+        """单轮搜索预算：本轮只搜一次，next_start 指到下一部剧，第二轮接着搜。"""
+        plan = [("剧A", {(1, 1)}), ("剧B", {(1, 2)})]
+        client = FakeClient([FakeMessage(1, "剧A S01E01")])
+        watcher = RecordingWatcher()
+        first = asyncio.run(
+            runner._complete_search(
+                client, watcher, [(self.channel, object())], plan, 50, max_searches=1
+            )
+        )
+        self.assertEqual(first.attempted, 1)
+        self.assertEqual(first.next_start, 1)
+        self.assertEqual(client.calls[0]["search"], "剧A")
+
+        second = asyncio.run(
+            runner._complete_search(
+                client,
+                watcher,
+                [(self.channel, object())],
+                plan,
+                50,
+                max_searches=1,
+                start=first.next_start,
+            )
+        )
+        self.assertEqual(second.attempted, 1)
+        self.assertEqual(client.calls[1]["search"], "剧B")
+
+    def test_search_hit_budget_caps_a_whole_season_burst(self):
+        """命中预算：整季命中也不会一口气全灌下去（消息从最老的开始处理）。"""
+        messages = [
+            FakeMessage(1, "某剧 S01E01 1080p"),
+            FakeMessage(2, "某剧 S01E02 1080p"),
+            FakeMessage(3, "某剧 S01E03 1080p"),
+        ]
+        watcher = RecordingWatcher()
+        result = asyncio.run(
+            runner._complete_search(
+                FakeClient(messages),
+                watcher,
+                [(self.channel, object())],
+                [("某剧", {(1, 1), (1, 2), (1, 3)})],
+                50,
+                max_hits=1,
+            )
+        )
+        self.assertEqual(result.matched, 1)
+        self.assertEqual(watcher.seen, [(3, "chan")])
+
+    def test_search_pauses_between_queries(self):
+        pauses = []
+
+        async def fake_sleep(seconds):
+            pauses.append(seconds)
+
+        plan = [("剧A", {(1, 1)}), ("剧B", {(1, 2)})]
+        with patch.object(runner.asyncio, "sleep", fake_sleep):
+            result = asyncio.run(
+                runner._complete_search(
+                    FakeClient([]), RecordingWatcher(), [(self.channel, object())], plan, 50, pause=7.5
+                )
+            )
+        self.assertEqual(result.attempted, 2)
+        self.assertEqual(pauses, [7.5])
+
+    def test_search_stops_on_flood_wait(self):
+        client = FloodClient(seconds=300)
+        watcher = RecordingWatcher()
+        plan = [("剧A", {(1, 1)}), ("剧B", {(1, 2)})]
+        result = asyncio.run(
+            runner._complete_search(client, watcher, [(self.channel, object())], plan, 50)
+        )
+        self.assertEqual(result.attempted, 1)
+        self.assertEqual(result.flood_seconds, 300.0)
+        self.assertEqual(client.calls, 1)
         self.assertEqual(watcher.seen, [])
 
     def test_periodic_complete_rounds_and_survives_errors(self):

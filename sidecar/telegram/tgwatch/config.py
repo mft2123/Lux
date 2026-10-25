@@ -33,6 +33,8 @@ DEFAULT_WASH_TOLERANCE = 0.02
 
 #: `LUX_TG_COMPLETE_INTERVAL` 的上限（30 天）：防手滑把毫秒当秒写。
 MAX_COMPLETE_INTERVAL = 2_592_000
+#: `LUX_TG_COMPLETE_PAUSE` 的上限：一次搜索后最多歇 10 分钟。
+MAX_COMPLETE_PAUSE = 600.0
 
 SINK_HTTP = "http"
 SINK_INBOX = "inbox"
@@ -89,6 +91,12 @@ class SidecarConfig:
     #: 定时补集间隔秒数：0 = 关（只用手动 `complete` 子命令）；>0 时常驻进程
     #: 每隔这么多秒跑一轮补集，判定、回执与手动 `complete --submit` 同一条管线。
     complete_interval: int = 0
+    #: 补集节流：两次频道搜索之间的停顿秒数（防 Telegram 风控 / FloodWait）。
+    complete_pause: float = 5.0
+    #: 补集单轮最多发多少次搜索（0 = 不限）；超出的剧名留到下一轮（自动轮转）。
+    complete_max_searches: int = 20
+    #: 补集单轮最多处理多少条命中消息（0 = 不限）：防一口气把整季灌给 115。
+    complete_max_hits: int = 10
     retry_seconds: int = 300
     http_timeout: float = 15.0
     dry_run: bool = False
@@ -147,6 +155,9 @@ class SidecarConfig:
             "backfill_limit": self.backfill_limit,
             "gap_limit": self.gap_limit,
             "complete_interval": self.complete_interval,
+            "complete_pause": self.complete_pause,
+            "complete_max_searches": self.complete_max_searches,
+            "complete_max_hits": self.complete_max_hits,
             "retry_seconds": self.retry_seconds,
             "dry_run": self.dry_run,
             "log_level": self.log_level,
@@ -375,6 +386,15 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
         raise ConfigError(
             f"LUX_TG_COMPLETE_INTERVAL 上限 {MAX_COMPLETE_INTERVAL} 秒（30 天），实际 {complete_interval}"
         )
+    complete_pause = _env_float("LUX_TG_COMPLETE_PAUSE", 5.0)
+    if not 0 <= complete_pause <= MAX_COMPLETE_PAUSE:
+        raise ConfigError(f"LUX_TG_COMPLETE_PAUSE 必须在 0~{MAX_COMPLETE_PAUSE} 秒之间")
+    complete_max_searches = _env_int("LUX_TG_COMPLETE_MAX_SEARCHES", 20)
+    if complete_max_searches < 0:
+        raise ConfigError("LUX_TG_COMPLETE_MAX_SEARCHES 不能为负（0 = 不限）")
+    complete_max_hits = _env_int("LUX_TG_COMPLETE_MAX_HITS", 10)
+    if complete_max_hits < 0:
+        raise ConfigError("LUX_TG_COMPLETE_MAX_HITS 不能为负（0 = 不限）")
 
     return SidecarConfig(
         api_id=api_id,
@@ -399,6 +419,9 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
         backfill_limit=backfill_limit,
         gap_limit=gap_limit,
         complete_interval=complete_interval,
+        complete_pause=complete_pause,
+        complete_max_searches=complete_max_searches,
+        complete_max_hits=complete_max_hits,
         retry_seconds=_env_int("LUX_TG_RETRY_SECONDS", 300),
         http_timeout=_env_float("LUX_TG_HTTP_TIMEOUT", 15.0),
         dry_run=_env_bool("LUX_TG_DRY_RUN", False),

@@ -88,6 +88,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=50,
         help="每个剧名在每个频道最多取几条消息（再按集号筛）",
     )
+    complete.add_argument(
+        "--full",
+        action="store_true",
+        help="不节流：忽略搜索间隔与单轮预算，一次跑完（连发易触发 Telegram 风控，慎用）",
+    )
     return parser
 
 
@@ -253,6 +258,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "replay":
             return asyncio.run(_cmd_replay(config, args))
         if args.command == "complete":
+            if args.full:
+                config = dataclasses.replace(
+                    config,
+                    complete_pause=0.0,
+                    complete_max_searches=0,
+                    complete_max_hits=0,
+                )
             return asyncio.run(
                 runner.complete(
                     dataclasses.replace(config, dry_run=not args.submit),

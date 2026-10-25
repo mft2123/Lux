@@ -147,6 +147,35 @@ class LoadTest(unittest.TestCase):
             self.load(env={"LUX_TG_COMPLETE_INTERVAL": str(config_mod.MAX_COMPLETE_INTERVAL + 1)})
         self.assertIn("上限", str(ctx.exception))
 
+    def test_complete_throttle_knobs(self):
+        cfg = self.load(
+            env={
+                "LUX_TG_COMPLETE_PAUSE": "2.5",
+                "LUX_TG_COMPLETE_MAX_SEARCHES": "30",
+                "LUX_TG_COMPLETE_MAX_HITS": "5",
+            }
+        )
+        self.assertEqual(cfg.complete_pause, 2.5)
+        self.assertEqual(cfg.complete_max_searches, 30)
+        self.assertEqual(cfg.complete_max_hits, 5)
+        self.assertIn("complete_max_hits", json.dumps(cfg.masked(), ensure_ascii=False))
+
+    def test_complete_throttle_defaults(self):
+        cfg = self.load()
+        self.assertEqual(cfg.complete_pause, 5.0)
+        self.assertEqual(cfg.complete_max_searches, 20)
+        self.assertEqual(cfg.complete_max_hits, 10)
+
+    def test_complete_throttle_bounds(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load(env={"LUX_TG_COMPLETE_PAUSE": "-1"})
+        with self.assertRaises(config_mod.ConfigError):
+            self.load(env={"LUX_TG_COMPLETE_PAUSE": str(config_mod.MAX_COMPLETE_PAUSE + 1)})
+        with self.assertRaises(config_mod.ConfigError):
+            self.load(env={"LUX_TG_COMPLETE_MAX_SEARCHES": "-1"})
+        with self.assertRaises(config_mod.ConfigError):
+            self.load(env={"LUX_TG_COMPLETE_MAX_HITS": "-2"})
+
     def test_http_sink_requires_api_key(self):
         payload = {"telegram": {"api_id": 1, "api_hash": "h"}}
         with self.assertRaises(config_mod.ConfigError) as ctx:

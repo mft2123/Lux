@@ -1109,48 +1109,103 @@ async def _missing_plan(
     return payload, completion_plan(payload)
 
 
+@dataclass
+class CompleteRound:
+    """一轮补集的账目：搜索了几次、命中几条、下一轮从清单第几项继续。"""
+
+    scanned: int = 0
+    matched: int = 0
+    #: 实际发出的搜索次数（预算按这个扣）。
+    attempted: int = 0
+    #: 下一轮的起始下标（预算用完后自动轮转，不会一直从头搜到同一批剧）。
+    next_start: int = 0
+    #: >0 = Telegram 要求等这么多秒（FloodWait），本轮已提前收摊。
+    flood_seconds: float = 0.0
+
+
 async def _complete_search(
     client,
     watcher: "Watcher",
     resolved: list[tuple[config_mod.ChannelConfig, object]],
     plan: list[tuple[str, set[tuple[int, int]]]],
     search_limit: int,
-) -> tuple[int, int]:
+    *,
+    pause: float = 0.0,
+    max_searches: int = 0,
+    max_hits: int = 0,
+    start: int = 0,
+) -> CompleteRound:
     """按计划在监听频道里搜：每个剧名搜一次，命中的消息走常驻同一条管线。
 
-    返回 `(扫描消息数, 命中数)`。单个搜索失败只记日志，不中断整轮。
+    防风控三件套（0 = 不限，手动 `complete --full` 用）：
+    - `pause`：两次搜索之间歇一会儿，别把请求连成一串；
+    - `max_searches`：单轮最多发多少次搜索，超出的剧名留到下一轮；
+    - `max_hits`：单轮最多处理多少条命中，别一口气把整季灌给 115。
+
+    轮转：`(频道, 剧名)` 摊平成清单，从 `start` 走一圈；预算用完就停，
+    `next_start` 指向没搜到的部分，下一轮接着来。搜到 FloodWait（异常带
+    `seconds`）就立刻收摊，等要求的时间再战。
     """
-    scanned = 0
-    matched = 0
-    for channel, entity in resolved:
-        for title, missing in plan:
-            try:
-                messages = [
-                    message
-                    async for message in client.iter_messages(entity, search=title, limit=search_limit)
-                ]
-            except Exception:  # noqa: BLE001 - 单个搜索失败不该中断整轮
-                log.exception("搜索 %s 失败", title)
-                continue
-            scanned += len(messages)
-            hits = 0
-            for message in reversed(messages):
-                found_episodes = episodes_in_text(getattr(message, "text", "") or "")
-                overlap = found_episodes & missing
-                if not overlap:
-                    continue
-                hits += 1
-                log.info(
-                    "%s 在 %s 命中 %s",
-                    title,
-                    channel.key(),
-                    ", ".join(f"S{s:02}E{e:02}" for s, e in sorted(overlap)),
+    pairs = [
+        (channel, entity, title, missing)
+        for channel, entity in resolved
+        for title, missing in plan
+    ]
+    result = CompleteRound()
+    total = len(pairs)
+    if total == 0:
+        return result
+    index = start % total
+    while result.attempted < total:
+        if max_searches and result.attempted >= max_searches:
+            log.info("补集预算用完：本轮只搜 %d 次，剩下的下一轮接着来", result.attempted)
+            break
+        if max_hits and result.matched >= max_hits:
+            log.info("补集命中预算用完：本轮已处理 %d 条，剩下的下一轮接着来", result.matched)
+            break
+        channel, entity, title, missing = pairs[index]
+        if result.attempted and pause > 0:
+            await asyncio.sleep(pause)
+        result.attempted += 1
+        index = (index + 1) % total
+        try:
+            messages = [
+                message
+                async for message in client.iter_messages(entity, search=title, limit=search_limit)
+            ]
+        except Exception as error:  # noqa: BLE001 - 单个搜索失败不该中断整轮
+            seconds = getattr(error, "seconds", None)
+            if isinstance(seconds, (int, float)) and seconds > 0:
+                # FloodWait：Telegram 明说了要等多久。硬顶是账号风控的主因。
+                result.flood_seconds = float(seconds)
+                log.warning(
+                    "Telegram 限流（要求等 %.0f 秒）：本轮提前收摊，等过去再战", seconds
                 )
-                await watcher.process(incoming_from_message(message, channel.key()), channel)
-            matched += hits
-            if not hits:
-                log.debug("%s 在 %s 的 %d 条消息里没有缺的那几集", title, channel.key(), len(messages))
-    return scanned, matched
+                break
+            log.exception("搜索 %s 失败", title)
+            continue
+        result.scanned += len(messages)
+        hits = 0
+        for message in reversed(messages):
+            if max_hits and result.matched + hits >= max_hits:
+                break
+            found_episodes = episodes_in_text(getattr(message, "text", "") or "")
+            overlap = found_episodes & missing
+            if not overlap:
+                continue
+            hits += 1
+            log.info(
+                "%s 在 %s 命中 %s",
+                title,
+                channel.key(),
+                ", ".join(f"S{s:02}E{e:02}" for s, e in sorted(overlap)),
+            )
+            await watcher.process(incoming_from_message(message, channel.key()), channel)
+        result.matched += hits
+        if not hits:
+            log.debug("%s 在 %s 的 %d 条消息里没有缺的那几集", title, channel.key(), len(messages))
+    result.next_start = index
+    return result
 
 
 async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, search_limit: int = 50) -> int:
@@ -1208,8 +1263,23 @@ async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, se
         if not resolved:
             raise RunnerError("所有频道都解析失败：补集无从搜索")
 
-        scanned, matched = await _complete_search(client, watcher, resolved, plan, search_limit)
-        log.info("补集结束：扫 %d 条消息、命中 %d 条，统计 %s", scanned, matched, watcher.counts)
+        result = await _complete_search(
+            client,
+            watcher,
+            resolved,
+            plan,
+            search_limit,
+            pause=config.complete_pause,
+            max_searches=config.complete_max_searches,
+            max_hits=config.complete_max_hits,
+        )
+        log.info(
+            "补集结束：扫 %d 条消息、命中 %d 条、发了 %d 次搜索，统计 %s",
+            result.scanned,
+            result.matched,
+            result.attempted,
+            watcher.counts,
+        )
         return 0
     finally:
         if client is not None:
@@ -1228,10 +1298,16 @@ async def _periodic_complete(
     """常驻定时补集：每 `complete_interval` 秒一轮，与手动 `complete --submit` 同一条管线。
 
     判定、回执、重复去重一个都不绕开（`_complete_search` 走的就是 `watcher.process`）。
-    任何一轮失败只记日志，下一轮照常；只想手动跑就把 `LUX_TG_COMPLETE_INTERVAL` 设 0。
+    防风控由 `complete_pause` / `complete_max_searches` / `complete_max_hits` 负责：
+    补全季这类大活自动分多轮慢慢补，`start` 游标记着清单走到哪了。任何一轮
+    失败只记日志，下一轮照常；被 FloodWait 时按 Telegram 要求的时间等。
+    只想手动跑就把 `LUX_TG_COMPLETE_INTERVAL` 设 0。
     """
+    start = 0
+    wait = config.complete_interval
     while True:
-        await asyncio.sleep(config.complete_interval)
+        await asyncio.sleep(wait)
+        wait = config.complete_interval
         try:
             payload, plan = await _missing_plan(config)
         except planner_mod.PlannerError as error:
@@ -1243,10 +1319,40 @@ async def _periodic_complete(
             log.info("定时补集：没有缺集，本轮空转")
             continue
         total_missing = sum(len(missing) for _, missing in plan)
-        log.info("定时补集：缺集清单 %d 部剧、%d 集（每部剧一次搜索）", len(plan), total_missing)
+        log.info(
+            "定时补集：缺集清单 %d 部剧、%d 集（每部剧一次搜索）", len(plan), total_missing
+        )
         try:
-            scanned, matched = await _complete_search(client, watcher, resolved, plan, search_limit)
-            log.info("定时补集结束：扫 %d 条消息、命中 %d 条，统计 %s", scanned, matched, watcher.counts)
+            result = await _complete_search(
+                client,
+                watcher,
+                resolved,
+                plan,
+                search_limit,
+                pause=config.complete_pause,
+                max_searches=config.complete_max_searches,
+                max_hits=config.complete_max_hits,
+                start=start,
+            )
+            start = result.next_start
+            if result.flood_seconds > 0:
+                wait = max(float(config.complete_interval), result.flood_seconds + 60.0)
+                log.warning(
+                    "定时补集被限流：本轮扫 %d、命中 %d；按 Telegram 要求等 %.0f 秒再战",
+                    result.scanned,
+                    result.matched,
+                    wait,
+                )
+                continue
+            log.info(
+                "定时补集结束：扫 %d 条消息、命中 %d 条、发了 %d 次搜索"
+                "（下一轮从清单第 %d 项继续），统计 %s",
+                result.scanned,
+                result.matched,
+                result.attempted,
+                start,
+                watcher.counts,
+            )
         except Exception:  # noqa: BLE001 - 一轮失败不该拖死常驻
             log.exception("定时补集一轮失败，下一轮照常")
 
