@@ -65,9 +65,19 @@ _HOST_KINDS = (
 )
 
 _URL_RE = re.compile(
-    r"(?:https?://|magnet:\?|ed2k://)[^\s<>\"'，。、；！？（）〔〕【】《》「」\u3000]+",
+    # ASCII 的 []{} 必须排除：频道常用 `[文字](链接)` 的 Markdown，不排除就会把
+    # 锚文本和目标链接连成一串（`url](url`，2026-10-25 线上踩到，17 条挂起全是这个）。
+    # 圆括号 `()` 反而要保留：ed2k 文件名里常有 `(2026)`、`(tmdbid=…)`，
+    # 排掉会把链接从第一个 `(` 处截断。结尾多出来的 `)` 由 `_TRAILING_JUNK` 剥掉。
+    r"(?:https?://|magnet:\?|ed2k://)[^\s<>\"'\[\]{}，。、；！？（）〔〕【】《》「」\u3000]+",
     re.IGNORECASE,
 )
+
+# ed2k 的完整形态：ed2k://|file|<名称>|<字节数>|<32 位十六进制 hash>|/
+# 缺 size/hash 的半截链接转不了，Lux 会以 400「ed2k 链接缺少 hash」拒收。
+_ED2K_COMPLETE = re.compile(r"^ed2k://\|file\|.+\|\d+\|[0-9a-fA-F]{32}\|/$", re.IGNORECASE)
+# 行内判断「这个 ed2k 已经完整」用：`|/` 后面还可能跟着正文，不能整行锚定。
+_ED2K_HAS_HASH = re.compile(r"\|\d+\|[0-9a-fA-F]{32}\|/")
 
 # 链接结尾常被正文标点粘住，需要剥掉
 _TRAILING_JUNK = "。，、；：！？）】》」』\"'”’,.;:!?)]}>~*"
@@ -201,15 +211,46 @@ def extract_links(text: str | None, entities: list[dict] | None = None) -> list[
         elif kind.endswith("Email"):
             push(url if url.startswith("mailto:") else f"mailto:{url}", "", "entity")
 
-    for match in _URL_RE.finditer(body):
+    for match in _URL_RE.finditer(_join_wrapped_ed2k(body)):
         push(match.group(0), "", "text")
 
     return found
 
 
+def _join_wrapped_ed2k(text: str) -> str:
+    """把被硬换行截断的 ed2k 接回去。
+
+    频道按固定列宽断行：`ed2k://|file|某剧.S01E03...DDP` 另起一行接着
+    `5.1.mkv|5364823894|<hash>|/`。不接回去，正则只能拿到没有 hash 的半截链接
+    （2026-10-25 线上 34 条死信全是这个原因，且都断在 `DDP` 之后）。
+    """
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return text
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.lower().startswith("ed2k://") and not _ED2K_HAS_HASH.search(stripped):
+            merged = stripped
+            tail = index + 1
+            while tail < len(lines) and tail <= index + 3 and not _ED2K_HAS_HASH.search(merged):
+                merged += lines[tail].strip()
+                tail += 1
+            out.append(merged)
+            index = tail
+            continue
+        out.append(lines[index])
+        index += 1
+    return "\n".join(out)
+
+
 def _looks_like_link(url: str) -> bool:
     lowered = url.lower()
-    if lowered.startswith(("magnet:", "ed2k://")):
+    if lowered.startswith("ed2k://"):
+        # 半截 ed2k（缺 size/hash）转不了，送去 Lux 只会换一个 400 死信，直接不收。
+        return bool(_ED2K_COMPLETE.match(url))
+    if lowered.startswith("magnet:"):
         return True
     if lowered.startswith(("http://", "https://")):
         rest = lowered.split("://", 1)[1]

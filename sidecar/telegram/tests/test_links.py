@@ -180,5 +180,47 @@ class SlugTest(unittest.TestCase):
         self.assertEqual(links.slugify("!!!"), "link")
 
 
+class RobustExtractionTest(unittest.TestCase):
+    """真实频道消息里的两种脏形态（2026-10-25 线上踩到）。"""
+
+    HASH = "0123456789abcdef0123456789abcdef"
+
+    def test_markdown_link_with_url_as_text_yields_one_clean_url(self):
+        """`[链接](链接)`：锚文本就是链接本身，不能被连成 `url](url`。"""
+        text = "[https://115.com/s/abc?password=1](https://115.com/s/abc?password=1)"
+        found = links.extract_links(text)
+        self.assertEqual([link.url for link in found], ["https://115.com/s/abc?password=1"])
+        self.assertEqual(found[0].kind, links.KIND_115)
+
+    def test_ed2k_wrapped_by_hard_line_break_is_joined(self):
+        """按列宽断行的 ed2k：后半截另起一行，接回去才是完整链接。"""
+        text = (
+            "ed2k://|file|某某.S01E03.WEB-DL.1080p.H264.DDP\n"
+            f"5.1.mkv|5364823894|{self.HASH}|/"
+        )
+        found = links.extract_links(text)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].kind, links.KIND_ED2K)
+        self.assertTrue(found[0].url.endswith(f"|5364823894|{self.HASH}|/"), found[0].url)
+
+    def test_incomplete_ed2k_is_dropped_instead_of_delivered(self):
+        """没有 hash 的半截 ed2k 不可转，不能送去 Lux 换 400 死信。"""
+        text = "ed2k://|file|某某.S01E03.WEB-DL.1080p.H264.DDP"
+        self.assertEqual(links.extract_links(text), [])
+
+    def test_complete_ed2k_still_extracted(self):
+        text = f"ed2k://|file|某剧.S01E01.mkv|1234567890|{self.HASH}|/"
+        found = links.extract_links(text)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].url, text)
+
+    def test_ed2k_name_with_parentheses_is_not_truncated(self):
+        """`(2026)`、`(tmdbid=…)` 是 ed2k 名字的常态，圆括号不能当链接边界。"""
+        text = f"ed2k://|file|尚公主(2026)(tmdbid=286171).S01E06.mkv|5364823894|{self.HASH}|/"
+        found = links.extract_links(text)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].url, text)
+
+
 if __name__ == "__main__":
     unittest.main()
