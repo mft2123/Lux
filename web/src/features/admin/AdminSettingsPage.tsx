@@ -5,6 +5,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
 import { ArchiveSettingsSection } from "../settings/ArchiveSettingsSection";
+import { MissingEpisodesSection } from "../settings/MissingEpisodesSection";
 import type {
   AdminNetworkProxySettings,
   LoginBackgroundSource,
@@ -299,6 +300,8 @@ export function AdminSettingsPage() {
       </section>
 
       <ArchiveSettingsSection />
+
+      <MissingEpisodesSection />
 
       <section className="lux-admin-panel lux-admin-settings-note">
         <div className="lux-admin-panel-heading"><div><h2>服务信息</h2></div></div>

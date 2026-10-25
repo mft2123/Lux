@@ -1447,6 +1447,30 @@ export class LuxApiClient {
     }>("/api/v1/admin/archive/telegram/channels");
   }
 
+  /**
+   * 补集清单：`follow_list` 里每部剧缺哪些季、哪些集。只读；补集由旁挂定时任务执行，
+   * 这个接口不会触发任何转存。
+   */
+  telegramMissing() {
+    return this.request<{
+      series: {
+        id: string;
+        title: string;
+        year?: number | null;
+        missingTotal: number;
+        seasons: {
+          season: number;
+          highest: number;
+          present: number;
+          missing: number[];
+          missingTotal: number;
+          truncated: boolean;
+        }[];
+      }[];
+      notes?: string[];
+    }>("/api/v1/admin/archive/telegram/missing");
+  }
+
   archiveStatus() {
     return this.request<ArchiveStatus>("/api/v1/admin/archive/status");
   }
