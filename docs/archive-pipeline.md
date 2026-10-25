@@ -193,6 +193,12 @@
   （`LUX_TG_COMPLETE_INTERVAL` 秒，默认 0 = 关；开着时每轮与 `complete --submit` 同一条
   判定/回执管线，一轮失败只记日志，下一轮照常）。定时任务复用常驻进程已登录的会话，
   不另开第二个 session。
+- **防风控节流**（补全季这类大活自动分多轮慢慢补，不逞一次性）：两次搜索之间歇
+  `LUX_TG_COMPLETE_PAUSE` 秒（默认 5）；单轮最多发 `LUX_TG_COMPLETE_MAX_SEARCHES` 次搜索
+  （默认 20，超出的剧名留到下一轮，游标自动轮转，不会每轮从头搜同一批）；单轮最多处理
+  `LUX_TG_COMPLETE_MAX_HITS` 条命中（默认 10，防一口气把整季链接灌给 115）。三个值 0 = 不限；
+  手动 `complete --full` 一键全关（自行承担风险）。搜到 FloodWait（Telegram 要求等 N 秒）
+  本轮立即收摊，等要求的时间再战，绝不硬顶。
 - 每季最多 200 个缺集参与匹配（`COMPLETION_PER_SEASON`），避免一次刷爆搜索配额。
 
 ### 2.2.4 回执三态（同一条链接只转存一次）
