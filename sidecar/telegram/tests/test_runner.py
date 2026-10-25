@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -1076,6 +1077,96 @@ class LibraryLookupTest(unittest.TestCase):
         lookup = runner.LibraryLookup("http://lux/lookup", "k", 5.0)
         result = asyncio.run(lookup.lookup(""))
         self.assertFalse(result["ok"])
+
+
+class RecordingWatcher:
+    """补集核的最小 watcher 形状：只记 process 过什么（真实 Watcher 的契约子集）。"""
+
+    def __init__(self):
+        self.seen = []
+        self.counts = {"delivered": 0}
+
+    async def process(self, incoming, channel):
+        self.seen.append((incoming.msg_id, channel.key()))
+
+
+class CompleteSearchTest(unittest.TestCase):
+    """`_complete_search` / `_periodic_complete`：抽出后的补集核与常驻定时循环。"""
+
+    def setUp(self):
+        self.tmp = support.mkdtemp()
+        self.channel = config_mod.ChannelConfig(channel="@chan", mode=filters.MODE_FOLLOW)
+
+    def tearDown(self):
+        support.cleanup(self.tmp)
+
+    def test_search_only_processes_missing_episodes(self):
+        messages = [
+            FakeMessage(1, "某剧 S01E02 1080p"),
+            FakeMessage(2, "某剧 S01E03 2160p"),
+            FakeMessage(3, "不相关消息"),
+        ]
+        watcher = RecordingWatcher()
+        scanned, matched = asyncio.run(
+            runner._complete_search(
+                FakeClient(messages), watcher, [(self.channel, object())], [("某剧", {(1, 3)})], 50
+            )
+        )
+        self.assertEqual((scanned, matched), (3, 1))
+        self.assertEqual(watcher.seen, [(2, "chan")])
+
+    def test_search_survives_a_failing_query(self):
+        class ExplodingClient:
+            async def iter_messages(self, entity, **kwargs):
+                raise RuntimeError("search down")
+                yield  # noqa: B027 - 占位：让函数成为 async 生成器
+
+        watcher = RecordingWatcher()
+        scanned, matched = asyncio.run(
+            runner._complete_search(
+                ExplodingClient(), watcher, [(self.channel, object())], [("某剧", {(1, 3)})], 50
+            )
+        )
+        self.assertEqual((scanned, matched), (0, 0))
+        self.assertEqual(watcher.seen, [])
+
+    def test_periodic_complete_rounds_and_survives_errors(self):
+        """第一轮真跑、第二轮拿不到清单也不能拖死循环；取消即退出。"""
+
+        async def scenario():
+            config = make_config(self.tmp, complete_interval=0)
+            calls = []
+
+            async def fake_missing(cfg):
+                calls.append(1)
+                if len(calls) == 1:
+                    return {"series": []}, [("某剧", {(1, 3)})]
+                raise runner.planner_mod.PlannerError("Lux 不可达")
+
+            watcher = RecordingWatcher()
+            with patch.object(runner, "_missing_plan", fake_missing):
+                task = asyncio.create_task(
+                    runner._periodic_complete(
+                        config,
+                        FakeClient([FakeMessage(2, "某剧 S01E03 2160p")]),
+                        watcher,
+                        [(self.channel, object())],
+                    )
+                )
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while len(calls) < 3:
+                    if asyncio.get_running_loop().time() > deadline:
+                        task.cancel()
+                        raise AssertionError(f"定时补集只跑了 {len(calls)} 轮")
+                    await asyncio.sleep(0.01)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            return watcher.seen, calls
+
+        seen, calls = asyncio.run(scenario())
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertEqual(seen, [(2, "chan")])
 
 
 if __name__ == "__main__":

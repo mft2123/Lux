@@ -129,6 +129,24 @@ class LoadTest(unittest.TestCase):
         with self.assertRaises(config_mod.ConfigError):
             self.load({"telegram": {"api_id": 1, "api_hash": "h", "listen_mode": "乱写"}})
 
+    def test_complete_interval_defaults_off(self):
+        cfg = self.load()
+        self.assertEqual(cfg.complete_interval, 0)
+
+    def test_complete_interval_from_env(self):
+        cfg = self.load(env={"LUX_TG_COMPLETE_INTERVAL": "43200"})
+        self.assertEqual(cfg.complete_interval, 43200)
+
+    def test_complete_interval_rejects_negative(self):
+        with self.assertRaises(config_mod.ConfigError) as ctx:
+            self.load(env={"LUX_TG_COMPLETE_INTERVAL": "-1"})
+        self.assertIn("LUX_TG_COMPLETE_INTERVAL", str(ctx.exception))
+
+    def test_complete_interval_rejects_over_cap(self):
+        with self.assertRaises(config_mod.ConfigError) as ctx:
+            self.load(env={"LUX_TG_COMPLETE_INTERVAL": str(config_mod.MAX_COMPLETE_INTERVAL + 1)})
+        self.assertIn("上限", str(ctx.exception))
+
     def test_http_sink_requires_api_key(self):
         payload = {"telegram": {"api_id": 1, "api_hash": "h"}}
         with self.assertRaises(config_mod.ConfigError) as ctx:

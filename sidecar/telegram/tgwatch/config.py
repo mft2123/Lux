@@ -31,6 +31,9 @@ DEFAULT_PLAN_PATH = "/api/v1/admin/archive/telegram/plan"
 DEFAULT_MISSING_PATH = "/api/v1/admin/archive/telegram/missing"
 DEFAULT_WASH_TOLERANCE = 0.02
 
+#: `LUX_TG_COMPLETE_INTERVAL` 的上限（30 天）：防手滑把毫秒当秒写。
+MAX_COMPLETE_INTERVAL = 2_592_000
+
 SINK_HTTP = "http"
 SINK_INBOX = "inbox"
 SINKS = (SINK_HTTP, SINK_INBOX)
@@ -83,6 +86,9 @@ class SidecarConfig:
     api_key: str = ""
     backfill_limit: int = 200
     gap_limit: int = 200
+    #: 定时补集间隔秒数：0 = 关（只用手动 `complete` 子命令）；>0 时常驻进程
+    #: 每隔这么多秒跑一轮补集，判定、回执与手动 `complete --submit` 同一条管线。
+    complete_interval: int = 0
     retry_seconds: int = 300
     http_timeout: float = 15.0
     dry_run: bool = False
@@ -140,6 +146,7 @@ class SidecarConfig:
             "api_key": mask_secret(self.api_key),
             "backfill_limit": self.backfill_limit,
             "gap_limit": self.gap_limit,
+            "complete_interval": self.complete_interval,
             "retry_seconds": self.retry_seconds,
             "dry_run": self.dry_run,
             "log_level": self.log_level,
@@ -361,6 +368,13 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
     gap_limit = _env_int("LUX_TG_GAP_LIMIT", 200)
     if gap_limit < 0:
         raise ConfigError("LUX_TG_GAP_LIMIT 不能为负")
+    complete_interval = _env_int("LUX_TG_COMPLETE_INTERVAL", 0)
+    if complete_interval < 0:
+        raise ConfigError("LUX_TG_COMPLETE_INTERVAL 不能为负")
+    if complete_interval > MAX_COMPLETE_INTERVAL:
+        raise ConfigError(
+            f"LUX_TG_COMPLETE_INTERVAL 上限 {MAX_COMPLETE_INTERVAL} 秒（30 天），实际 {complete_interval}"
+        )
 
     return SidecarConfig(
         api_id=api_id,
@@ -384,6 +398,7 @@ def load(settings_path: str | Path | None = None) -> SidecarConfig:
         api_key=api_key,
         backfill_limit=backfill_limit,
         gap_limit=gap_limit,
+        complete_interval=complete_interval,
         retry_seconds=_env_int("LUX_TG_RETRY_SECONDS", 300),
         http_timeout=_env_float("LUX_TG_HTTP_TIMEOUT", 15.0),
         dry_run=_env_bool("LUX_TG_DRY_RUN", False),

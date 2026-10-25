@@ -918,6 +918,11 @@ async def run(config: config_mod.SidecarConfig) -> None:
         # 空配置不再拒绝启动：设置页要先能列出账号里的频道，才有了勾选的前提。
         # 这里空转（/channels 仍可用），勾选并重启后开始投递。
         log.warning("listen_channels 为空：侧车空转，等勾选频道后重启")
+        if config.complete_interval > 0:
+            log.info(
+                "定时补集间隔 %d 秒已设：频道为空用不上，勾选后随常驻一起生效",
+                config.complete_interval,
+            )
         try:
             await asyncio.Event().wait()
         finally:
@@ -1013,14 +1018,30 @@ async def run(config: config_mod.SidecarConfig) -> None:
                 log.exception("补拉 %s 失败", channel.key())
 
         retry_task = asyncio.create_task(watcher.retry_loop())
+        # 定时补集（可选）：复用这个已登录的 client 与 watcher，绝不再开第二个
+        # Telegram session（同一 session 文件两个 client 会把 SQLite 锁死）。
+        completion_task = None
+        if config.complete_interval > 0:
+            completion_task = asyncio.create_task(
+                _periodic_complete(config, client, watcher, resolved)
+            )
+            log.info(
+                "定时补集已启用：每 %d 秒一轮（判定与回执同手动 complete）",
+                config.complete_interval,
+            )
         log.info("就绪：%d 个频道在线", len(resolved))
         try:
             await client.run_until_disconnected()
         finally:
             watcher.stop()
             retry_task.cancel()
+            if completion_task is not None:
+                completion_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await retry_task
+            if completion_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await completion_task
             # 后台 handler 必须先收尾，再让外层 finally 关库（review SC11）
             await _drain_background("停止监听")
             log.info("统计: %s", watcher.counts)
@@ -1077,6 +1098,61 @@ def episodes_in_text(text: str) -> set[tuple[int, int]]:
     return found
 
 
+async def _missing_plan(
+    config: config_mod.SidecarConfig,
+) -> tuple[dict, list[tuple[str, set[tuple[int, int]]]]]:
+    """拉 Lux 的缺集清单并翻成搜索计划；PlannerError 原样抛给调用方处理。"""
+    missing_client = planner_mod.CompletionClient(
+        config.missing_url, config.api_key, config.http_timeout
+    )
+    payload = await asyncio.to_thread(missing_client.missing)
+    return payload, completion_plan(payload)
+
+
+async def _complete_search(
+    client,
+    watcher: "Watcher",
+    resolved: list[tuple[config_mod.ChannelConfig, object]],
+    plan: list[tuple[str, set[tuple[int, int]]]],
+    search_limit: int,
+) -> tuple[int, int]:
+    """按计划在监听频道里搜：每个剧名搜一次，命中的消息走常驻同一条管线。
+
+    返回 `(扫描消息数, 命中数)`。单个搜索失败只记日志，不中断整轮。
+    """
+    scanned = 0
+    matched = 0
+    for channel, entity in resolved:
+        for title, missing in plan:
+            try:
+                messages = [
+                    message
+                    async for message in client.iter_messages(entity, search=title, limit=search_limit)
+                ]
+            except Exception:  # noqa: BLE001 - 单个搜索失败不该中断整轮
+                log.exception("搜索 %s 失败", title)
+                continue
+            scanned += len(messages)
+            hits = 0
+            for message in reversed(messages):
+                found_episodes = episodes_in_text(getattr(message, "text", "") or "")
+                overlap = found_episodes & missing
+                if not overlap:
+                    continue
+                hits += 1
+                log.info(
+                    "%s 在 %s 命中 %s",
+                    title,
+                    channel.key(),
+                    ", ".join(f"S{s:02}E{e:02}" for s, e in sorted(overlap)),
+                )
+                await watcher.process(incoming_from_message(message, channel.key()), channel)
+            matched += hits
+            if not hits:
+                log.debug("%s 在 %s 的 %d 条消息里没有缺的那几集", title, channel.key(), len(messages))
+    return scanned, matched
+
+
 async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, search_limit: int = 50) -> int:
     """补集：按 Lux 的缺集清单，在监听频道里搜对应集。
 
@@ -1090,15 +1166,11 @@ async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, se
     if not submit:
         log.warning("补集为 dry-run：只搜索与判定，不转存（加 --submit 才真的提交）")
 
-    missing_client = planner_mod.CompletionClient(
-        config.missing_url, config.api_key, config.http_timeout
-    )
     try:
-        payload = await asyncio.to_thread(missing_client.missing)
+        payload, plan = await _missing_plan(config)
     except planner_mod.PlannerError as error:
         log.error("拿不到缺集清单：%s", error)
         return 2
-    plan = completion_plan(payload)
     for note in payload.get("notes") or []:
         log.warning("Lux: %s", note)
     if not plan:
@@ -1136,46 +1208,47 @@ async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, se
         if not resolved:
             raise RunnerError("所有频道都解析失败：补集无从搜索")
 
-        scanned = 0
-        matched = 0
-        for channel, entity in resolved:
-            for title, missing in plan:
-                try:
-                    messages = [
-                        message
-                        async for message in client.iter_messages(
-                            entity, search=title, limit=search_limit
-                        )
-                    ]
-                except Exception:  # noqa: BLE001 - 单个搜索失败不该中断整轮
-                    log.exception("搜索 %s 失败", title)
-                    continue
-                scanned += len(messages)
-                hits = 0
-                for message in reversed(messages):
-                    found_episodes = episodes_in_text(getattr(message, "text", "") or "")
-                    overlap = found_episodes & missing
-                    if not overlap:
-                        continue
-                    hits += 1
-                    log.info(
-                        "%s 在 %s 命中 %s",
-                        title,
-                        channel.key(),
-                        ", ".join(f"S{s:02}E{e:02}" for s, e in sorted(overlap)),
-                    )
-                    await watcher.process(incoming_from_message(message, channel.key()), channel)
-                matched += hits
-                if not hits:
-                    log.debug("%s 在 %s 的 %d 条消息里没有缺的那几集", title, channel.key(), len(messages))
-        log.info(
-            "补集结束：扫 %d 条消息、命中 %d 条，统计 %s", scanned, matched, watcher.counts
-        )
+        scanned, matched = await _complete_search(client, watcher, resolved, plan, search_limit)
+        log.info("补集结束：扫 %d 条消息、命中 %d 条，统计 %s", scanned, matched, watcher.counts)
         return 0
     finally:
         if client is not None:
             await client.disconnect()
         store.close()
+
+
+async def _periodic_complete(
+    config: config_mod.SidecarConfig,
+    client,
+    watcher: "Watcher",
+    resolved: list[tuple[config_mod.ChannelConfig, object]],
+    *,
+    search_limit: int = 50,
+) -> None:
+    """常驻定时补集：每 `complete_interval` 秒一轮，与手动 `complete --submit` 同一条管线。
+
+    判定、回执、重复去重一个都不绕开（`_complete_search` 走的就是 `watcher.process`）。
+    任何一轮失败只记日志，下一轮照常；只想手动跑就把 `LUX_TG_COMPLETE_INTERVAL` 设 0。
+    """
+    while True:
+        await asyncio.sleep(config.complete_interval)
+        try:
+            payload, plan = await _missing_plan(config)
+        except planner_mod.PlannerError as error:
+            log.error("定时补集：拿不到缺集清单（%s），下一轮再试", error)
+            continue
+        for note in payload.get("notes") or []:
+            log.warning("Lux: %s", note)
+        if not plan:
+            log.info("定时补集：没有缺集，本轮空转")
+            continue
+        total_missing = sum(len(missing) for _, missing in plan)
+        log.info("定时补集：缺集清单 %d 部剧、%d 集（每部剧一次搜索）", len(plan), total_missing)
+        try:
+            scanned, matched = await _complete_search(client, watcher, resolved, plan, search_limit)
+            log.info("定时补集结束：扫 %d 条消息、命中 %d 条，统计 %s", scanned, matched, watcher.counts)
+        except Exception:  # noqa: BLE001 - 一轮失败不该拖死常驻
+            log.exception("定时补集一轮失败，下一轮照常")
 
 
 async def deliver_pending(
