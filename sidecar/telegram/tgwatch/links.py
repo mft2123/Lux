@@ -21,6 +21,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
+import urllib.parse
 from dataclasses import dataclass
 
 # 资源链接的 kind 分类；`allowed_kinds` 配置用这些名字
@@ -78,6 +79,10 @@ _URL_RE = re.compile(
 _ED2K_COMPLETE = re.compile(r"^ed2k://\|file\|.+\|\d+\|[0-9a-fA-F]{32}\|/$", re.IGNORECASE)
 # 行内判断「这个 ed2k 已经完整」用：`|/` 后面还可能跟着正文，不能整行锚定。
 _ED2K_HAS_HASH = re.compile(r"\|\d+\|[0-9a-fA-F]{32}\|/")
+
+# 链接自带的作品名：ed2k 的 `|file|<名称>|`、magnet 的 `dn=` 参数。
+_ED2K_NAME = re.compile(r"^ed2k://\|file\|([^|]+)\|", re.IGNORECASE)
+_MAGNET_NAME = re.compile(r"[?&]dn=([^&]+)", re.IGNORECASE)
 
 # 链接结尾常被正文标点粘住，需要剥掉
 _TRAILING_JUNK = "。，、；：！？）】》」』\"'”’,.;:!?)]}>~*"
@@ -318,16 +323,45 @@ def title_from(text: str | None, links: list[Link] | None = None) -> str:
     return _first_line_title(text)
 
 
+def _name_from_link(url: str, kind: str) -> str:
+    """链接自带的作品名（ed2k 文件名 / magnet 的 `dn=`），拿不到返回空串。
+
+    这些频道常在正文里放品牌行（`✅ 少爷:请您检阅`），拿首行当标题会让每条资源
+    都判成同一个「库里没有」的假作品；链接里的发布名才是判定链要的东西。
+    """
+    if kind == KIND_ED2K:
+        match = _ED2K_NAME.match(url)
+        if not match:
+            return ""
+        name = match.group(1)
+    elif kind == KIND_MAGNET:
+        match = _MAGNET_NAME.search(url)
+        if not match:
+            return ""
+        name = urllib.parse.unquote(match.group(1))
+    else:
+        return ""
+    name = name.strip()
+    name = re.sub(r"\.[A-Za-z0-9]{1,4}$", "", name)  # 去扩展名（.mkv/.mp4/.ts…）
+    return _clean_title(name) if name else ""
+
+
 def link_title(link: Link, text: str | None, *, fallback_to_text: bool = False) -> str:
     """**单个**链接自己的标题（review SC7）。
 
     一条消息里常有多个链接，各自挂着不同的锚文本。这里只认该链接自己的锚文本，
     不拿同一条消息里别的链接、也不拿整段正文去凑。
 
+    链接自带发布名（ed2k 文件名 / magnet `dn`）时优先用它：频道的正文首行往往是
+    品牌行，比链接里的文件名差得多。
+
     拿不到独立标题时返回空串。`fallback_to_text=True` 只给**单链接**消息用——
     那种情况下正文首行确实就是这条链接的标题；多链接消息绝不能兜底，调用方
     应当把该链接记 `held`（原因 `title_ambiguous`），不要猜。
     """
+    derived = _name_from_link(link.url, link.kind)
+    if derived:
+        return derived
     title = _anchor_title(link)
     if title:
         return title

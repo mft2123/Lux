@@ -222,5 +222,33 @@ class RobustExtractionTest(unittest.TestCase):
         self.assertEqual(found[0].url, text)
 
 
+class LinkNameTitleTest(unittest.TestCase):
+    """链接自带的发布名优先于正文首行（频道首行常是品牌行，比如「✅ 少爷:请您检阅」）。"""
+
+    HASH = "0123456789abcdef0123456789abcdef"
+
+    def test_ed2k_filename_becomes_the_title(self):
+        url = (
+            "ed2k://|file|尚公主(2026)(tmdbid=286171).S01E06.WEB-DL.1080p.H264.DDP5.1.mkv"
+            f"|5364823894|{self.HASH}|/"
+        )
+        link = links.Link(url=url, kind=links.KIND_ED2K)
+        self.assertEqual(
+            links.link_title(link, "✅ 少爷:请您检阅"),
+            "尚公主(2026)(tmdbid=286171).S01E06.WEB-DL.1080p.H264.DDP5.1",
+        )
+
+    def test_magnet_dn_becomes_the_title(self):
+        link = links.Link(
+            url="magnet:?xt=urn:btih:abc123&dn=%E6%B2%99%E4%B8%982.2024.1080p&tr=udp://x",
+            kind=links.KIND_MAGNET,
+        )
+        self.assertEqual(links.link_title(link, "品牌行"), "沙丘2.2024.1080p")
+
+    def test_115_link_still_prefers_its_anchor(self):
+        link = links.Link(url="https://115.com/s/abc", kind=links.KIND_115, anchor="某剧 第二季")
+        self.assertEqual(links.link_title(link, "品牌行"), "某剧 第二季")
+
+
 if __name__ == "__main__":
     unittest.main()
