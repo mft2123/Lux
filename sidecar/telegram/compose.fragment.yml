@@ -18,8 +18,8 @@ services:
   telegram:
     build:
       context: ./sidecar/telegram
-    # v2（判定链 / 补集 / 回执三态，2026-10-24）的产物打 :2；回滚把 tag 改回 :1 再 up -d。
-    image: lux-telegram:2
+    # v3（v2 + 定时补集，2026-10-25）的产物打 :3；回滚把 tag 改回 :2 / :1 再 up -d。
+    image: lux-telegram:3
     container_name: lux-telegram
     # 非 root：session 授权密钥不该只有 root 能读
     user: "10001:10001"
@@ -38,6 +38,9 @@ services:
       LUX_TG_HEALTH_PORT: "8091"
       LUX_TG_BACKFILL_LIMIT: "200"
       LUX_TG_GAP_LIMIT: "200"
+      # 定时补集：每 12 小时按 Lux 的缺集清单在监听频道里搜一轮（判定/回执同手动
+      # complete --submit）；0 = 关，只用手动子命令。
+      LUX_TG_COMPLETE_INTERVAL: "43200"
       # 走 Lux 项目网络时用服务名；单独跑这段 compose 的话，下面三行一起改成
       # http://<nas-ip>:8097 与对应路径（只改 BASE 不够，PLAN/MISSING 是显式值）。
       LUX_TG_LUX_BASE: http://lux:8097
