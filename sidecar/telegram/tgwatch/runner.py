@@ -790,8 +790,13 @@ class Watcher:
 
     # ---- telethon 事件入口 ----
 
-    def on_event(self, event) -> None:
-        """由 telethon 调用；解析成纯数据后交给 process。"""
+    async def on_event(self, event) -> None:
+        """由 telethon 调用；解析成纯数据后交给 process。
+
+        必须是 async：telethon 的 dispatcher 会 `await callback(event)`，
+        同步函数返回 None 会让每条消息都抛 `object NoneType can't be used
+        in 'await' expression`（2026-10-25 实测踩到）。
+        """
         channel = self._channel_for(event)
         if channel is None:
             log.debug("未登记的会话，忽略: %s", getattr(event, "chat_id", "?"))
@@ -975,7 +980,8 @@ async def run(config: config_mod.SidecarConfig) -> None:
             watcher.by_key[key] = channel
             watcher.by_key[channel.key()] = channel
             # Lux 的频道设置用数字 id 做主键，判定接口按它找模式位。
-            watcher.channel_ids[channel.key()] = str(utils.get_peer_id(entity))
+            # 存裸 id（不带 -100）：与 /channels 列表和设置文件里的写法一致。
+            watcher.channel_ids[channel.key()] = lux_channel_id(utils.get_peer_id(entity))
             resolved.append((channel, entity))
             log.info("监听 %s → %s（%s）", channel.key(), key, channel.mode)
 
@@ -1107,6 +1113,19 @@ async def _missing_plan(
     )
     payload = await asyncio.to_thread(missing_client.missing)
     return payload, completion_plan(payload)
+
+
+def lux_channel_id(peer_id: int | str) -> str:
+    """Lux 侧的频道主键：telethon 的 peer id 去掉 `-100` 标记前缀。
+
+    Lux 的 `telegram.channels[].id` 来自 `/channels` 列表（`entity.id`，裸正数），
+    而 telethon 的 `get_peer_id()` 给频道加 `-100` 标记。判定接口按字符串精确
+    匹配，不归一就会每条消息都 404 退回本地规则（2026-10-25 实测踩到）。
+
+    普通群/用户本来就没有标记，原样返回。
+    """
+    text = str(peer_id)
+    return text[4:] if text.startswith("-100") else text
 
 
 @dataclass
@@ -1258,7 +1277,7 @@ async def complete(config: config_mod.SidecarConfig, *, submit: bool = False, se
             except RunnerError as error:
                 log.error("%s", error)
                 continue
-            watcher.channel_ids[channel.key()] = str(utils.get_peer_id(entity))
+            watcher.channel_ids[channel.key()] = lux_channel_id(utils.get_peer_id(entity))
             resolved.append((channel, entity))
         if not resolved:
             raise RunnerError("所有频道都解析失败：补集无从搜索")

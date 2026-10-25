@@ -1270,5 +1270,21 @@ class CompleteSearchTest(unittest.TestCase):
         self.assertEqual(seen, [(2, "chan")])
 
 
+class ChannelIdTest(unittest.TestCase):
+    """判定接口的频道主键：必须和 Lux 设置里的裸 id 一致（2026-10-25 线上踩到 404）。"""
+
+    def test_strips_the_channel_mark(self):
+        self.assertEqual(runner.lux_channel_id(-1002769844611), "2769844611")
+        self.assertEqual(runner.lux_channel_id("-1004358697065"), "4358697065")
+
+    def test_leaves_plain_and_group_ids_alone(self):
+        self.assertEqual(runner.lux_channel_id(2769844611), "2769844611")
+        self.assertEqual(runner.lux_channel_id(-123456), "-123456")
+
+    def test_on_event_is_awaitable(self):
+        """telethon 会 await 回调；同步 def 会让每条消息抛 NoneType 错误。"""
+        self.assertTrue(asyncio.iscoroutinefunction(runner.Watcher.on_event))
+
+
 if __name__ == "__main__":
     unittest.main()
