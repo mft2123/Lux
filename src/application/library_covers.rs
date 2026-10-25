@@ -143,11 +143,29 @@ impl LibraryCoverService {
         library_id: LibraryId,
     ) -> Result<LibraryCoverJob, ManualLibraryCoverDispatchError> {
         let library_id_text = library_id.to_string();
-        let task = self
+        let mut task = self
             .database
             .find_scheduled_task_config("LIBRARY", &library_id_text, AUTO_LIBRARY_COVER_TASK_TYPE)
             .await
             .map_err(|_| ManualLibraryCoverDispatchError::StorageUnavailable)?;
+        if task.is_none() {
+            // 老库（自动封面功能上线前就存在，或从没攒够 9 张海报）从来没注册过这个
+            // 计划，手动触发原本直接 404；这里补注册，让「立即生成」对所有库可用
+            // （2026-10-25 线上踩到）。
+            self.database
+                .register_auto_library_cover_task(&library_id_text)
+                .await
+                .map_err(|_| ManualLibraryCoverDispatchError::StorageUnavailable)?;
+            task = self
+                .database
+                .find_scheduled_task_config(
+                    "LIBRARY",
+                    &library_id_text,
+                    AUTO_LIBRARY_COVER_TASK_TYPE,
+                )
+                .await
+                .map_err(|_| ManualLibraryCoverDispatchError::StorageUnavailable)?;
+        }
         if task.is_none() {
             return Err(ManualLibraryCoverDispatchError::TaskNotRegistered);
         }
